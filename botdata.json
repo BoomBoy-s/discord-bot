@@ -937,6 +937,30 @@
         "forceMarried": false,
         "uploadedImages": []
       }
+    ],
+    [
+      "695734457830998057",
+      {
+        "username": "malikinez",
+        "wins": 0,
+        "gamesPlayed": 0,
+        "coins": 0,
+        "dailyStreak": 0,
+        "bestStreak": 0,
+        "lastDailyDate": "",
+        "xp": 9,
+        "level": 1,
+        "lastWorkTime": 0,
+        "lastBegTime": 0,
+        "lastCrimeTime": 0,
+        "lastRobTime": 0,
+        "inventory": [],
+        "marriedTo": null,
+        "pendingProposal": null,
+        "imagesUploaded": 0,
+        "forceMarried": false,
+        "uploadedImages": []
+      }
     ]
   ],
   "activeEffects": [],
@@ -1137,6 +1161,17 @@
         "submitterId": "1254388539890860083",
         "fileName": "1254388539890860083__image__IMG_0840.png",
         "rawName": "IMG_0840.png",
+        "mediaKind": "image",
+        "guildId": "1048053656035020911",
+        "destFolder": null
+      }
+    ],
+    [
+      "860083mwuuylfj",
+      {
+        "submitterId": "1254388539890860083",
+        "fileName": "1254388539890860083__image__IMG_0835.png",
+        "rawName": "IMG_0835.png",
         "mediaKind": "image",
         "guildId": "1048053656035020911",
         "destFolder": null
