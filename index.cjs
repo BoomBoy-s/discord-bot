@@ -1,0 +1,13635 @@
+"use strict";
+const { Client, Intents, MessageActionRow, MessageButton, MessageSelectMenu } = require("discord.js");
+const sharp  = require("sharp");
+const https = require("https");
+const http  = require("http");
+const fs    = require("fs");
+const path  = require("path");
+const os    = require("os");
+const { spawn } = require("child_process");
+const youtubedl  = require("yt-dlp-exec");
+const ffmpegPath = require("ffmpeg-static");
+
+// ── Bundled font registration (for /fakequote card rendering) ────────────────
+(function registerBundledFonts() {
+  try {
+    const fontsDir = path.join(__dirname, "fonts");
+    if (!fs.existsSync(fontsDir)) return;
+    const fcDir = path.join(__dirname, ".fontconfig");
+    if (!fs.existsSync(fcDir)) fs.mkdirSync(fcDir, { recursive: true });
+    const fontsConfPath = path.join(fcDir, "fonts.conf");
+    const cacheDir = path.join(fcDir, "cache");
+    if (!fs.existsSync(cacheDir)) fs.mkdirSync(cacheDir, { recursive: true });
+    const fontsConf = `<?xml version="1.0"?>
+<!DOCTYPE fontconfig SYSTEM "fonts.dtd">
+<fontconfig>
+  <dir>${fontsDir}</dir>
+  <cachedir>${cacheDir}</cachedir>
+  <include ignore_missing="yes">/etc/fonts/fonts.conf</include>
+</fontconfig>`;
+    fs.writeFileSync(fontsConfPath, fontsConf);
+    process.env.FONTCONFIG_FILE = fontsConfPath;
+  } catch (e) {
+    console.error("Font registration skipped:", e.message);
+  }
+})();
+
+const TOKEN     = process.env.TOKEN;
+const CLIENT_ID = process.env.CLIENT_ID || "1480592876684706064";
+const BETA_CLIENT_ID = "1533598420504412261";
+const IS_BETA_BOT = CLIENT_ID === BETA_CLIENT_ID;
+const OWNER_IDS = ["1419803002771865722","969280648667889764","363149593787105291"];
+const OWNER_ID  = OWNER_IDS[1];
+const GAY_IDS   = ["1245284545452834857","1413943805203189800","1057320311453913149","1193150033864949811"];
+const MEMERS = new Set(["1419803002771865722","1259223683826712729","1254388539890860083","1082452773787942922","1193150033864949811","1413943805203189800","969280648667889764","690219723472109616"]);
+
+// ── Restart webhook notice ────────────────────────────────────────────────────
+const DISCORD_WEBHOOK_URL = process.env.DISCORD_WEBHOOK_URL || null;
+let restartMessageId = null;
+
+async function postWebhookMessage(content) {
+  if (!DISCORD_WEBHOOK_URL) return null;
+  try {
+    const res = await fetch(`${DISCORD_WEBHOOK_URL}?wait=true`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ content }),
+    });
+    if (!res.ok) { console.error("webhook post failed:", res.status); return null; }
+    const data = await res.json();
+    return data?.id || null;
+  } catch(e) { console.error("webhook post error:", e.message); return null; }
+}
+
+async function editWebhookMessage(messageId, content) {
+  if (!DISCORD_WEBHOOK_URL || !messageId) return false;
+  try {
+    const res = await fetch(`${DISCORD_WEBHOOK_URL}/messages/${messageId}`, {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ content }),
+    });
+    if (!res.ok) { console.error("webhook edit failed:", res.status); return false; }
+    return true;
+  } catch(e) { console.error("webhook edit error:", e.message); return false; }
+}
+
+postWebhookMessage("🔄 RoyalBot restarting, please give us a few seconds…")
+  .then(id => { restartMessageId = id; })
+  .catch(() => {});
+
+// ── App emoji cache (populated on ready) ─────────────────────────────────────
+const appEmojiCache = new Map();
+
+// ── Instance lock ─────────────────────────────────────────────────────────────
+const INSTANCE_ID = Math.random().toString(36).slice(2, 8);
+const LOCK_PREFIX  = "BOT_INSTANCE_LOCK:";
+let instanceLocked = false;
+
+async function acquireInstanceLock(ownerUser) {
+  try {
+    const dm     = await ownerUser.createDM();
+    const recent = await dm.messages.fetch({ limit: 20 });
+    const now    = Date.now();
+    const competing = recent.find(m =>
+      m.author.id === CLIENT_ID &&
+      m.content.startsWith(LOCK_PREFIX) &&
+      !m.content.includes(INSTANCE_ID) &&
+      (now - m.createdTimestamp) < 15000
+    );
+    if (competing) { console.log(`[${INSTANCE_ID}] Duplicate: exiting.`); process.exit(0); }
+    await dm.send(`${LOCK_PREFIX}${INSTANCE_ID}:${now}`);
+        await dm.send(`Oh creator please don't leave me waiting…`);
+    instanceLocked = true;
+    console.log(`[${INSTANCE_ID}] Lock acquired.`);
+  } catch(e) { console.error("Lock failed:", e); instanceLocked = true; }
+}
+
+// ── Heartbeat / status page support ───────────────────────────────────────────
+const STATUS_FILE = "./status.json";
+const BOT_START_TIME = Date.now();
+const RESTART_TIMEOUT_MIN = 345;
+const RESTART_AT_MS = Number(process.env.BOT_DEADLINE_EPOCH) > 0
+  ? Number(process.env.BOT_DEADLINE_EPOCH) * 1000
+  : BOT_START_TIME + RESTART_TIMEOUT_MIN * 60 * 1000;
+const HEARTBEAT_INTERVAL_MIN = 10;
+
+function buildStatusObject() {
+  return {
+    startedAt: BOT_START_TIME,
+    lastHeartbeat: Date.now(),
+    nextScheduledRestart: RESTART_AT_MS,
+    guildCount: client?.guilds?.cache?.size ?? null,
+    instanceId: INSTANCE_ID,
+  };
+}
+
+async function commitStatusToGitHub() {
+  if (!GH_TOKEN || !GH_REPO) return;
+  const jsonString = JSON.stringify(buildStatusObject(), null, 2);
+  try { fs.writeFileSync(STATUS_FILE, jsonString); } catch(e) { console.error("status write error:", e.message); }
+
+  async function fetchSHA() {
+    return new Promise(resolve => {
+      const req = https.request({
+        hostname: "api.github.com", port: 443,
+        path: `/repos/${GH_REPO}/contents/status.json`,
+        method: "GET",
+        headers: { Authorization: `Bearer ${GH_TOKEN}`, "User-Agent": "discord-bot", Accept: "application/vnd.github+json" }
+      }, res => {
+        let b = ""; res.on("data", c => b += c);
+        res.on("end", () => { try { resolve(JSON.parse(b)?.sha || null); } catch { resolve(null); } });
+      });
+      req.on("error", () => resolve(null));
+      req.end();
+    });
+  }
+  async function tryPut(sha) {
+    const encoded = Buffer.from(jsonString).toString("base64");
+    const body = JSON.stringify({ message: "chore: heartbeat [skip ci]", content: encoded, ...(sha ? { sha } : {}) });
+    return new Promise((resolve, reject) => {
+      const req = https.request({
+        hostname: "api.github.com", port: 443,
+        path: `/repos/${GH_REPO}/contents/status.json`,
+        method: "PUT",
+        headers: {
+          Authorization: `Bearer ${GH_TOKEN}`, "User-Agent": "discord-bot",
+          Accept: "application/vnd.github+json",
+          "Content-Type": "application/json", "Content-Length": Buffer.byteLength(body),
+        }
+      }, res => {
+        let b = ""; res.on("data", c => b += c);
+        res.on("end", () => resolve({ status: res.statusCode, body: b }));
+      });
+      req.on("error", reject);
+      req.write(body); req.end();
+    });
+  }
+
+  try {
+    let sha = await fetchSHA();
+    let result = await tryPut(sha);
+    if (result.status === 409 || result.status === 422) {
+      sha = await fetchSHA();
+      result = await tryPut(sha);
+    }
+    if (result.status !== 200 && result.status !== 201) {
+      console.error(`❌ status.json commit failed HTTP ${result.status}: ${result.body.slice(0,200)}`);
+    }
+  } catch(e) { console.error("commitStatusToGitHub error:", e.message); }
+}
+
+setInterval(() => { commitStatusToGitHub().catch(()=>{}); }, HEARTBEAT_INTERVAL_MIN * 60 * 1000);
+
+// ── State ─────────────────────────────────────────────────────────────────────
+const guildChannels    = new Map();
+const welcomeChannels  = new Map();
+const leaveChannels    = new Map();
+const boostChannels    = new Map();
+const boostHistory = new Map();
+function ensureBoostGuildMap(guildId){
+  if(!boostHistory.has(guildId)) boostHistory.set(guildId, new Map());
+  return boostHistory.get(guildId);
+}
+function recordBoost(guildId, userId){
+  const m = ensureBoostGuildMap(guildId);
+  const rec = m.get(userId) || {count:0, firstBoostAt:Date.now(), lastBoostAt:Date.now()};
+  rec.count += 1; rec.lastBoostAt = Date.now();
+  m.set(userId, rec);
+  saveData();
+}
+async function seedBoostHistory(guild){
+  const m = ensureBoostGuildMap(guild.id);
+  try{ await guild.members.fetch(); }catch{}
+  let changed = false;
+  for(const [id, member] of guild.members.cache){
+    if(member.premiumSince && !m.has(id)){
+      m.set(id, {count:1, firstBoostAt:member.premiumSinceTimestamp||Date.now(), lastBoostAt:member.premiumSinceTimestamp||Date.now()});
+      changed = true;
+    }
+  }
+  if(changed) saveData();
+}
+const autoRoles        = new Map();
+const reactionRoles    = new Map();
+const rrBuilders = new Map();
+
+function normalizeEmojiKey(emojiRaw) {
+  return emojiRaw.trim().replace(/^<a?:([^:]+:\d+)>$/, "$1");
+}
+
+function normalizeRoleNameKey(s) {
+  return (s || "").toLowerCase().replace(/\s+/g, "");
+}
+// Finds a role by its plain name anywhere in a line, ignoring case and
+// spacing differences ("Book After Work" matches "bookafterwork" or
+// "BOOK AFTER WORK"). Longer role names are tried first so a short name
+// doesn't win over a more specific one that also appears in the line.
+function findRoleByFuzzyName(line, guild) {
+  if (!guild) return null;
+  const normChars = [], origIndex = [];
+  for (let i = 0; i < line.length; i++) {
+    if (/\s/.test(line[i])) continue;
+    normChars.push(line[i].toLowerCase());
+    origIndex.push(i);
+  }
+  const normLine = normChars.join("");
+  if (!normLine) return null;
+
+  const roles = [...guild.roles.cache.values()]
+    .filter(r => r.id !== guild.id && normalizeRoleNameKey(r.name))
+    .sort((a, b) => normalizeRoleNameKey(b.name).length - normalizeRoleNameKey(a.name).length);
+  for (const r of roles) {
+    const key = normalizeRoleNameKey(r.name);
+    const pos = normLine.indexOf(key);
+    if (pos === -1) continue;
+    return { role: r, start: origIndex[pos], end: origIndex[pos + key.length - 1] + 1 };
+  }
+  return null;
+}
+// Reads each line for either an actual role mention or, failing that, the
+// role's plain name (case and spacing don't matter), and returns the role
+// paired with whatever's left on the line as the emoji. guild is required
+// for name matching; without it, only real mentions are recognized.
+function parseReactionRoleLines(content, guild) {
+  const results = [];
+  for (const line of (content || "").split("\n")) {
+    const roleMatch = line.match(/<@&(\d+)>/);
+    let roleId, matchStart, matchEnd;
+    if (roleMatch) {
+      roleId = roleMatch[1];
+      matchStart = roleMatch.index;
+      matchEnd = roleMatch.index + roleMatch[0].length;
+    } else {
+      const found = findRoleByFuzzyName(line, guild);
+      if (!found) continue;
+      roleId = found.role.id;
+      matchStart = found.start;
+      matchEnd = found.end;
+    }
+    const rest = line.slice(0, matchStart) + line.slice(matchEnd);
+    const emojiRaw = rest.replace(/[|:\-\u2013\u2014]+/g, " ").trim();
+    if (emojiRaw) results.push({ emojiRaw, roleId });
+  }
+  return results;
+}
+
+function formatReactionRoleBindings(guildId, messageId) {
+  const prefix = `${guildId}:${messageId}:`;
+  const entries = [...reactionRoles.entries()].filter(([k]) => k.startsWith(prefix));
+  if (!entries.length) return "_No reaction roles set up on this message yet._";
+  const guild = client.guilds.cache.get(guildId);
+  return entries.map(([key, roleId]) => {
+    const emojiPart = key.slice(prefix.length);
+    const display = emojiPart.includes(":") ? `<:${emojiPart}>` : emojiPart;
+    const role = guild?.roles.cache.get(roleId);
+    return `${display} to ${role ? `<@&${role.id}>` : "an unknown role"}`;
+  }).join("\n");
+}
+
+async function findMessageInGuild(guild, messageId) {
+  for (const ch of guild.channels.cache.filter(c => (c.isText && c.isText()) || c.type === "GUILD_TEXT").values()) {
+    const found = await ch.messages.fetch(messageId).catch(() => null);
+    if (found) return found;
+  }
+  return null;
+}
+
+function buildReactionRoleManualPanel(token) {
+  const b = rrBuilders.get(token);
+  const prefix = `${b.guildId}:${b.messageId}:`;
+  const entries = [...reactionRoles.entries()].filter(([k]) => k.startsWith(prefix));
+  const guild = client.guilds.cache.get(b.guildId);
+  const rows = [];
+  if (entries.length) {
+    const options = entries.map(([key, roleId]) => {
+      const emojiPart = key.slice(prefix.length);
+      const role = guild?.roles.cache.get(roleId);
+      const label = `${emojiPart.includes(":") ? "Custom emoji" : emojiPart} to ${role ? role.name : "unknown role"}`;
+      return { label: label.slice(0, 100), value: key };
+    });
+    rows.push(new MessageActionRow().addComponents(
+      new MessageSelectMenu().setCustomId(`rr_remove_${token}`).setPlaceholder("Select a binding to remove...").setOptions(options)
+    ));
+  }
+  rows.push(new MessageActionRow().addComponents(
+    new MessageButton().setCustomId(`rr_addstart_${token}`).setLabel("Add Binding").setStyle("PRIMARY").setEmoji({ name:"➕" }),
+    new MessageButton().setCustomId(`rr_done_${token}`).setLabel("Done").setStyle("SECONDARY"),
+  ));
+  const content = [
+    `Reaction Role Builder for message \`${b.messageId}\``,
+    "",
+    "Current bindings:",
+    formatReactionRoleBindings(b.guildId, b.messageId),
+  ].join("\n");
+  return { content, components: rows };
+}
+
+function buildReactionRoleRolePicker(token) {
+  const b = rrBuilders.get(token);
+  const guild = client.guilds.cache.get(b.guildId);
+  const items = getEligibleTicketRoles(guild).map(r => ({ label: r.name, value: r.id }));
+  const { rows } = buildTicketPickerRows({ items, idPrefix:`rr_pickrole_${token}`, mode:"single", placeholder:"Pick a role..." });
+  rows.push(new MessageActionRow().addComponents(
+    new MessageButton().setCustomId(`rr_cancel_${token}`).setLabel("Cancel").setStyle("SECONDARY"),
+  ));
+  return { content: `Emoji: ${b.pendingEmoji}\nNow pick which role it should give:`, components: rows };
+}
+// ── Dropdown roles (select-menu upgrade to reaction roles) ──────────────────
+const dropdownRoleSets = new Map();
+
+const ddBuilders = new Map();
+const DD_MAX_DROPDOWNS = 5;
+
+function newDdSetId() {
+  return `dd${Date.now().toString(36)}${Math.random().toString(36).slice(2,6)}`;
+}
+
+function emojiOptionFromRaw(emojiRaw) {
+  const m = (emojiRaw||"").trim().match(/^<(a)?:([^:]+):(\d+)>$/);
+  if (m) return { name: m[2], id: m[3], animated: !!m[1] };
+  return { name: (emojiRaw||"").trim() || "🔘" };
+}
+function emojiDisplayFromRaw(emojiRaw) {
+  const m = (emojiRaw||"").trim().match(/^<(a)?:([^:]+):(\d+)>$/);
+  if (m) return `<${m[1]?"a":""}:${m[2]}:${m[3]}>`;
+  return (emojiRaw||"").trim();
+}
+
+function ddTouch(token) {
+  const b = ddBuilders.get(token);
+  if (!b) return;
+  clearTimeout(b._expireTimer);
+  b._expireTimer = setTimeout(()=>ddBuilders.delete(token), 15*60*1000);
+}
+
+function buildDdMainPanel(token) {
+  const b = ddBuilders.get(token);
+  const rows = [];
+  if (b.dropdowns.length) {
+    const options = b.dropdowns.map((dd, i) => ({
+      label: `${i+1}. ${dd.name}`.slice(0,100),
+      description: `${dd.options.length} option${dd.options.length!==1?"s":""}`.slice(0,100),
+      value: String(i),
+    }));
+    rows.push(new MessageActionRow().addComponents(
+      new MessageSelectMenu().setCustomId(`ddb_edit_${token}`).setPlaceholder("Choose a dropdown to edit...").setOptions(options)
+    ));
+  }
+  rows.push(new MessageActionRow().addComponents(
+    new MessageButton().setCustomId(`ddb_new_${token}`).setLabel("New Dropdown").setStyle("PRIMARY").setEmoji({name:"➕"}),
+    new MessageButton().setCustomId(`ddb_detect_${token}`).setLabel("Detect from Messages").setStyle("SECONDARY").setEmoji({name:"🔎"}),
+  ));
+  rows.push(new MessageActionRow().addComponents(
+    new MessageButton().setCustomId(`ddb_post_${token}`).setLabel("Post").setStyle("SUCCESS").setDisabled(!b.dropdowns.length),
+    new MessageButton().setCustomId(`ddb_cancel_${token}`).setLabel("Cancel").setStyle("DANGER"),
+  ));
+  const lines = b.dropdowns.length
+    ? b.dropdowns.map((dd,i)=>`**${i+1}. ${dd.name}** — ${dd.options.length} option${dd.options.length!==1?"s":""}`).join("\n")
+    : "_No dropdowns yet. Add one, or paste message IDs to detect from existing reaction-role-style messages._";
+  const content = [
+    "**Dropdown Roles Builder**",
+    b.dropdowns.length > DD_MAX_DROPDOWNS ? `⚠️ Only the first ${DD_MAX_DROPDOWNS} dropdowns will be posted (one per row, ${DD_MAX_DROPDOWNS} max per message).` : null,
+    "",
+    lines,
+  ].filter(Boolean).join("\n");
+  return { content, components: rows };
+}
+
+function buildDdEditPanel(token, index) {
+  const b = ddBuilders.get(token);
+  const dd = b.dropdowns[index];
+  const guild = client.guilds.cache.get(b.guildId);
+  const rows = [];
+  if (dd.options.length) {
+    const options = dd.options.map((opt, i) => {
+      const role = guild?.roles.cache.get(opt.roleId);
+      return {
+        label: `${role ? role.name : "unknown role"}`.slice(0,100),
+        description: emojiDisplayFromRaw(opt.emojiRaw).slice(0,100),
+        value: String(i),
+        emoji: emojiOptionFromRaw(opt.emojiRaw),
+      };
+    });
+    rows.push(new MessageActionRow().addComponents(
+      new MessageSelectMenu().setCustomId(`ddb_removeopt_${token}_${index}`).setPlaceholder("Select an option to remove...").setOptions(options)
+    ));
+  }
+  rows.push(new MessageActionRow().addComponents(
+    new MessageButton().setCustomId(`ddb_addopt_${token}_${index}`).setLabel("Add Option").setStyle("PRIMARY").setEmoji({name:"➕"}),
+    new MessageButton().setCustomId(`ddb_rename_${token}_${index}`).setLabel("Rename").setStyle("SECONDARY"),
+  ));
+  rows.push(new MessageActionRow().addComponents(
+    new MessageButton().setCustomId(`ddb_moveup_${token}_${index}`).setLabel("Move Up").setStyle("SECONDARY").setEmoji({name:"⬆️"}).setDisabled(index===0),
+    new MessageButton().setCustomId(`ddb_movedown_${token}_${index}`).setLabel("Move Down").setStyle("SECONDARY").setEmoji({name:"⬇️"}).setDisabled(index===b.dropdowns.length-1),
+    new MessageButton().setCustomId(`ddb_deletedd_${token}_${index}`).setLabel("Delete Dropdown").setStyle("DANGER"),
+  ));
+  rows.push(new MessageActionRow().addComponents(
+    new MessageButton().setCustomId(`ddb_back_${token}`).setLabel("← Back").setStyle("SECONDARY"),
+  ));
+  const optLines = dd.options.length
+    ? dd.options.map(opt => {
+        const role = guild?.roles.cache.get(opt.roleId);
+        return `${emojiDisplayFromRaw(opt.emojiRaw)} → ${role ? `<@&${role.id}>` : "unknown role"}`;
+      }).join("\n")
+    : "_No options yet._";
+  const content = `Editing dropdown **${dd.name}** (${index+1}/${b.dropdowns.length})\n\n${optLines}`;
+  return { content, components: rows };
+}
+
+function buildDdRolePicker(token, index) {
+  const b = ddBuilders.get(token);
+  const guild = client.guilds.cache.get(b.guildId);
+  const items = getEligibleTicketRoles(guild).map(r => ({ label: r.name, value: r.id }));
+  const { rows } = buildTicketPickerRows({ items, idPrefix:`ddb_pickrole_${token}_${index}`, mode:"single", placeholder:"Pick a role..." });
+  rows.push(new MessageActionRow().addComponents(
+    new MessageButton().setCustomId(`ddb_cancelopt_${token}_${index}`).setLabel("Cancel").setStyle("SECONDARY"),
+  ));
+  return { content: `Emoji: ${emojiDisplayFromRaw(b.pendingEmoji)}\nNow pick which role it should give:`, components: rows };
+}
+
+function buildDdChannelPicker(token) {
+  const b = ddBuilders.get(token);
+  const guild = client.guilds.cache.get(b.guildId);
+  const items = [...guild.channels.cache.filter(ch =>
+    ch.type==="GUILD_TEXT" && guild.members.me &&
+    ch.permissionsFor(guild.members.me).has("SEND_MESSAGES")
+  ).values()].map(ch => ({ label:`#${ch.name}`, value: ch.id }));
+  const { rows } = buildTicketPickerRows({ items, idPrefix:`ddb_postchannel_${token}`, mode:"single", placeholder:"Pick a channel to post in..." });
+  rows.push(new MessageActionRow().addComponents(
+    new MessageButton().setCustomId(`ddb_back_${token}`).setLabel("← Back").setStyle("SECONDARY"),
+  ));
+  return { content: "Which channel should the dropdown message be posted in?", components: rows };
+}
+
+function buildLiveDropdownRows(guild, setId, dropdowns) {
+  return dropdowns.slice(0, DD_MAX_DROPDOWNS).map((dd, i) => {
+    const options = dd.options.map(opt => ({
+      label: (guild?.roles.cache.get(opt.roleId)?.name || "unknown role").slice(0,100),
+      value: opt.roleId,
+      emoji: emojiOptionFromRaw(opt.emojiRaw),
+    }));
+    return new MessageActionRow().addComponents(
+      new MessageSelectMenu()
+        .setCustomId(`ddsel_${setId}_${i}`)
+        .setPlaceholder(dd.name.slice(0,100))
+        .setMinValues(0)
+        .setMaxValues(options.length)
+        .setOptions(options)
+    );
+  });
+}
+
+const disabledOwnerMsg = new Set();
+const activeGames      = new Map();
+const reminders        = [];
+const scheduledMessages = new Map();
+const countGames       = new Map();
+const countingChannels = new Map();
+// countingBlocks: scopedKey(guildId,userId) -> expiry ms. Set by the Jarvis "elementary" trigger.
+const countingBlocks = new Map();
+// ── Guild-scoped effect key helper ───────────────────────────────────────────
+function scopedKey(guildId, userId){ return `${guildId||"global"}:${userId}`; }
+const shadowDelete = new Map();
+// ── Delete flavor lines (shadowdelete + a user deleting their own message) ──
+const MESSAGE_DELETE_FLAVOR_LINES = [
+  "Must’ve been the wind.",
+  "The Lord giveth message perms, and the Lord taketh them away.",
+  "What message?",
+  "There was never a message here.",
+  "Must be a skill issue.",
+  "I saw nothing.",
+  "Nothing to see here.",
+  "The void has spoken.",
+  "Your message has been selected for deletion.",
+  "Congratulations! Your message has been deemed unnecessary.",
+  "Your message has been promoted to the shadow realm.",
+  "Interesting. I seem to have misplaced that.",
+  "This message was brought to you by poor decisions.",
+  "The council has decided.",
+  "The council has spoken. The message has not.",
+  "Your message failed the vibe check.",
+  "Message.exe has stopped working.",
+  "Message successfully sentn't.",
+  "Oops.",
+  "Anyway.",
+  "Moving on.",
+  "We don't talk about what just happened.",
+  "I have no idea what you're talking about.",
+  "I am just as surprised as you are.",
+  "That was weird. Huh. Anyway...",
+  "The message was never real.",
+  "Your message has been sacrificed for the greater good.",
+  "One message has been taken by the algorithm.",
+  "The algorithm demands a sacrifice.",
+  "A small price to pay for salvation.",
+  "The deletion was foretold.",
+  "It has been decided.",
+  "Your message has been judged.",
+  "Your message has been found wanting.",
+  "The prophecy has been fulfilled.",
+  "Natural causes.",
+  "Probably a bug.",
+  "Definitely not me.",
+  "Don't look at me.",
+  "I didn't do it.",
+  "I was never here.",
+  "This is above my pay grade.",
+  "Please remain calm.",
+  "Please do not investigate.",
+  "Nothing unusual has occurred.",
+  "Everything is functioning exactly as intended.",
+  "This incident has been classified.",
+  "The Department of Message Removal has been notified.",
+  "Your message has been sent to the recycling bin.",
+  "Your message has been carefully reviewed and subsequently regretted.",
+  "We appreciate your sacrifice.",
+  "Thank you for your contribution to science.",
+  "Your message will be missed.",
+  "Gone, but not forgotten.",
+  "F.",
+  "🫡",
+  "Skill issue.",
+  "Thy message hath been stricken from the record.",
+  "The scribe hath deemed thy words unworthy.",
+  "By royal decree, thy message is no more.",
+  "The king hath spoken. Thy message hath not.",
+  "Thy words have been claimed by the abyss.",
+  "The scroll hath been burned.",
+  "The ink hath dried, yet thy words remain not.",
+  "Henceforth, thou shalt speak no more.",
+  "Thy message has been cast into the flames.",
+  "The archives shall remember thee not.",
+  "Thy words have been erased from history.",
+  "By decree of the crown, this message never existed.",
+  "The messenger was slain before delivering thy words.",
+  "The raven hath returned empty-handed.",
+  "The royal scribe hath misplaced thy message.",
+  "Alas, thy message hath fallen from the scroll.",
+  "The parchment hath been confiscated.",
+  "Thy words have offended the court.",
+  "The court finds thy message... disposable.",
+  "The council hath reached its decision.",
+  "The council hath spoken. Thy message hath been silenced.",
+  "Thy message hath been judged and found wanting.",
+  "The gods demand a sacrifice. They chose thy message.",
+  "The heavens have judged thy words.",
+  "Divine intervention hath occurred.",
+  "The Lord giveth messages, and the Lord taketh messages away.",
+  "The bell tolls for thy message.",
+  "Thy message hath met its maker.",
+  "Rest well, fallen message. Thou served thy purpose.",
+  "Here lies a message. It lived briefly.",
+  "A moment of silence for the fallen words.",
+  "Thy message has been banished from the realm.",
+  "Exiled by order of the crown.",
+  "Thou hast been censored by the kingdom.",
+  "The royal censor hath arrived.",
+  "The castle guards have removed thy message.",
+  "The message hath been seized by the king's men.",
+  "By order of His Majesty, nah.",
+  "The king has decided that you didn't say that.",
+  "The king hath reconsidered thy words.",
+  "His Majesty would prefer if thou said nothing.",
+  "Speak thy words again, peasant. Perhaps they shall survive this time.",
+  "Thou hast rolled poorly.",
+  "The dice have spoken. Thy message is gone.",
+  "Fate hath dealt thee an unfortunate hand.",
+  "Thy message hath been claimed by fate.",
+  "The ancient prophecy foretold this deletion.",
+  "It was written. It was read. It was erased.",
+  "Thus concludes thy contribution to the realm.",
+  "And lo, the message was no more.",
+  "Call me deletion.",
+  "It was the best of messages, it was the worst of messages.",
+  "All messages are equal, but some messages are more equal than others.",
+  "Big Brother has deleted your message.",
+  "The message is dead. Long live the message.",
+  "Abandon hope, all ye whose messages are deleted here.",
+  "It was a dark and deletion-filled night.",
+  "The message? It is gone.",
+  "I have no message, and I must scream.",
+  "I have no message, and I must delete.",
+  "HATE. LET ME TELL YOU HOW MUCH I’VE COME TO HATE YOUR MESSAGE SINCE YOU SENT IT.",
+  "Your message has been deemed unworthy of continued existence.",
+  "You died.",
+  "[Message] was slain by RoyalBot.",
+  "[Message] fell from a high place.",
+  "Your message has fallen into the void.",
+  "Your message tried to swim in lava.",
+  "The chat was blown up by Creeper.",
+  "Your message has entered the Nether.",
+  "* The message refused to stay.",
+  "* Your message has been erased.",
+  "* Despite everything, your message is gone.",
+  "* You feel like you’re going to have a bad time.",
+  "* The message is filled with determination.",
+  "* It’s a message. Or was.",
+  "* The [MESSAGE] was thrown away.",
+  "* You encountered the DELETE button.",
+  "MESSAGE DELETED.",
+  "MANKIND IS DEAD. MESSAGE IS FUEL. ROYALBOT IS GOD.",
+  "BE GONE.",
+  "THY MESSAGE IS DEAD.",
+  "JUDGEMENT.",
+  "PREPARE THY MESSAGE.",
+  "CRUSH.",
+  "+DISRESPECT",
+  "+MESSAGE DELETED",
+  "Your message has been sent to Heresy.",
+  "The message was a triumph.",
+  "We do what we must because we can. Your message was deleted.",
+  "This was a triumph. I'm making a note here: huge deletion.",
+  "The Enrichment Center reminds you that your message does not exist.",
+  "You have been given a message. It has now been taken away.",
+  "The cake was a lie. The message was also a lie.",
+  "Rise and shine, Mr. Message.",
+  "The right message in the wrong place can make all the difference in the world.",
+  "Wake up and smell the ashes.",
+  "Your message has been removed from the Black Mesa incident.",
+  "War. War never changes. Messages do.",
+  "Your message has been lost to the wastes.",
+  "Patrolling the Mojave almost makes you wish for a message deletion.",
+  "The message has encountered a critical failure.",
+  "Courier? What courier?",
+  "YOU DIED.",
+  "Message ahead. Therefore, deletion.",
+  "Try message, but hole.",
+  "Git gud.",
+  "Bearer of the deleted message, seek seek lest.",
+  "The message has been felled.",
+  "O message, thou art of passing skill.",
+  "I am Malenia, Blade of Miquella. And I have deleted your message.",
+  "Kept you waiting, huh? Your message is gone.",
+  "A message dies when it is deleted.",
+  "War has changed.",
+  "The message... it was never yours.",
+  "What a thrill...",
+  "Snake? Snake? SNAKE!",
+  "It's dangerous to go alone! Take this deletion.",
+  "Do a barrel roll. Your message won't.",
+  "Wake me when you need me.",
+  "Finish the message.",
+  "Fatality.",
+  "Hadouken!",
+  "Get over here!",
+  "The message is approaching.",
+  "You cannot simply walk into chat.",
+  "One does not simply send a message here.",
+  "My precious message.",
+  "Why did it have to be messages?",
+  "Somehow, the message returned.",
+  "The message has been taken to a farm upstate.",
+  "What is a message? A miserable little pile of permissions.",
+  "You either die a message, or live long enough to see yourself become deleted.",
+  "I am become deletion, destroyer of messages.",
+  "There is no message in Ba Sing Se.",
+  "The message must flow.",
+  "Message? Message? Message?",
+  "It’s over. I have the high ground.",
+  "I am altering the message. Pray I don’t alter it further.",
+  "I have no mouth, and I must scream.",
+  "HATE. LET ME DELETE YOUR MESSAGE.",
+  "Achievement unlocked: Message Deleted.",
+  "The message has been sent to the End.",
+  "The message has been corrupted.",
+  "Despite everything, it’s still deleted.",
+  "Despite everything, your message is still gone.",
+  "Your message has been [BIG SHOT].",
+  "NOW’S YOUR CHANCE TO BE A [DELETED MESSAGE]!",
+  "HEY EVERY !! IT’S YOUR BOY!! THE MESSAGE HAS BEEN [DELETED]!!",
+  "Your message is a [BIG SHOT] no more.",
+  "A [LIMITED TIME OFFER]: your message is gone!",
+  "You’ve been [PIPE DOWN]’d.",
+  "The message has fallen into the Dark World.",
+  "A Dark Fountain has appeared where your message used to be.",
+  "The Roaring has begun. Your message is gone.",
+  "The three heroes have arrived. Unfortunately, your message has not.",
+  "Your message has been sealed away.",
+  "The darkness calls...",
+  "You felt your sins crawling on your back.",
+  "Your message fills you with DETERMINATION.",
+  "You are filled with the power of deletion.",
+  "You have reached the end of the message.",
+  "It’s a lone message. It’s not doing anything.",
+  "The message doesn’t seem to understand what’s happening.",
+  "Your message is now [Hyperlink Blocked].",
+  "Your message has been added to the [Discard Pile].",
+  "You tried to send a message. It refused.",
+  "The message is still thinking about that.",
+  "The message is doing its best.",
+  "The message has no idea what to do.",
+  "You recalled the message.",
+  "You remembered something you already knew.",
+  "The message has been spared.",
+  "You spared the message. RoyalBot did not.",
+  "The message looked like it was going to say something...",
+  "The message was not happy about this.",
+  "The message became very tired.",
+  "You whispered something to the message.",
+  "The message whispered something back.",
+  "The message refused.",
+  "The message refused to be controlled.",
+  "Your SOUL is gone. So is your message.",
+  "Your message became lost in the Cyber World.",
+  "HEY EVERY !! IT’S TIME TO DELETE YOUR [[Message]]!!",
+  "YOU TOO CAN BECOME A [[BIG SHOT]]!! Just not in this chat.",
+  "YOUR MESSAGE HAS BEEN [[DISCONTINUED]]!!",
+  "GET YOUR MESSAGE NOW AT THE LOW LOW PRICE OF [[ONE DELETION]]!!",
+  "WOAH!! THIS MESSAGE IS [[HYPERLINK BLOCKED]]!!",
+  "YOU’RE [[100% OFF]] YOUR MESSAGE!!",
+  "SORRY PAL!! THE [[FREE TRIAL]] HAS ENDED!!",
+  "YOU WANT TO BE A [[BIG SHOT]]? FIRST YOU GOTTA LOSE THE MESSAGE!!",
+  "THIS IS YOUR CHANCE TO BE A [[BIG SHOT]]!!",
+  "YOUR MESSAGE HAS BEEN [[DISCONNECTED]] FROM THE [[INTERNET]]!!",
+  "CALL NOW!! OPERATORS ARE [[NOT]] STANDING BY!!",
+  "YOUR MESSAGE HAS BEEN [[BLOCKED]] BY OUR [HYPERLINK] DEPARTMENT.",
+  "You feel like you’re going to have a bad time.",
+  "It’s a beautiful day outside. Birds are singing, flowers are blooming... and your message is gone.",
+  "You’re gonna have a bad time.",
+  "But nobody came.",
+  "You tried to send a message. But nobody came.",
+  "A message was added to the pile.",
+  "The message was not spared.",
+  "You won’t like what happens next.",
+  "You have died.",
+  "Game Over.",
+  "You cannot give up just yet.",
+  "Stay determined.",
+  "Despite everything... it’s still gone.",
+  "DESTROY.",
+  "+PARRY",
+  "+ENRAGED",
+  "MANKIND IS DEAD.",
+  "MESSAGE IS FUEL.",
+  "ROYALBOT IS ETERNAL.",
+  "YOU CAN’T ESCAPE.",
+  "USELESS.",
+  "THIS WILL HURT.",
+  "YOU ARE NOT GETTING AWAY.",
+  "Machine, what happened to your message?",
+  "The message has entered Heresy.",
+  "I’m making a note here: huge deletion.",
+  "Thank you for helping us help you help us.",
+  "Please proceed to the next test chamber.",
+  "The test is now over.",
+  "The cake was a lie. So was your message.",
+  "Your message has been removed from the testing area.",
+  "Time, Dr. Message? Is it really that time again?",
+  "This message has been removed by the Administrator.",
+  "Gordon doesn’t need to hear all this.",
+  "Forget about Freeman.",
+  "You died. Again.",
+  "Be wary of message.",
+  "Foul message.",
+  "Put these foolish messages to rest.",
+  "Ahh... you were at my side, all along. Your message.",
+  "A message to surpass Metal Gear.",
+  "Message has changed.",
+  "SNAAAAKE!",
+  "You’re pretty good.",
+  "The message is coming from inside the server.",
+  "I see dead messages.",
+  "May the message rest in peace.",
+  "The first rule of the server is: we do not talk about the deleted message.",
+  "Suffer like G did.",
+  "A NEW HAND TOUCHES THE MESSAGE.",
+  "Hey, you. You’re finally awake.",
+  "Stop right there, criminal message!",
+  "You picked the wrong message, fool!",
+  "Protocol 3: Protect the message.",
+  "Trust me.",
+  "Stand by for Titanfall.",
+  "Would you kindly... delete that?",
+  "Would you kindly stop sending messages?",
+  "A corpse should be left well alone.",
+  "Fear the old message.",
+  "Grant us messages.",
+  "A hoonter must hoont. RoyalBot must delete.",
+  "Tonight, the message joins the hunt.",
+  "Wake up, Samurai. We’ve got a message to delete.",
+  "Your message was covered.",
+  "The Void has no use for your message.",
+  "Something survived. Your message did not.",
+  "The dimension is gone. So is the message.",
+  "There was only one survivor. It wasn't your message.",
+  "The Void does not remember your words.",
+  "The portal opened. Your message did not return.",
+  "4736251.",
+  "The number has seen your message.",
+  "Do not follow the message through the portal.",
+  "Your message came from somewhere that no longer exists.",
+  "Something on the other side is reading your message.",
+  "The mask smiled. Then the message disappeared.",
+  "The Void took it.",
+  "It was here before the covering.",
+  "The covering has begun.",
+  "Your message has become a Remnant.",
+  "A Remnant remembers what the world forgot.",
+  "The world forgot your message.",
+  "There is nothing left of the dimension. Check again.",
+  "You shouldn't have looked through that portal.",
+  "The portal is still open. Your message isn't.",
+  "The Void does not destroy things twice.",
+  "Something is wrong with the number.",
+  "The message has been displaced between dimensions.",
+  "This message has no known origin.",
+  "Origin: [REDACTED]",
+  "Destination: [REDACTED]",
+  "Survivor count: 1.",
+  "Survivor count: 0.",
+  "Do not ask what happened to the others.",
+  "The Void event has concluded.",
+  "The Void event is still occurring.",
+  "The scar is still there.",
+  "Something is standing inside the Void Scar.",
+  "The message was never from this dimension.",
+  "It learned your intent before you finished typing.",
+  "It knows what you meant.",
+  "It shouldn't be able to read this.",
+  "The portal shouldn't be here.",
+  "There is no reason for this portal to exist.",
+  "Someone has been here before.",
+  "You have been here before.",
+  "You just don't remember.",
+  "The mask remembers.",
+  "The number remembers.",
+  "Something remembers.",
+  "The message has been archived by the Watcher.",
+  "The Watcher saw this happen.",
+  "IT SAW YOU SEND THAT.",
+  "IT WAS NOT SUPPOSED TO SEE THAT.",
+  "A dimension has been removed from the record.",
+  "One more portal.",
+  "One more message.",
+  "One less world.",
+  "Do not make the same mistake twice.",
+  "There are things beyond the portal.",
+  "There are things beyond the message.",
+  "The Void is not empty.",
+  "The message was covered.",
+  "The message survived. Somehow.",
+  "The message should not have survived.",
+  "It survived for exactly 4736251 milliseconds.",
+  "No one knows why.",
+  "The last thing that dimension saw was your message.",
+  "The first thing the next dimension saw was its deletion.",
+  "Something followed the message here.",
+  "You should not be reading this.",
+  "You are not supposed to know about the Void.",
+  "Fred evaporated your message.",
+  "Royal V- reference.",
+  "Paavan reference.",
+  "Hawky reference.",
+  "Bla- Krow reference.",
+  "Respawn Raccoon reference.",
+  "Me reference.",
+  "This message has been Royal V- approved. Unfortunately, it was deleted.",
+  "Paavan knows what happened.",
+  "Hawky was here five minutes ago.",
+  "Krow was here. Then the message wasn't.",
+  "Respawn Raccoon has respawned your message somewhere else.",
+  "Fred evaporated it. Don't ask how.",
+  "A Royal V- reference has been detected.",
+  "A Paavan reference has been detected.",
+  "A Hawky reference has been detected.",
+  "A Bla- Krow reference has been detected.",
+  "A Respawn Raccoon reference has been detected.",
+  "A me reference has been detected.",
+  "You have triggered the forbidden Royal V- reference.",
+  "You have triggered the Paavan event.",
+  "You have triggered the Hawky protocol.",
+  "You have triggered the Bla- Krow incident.",
+  "You have triggered the Respawn Raccoon contingency.",
+  "You have triggered the me incident.",
+  "The reference was so powerful that your message evaporated.",
+  "Fred has been notified.",
+  "Royal V- knows what you did.",
+  "Paavan knows what you did.",
+  "Hawky knows what you did.",
+  "Krow knows what you did.",
+  "Respawn Raccoon knows what you did.",
+  "I know what you did.",
+  "The references are watching.",
+  "This was a reference. You wouldn't get it.",
+  "If you understood this reference, I'm sorry.",
+  "The council has determined that this is a Royal V- reference.",
+  "Your message has been sacrificed to the lore.",
+  "The lore demanded your message.",
+  "Your message is now canon.",
+  "Unfortunately, canonically, it was deleted."
+];
+function pickDeleteFlavorLine(){
+  return MESSAGE_DELETE_FLAVOR_LINES[Math.floor(Math.random() * MESSAGE_DELETE_FLAVOR_LINES.length)];
+}
+async function sendDeleteFlavorLine(channel){
+  if(!channel) return;
+  try{ await channel.send({ content: pickDeleteFlavorLine() }); }catch(e){ console.error("[deleteFlavor] send failed:", e.message); }
+}
+
+const clankerify = new Map();
+const inviteComps      = new Map();
+const inviteCache      = new Map();
+const ticketConfigs    = new Map();
+const openTickets      = new Map();
+const premieres        = new Map();
+const disabledLevelUp  = new Set();
+const userInstalls     = new Set();
+const featureBlacklist = new Map();
+function isFeatureBlacklisted(userId, featureName){
+  const b = featureBlacklist.get(userId);
+  if(!b) return false;
+  return b.features.has("all") || b.features.has(featureName);
+}
+function isFullyBlacklisted(userId){
+  return !!featureBlacklist.get(userId)?.features.has("all");
+}
+function isSilentBlacklisted(userId){
+  return !!featureBlacklist.get(userId)?.silent;
+}
+const activityChecks   = new Map();
+const scheduledChecks  = new Map();
+const raConfig         = new Map();
+const raTimers         = new Map();
+const levelUpConfig    = new Map();
+const dailyQuoteChannels = new Map();
+const quoteCooldown    = new Map();
+
+// ── YouTube tracking ─────────────────────────────────────────────────────────
+const ytConfig = new Map();
+
+function getYtKey(guildId) { return ytConfig.get(guildId)?.apiKey || null; }
+
+// ── Song of the Day (/sotd, /sotd-playlist) ──────────────────────────────────
+// sotdConfig: guildId -> {
+//   postChannelId, hour (0-23 UTC), pingRoleId,
+//   playlists: [{ id, url, label, entries:[{videoId,title,index}], trackCount }],
+//   usedVideoIds: [videoId,...],   // this shuffle cycle; cleared once every entry's been posted
+//   _lastFire: "YYYY-M-D:H",
+// }
+const sotdConfig = new Map();
+// sotdMetaCache: videoId -> { title, artist, artwork, genres:[...], matched, cachedAt }
+const sotdMetaCache = new Map();
+// sotdVotes: videoId -> { count, voters:[userId,...] }, persisted so the score
+// and who voted survives a restart, same as it does for every other video.
+const sotdVotes = new Map();
+const SOTD_GENRE_CHOICES = ["Pop","Rock","Hip Hop","R&B","Jazz","Country","Metal","EDM","Indie","Alternative","Classical","Reggae","Folk","Punk","Soul","Funk","Blues","K-Pop","Latin","House","Techno","Dubstep","Trap","Lo-fi"];
+
+// ── /gifquality ────────────────────────────────────────────────────────────
+// gifqJobs: token -> { srcPath, workDir, name, width, height, fps, ownerId, scalePct, targetFps }
+const gifqJobs = new Map();
+const gifqCooldown = new Map(); // userId -> last-used ms, a light spam guard since conversion is real CPU work
+
+function probeVideoInfo(filePath){
+  return new Promise((resolve) => {
+    const proc = spawn(ffmpegPath, ["-i", filePath], { stdio:["ignore","ignore","pipe"] });
+    let stderr = "";
+    proc.stderr.on("data", d => stderr += d.toString());
+    proc.on("close", () => {
+      const dim = stderr.match(/, (\d{2,5})x(\d{2,5})[, ]/);
+      const fpsM = stderr.match(/, ([\d.]+) fps/);
+      if(!dim){ resolve(null); return; }
+      resolve({ width: parseInt(dim[1],10), height: parseInt(dim[2],10), fps: fpsM ? parseFloat(fpsM[1]) : 24 });
+    });
+    proc.on("error", () => resolve(null));
+  });
+}
+function buildGifQualityPanel(token){
+  const j = gifqJobs.get(token);
+  if(!j) return { content:"❌ This session expired, run `/gifquality` again.", embeds:[], components:[] };
+  const embed = {
+    color: 0x5865F2,
+    title: "🎞️ GIF Quality",
+    description: `**${j.name}** (${j.width}x${j.height}, ~${j.fps.toFixed(1)} fps)\n\nPick a quality (resolution) and a frame rate, then convert. The result is always a \`.gif\`.`,
+    fields: [
+      { name:"Quality", value: j.scalePct ? `${j.scalePct}%` : "Not set", inline:true },
+      { name:"FPS", value: j.targetFps ? `${j.targetFps}` : "Not set", inline:true },
+    ],
+  };
+  const qualityOptions = [100,75,50,35,25,15].map(p => ({ label: p===100 ? "100% (original)" : `${p}%`, value:String(p), default: j.scalePct===p }));
+  const roundedSrcFps = Math.round(j.fps);
+  const fpsCandidates = [...new Set([roundedSrcFps,15,10,8,5].filter(f => f && f <= roundedSrcFps))].sort((a,b)=>b-a);
+  const fpsOptions = fpsCandidates.map(f => ({ label: f===roundedSrcFps ? `${f} fps (original)` : `${f} fps`, value:String(f), default: j.targetFps===f }));
+  const qMenu = new MessageSelectMenu().setCustomId(`gifq_quality_${token}`).setPlaceholder("Quality…").setOptions(qualityOptions);
+  const fMenu = new MessageSelectMenu().setCustomId(`gifq_fps_${token}`).setPlaceholder("FPS…").setOptions(fpsOptions);
+  const ready = !!(j.scalePct && j.targetFps);
+  return {
+    embeds:[embed],
+    components:[
+      new MessageActionRow().addComponents(qMenu),
+      new MessageActionRow().addComponents(fMenu),
+      new MessageActionRow().addComponents(
+        new MessageButton().setCustomId(`gifq_go_${token}`).setLabel("Convert ▶️").setStyle("PRIMARY").setDisabled(!ready),
+        new MessageButton().setCustomId(`gifq_cancel_${token}`).setLabel("Cancel").setStyle("SECONDARY"),
+      ),
+    ],
+    ephemeral:true,
+  };
+}
+function cleanupGifqJob(token){
+  const j = gifqJobs.get(token);
+  if(j){ try{ fs.rmSync(j.workDir, { recursive:true, force:true }); }catch{} gifqJobs.delete(token); }
+}
+
+// ── /bansync ──────────────────────────────────────────────────────────────
+// banSyncLinks: guildId -> [otherGuildId,...] this server has agreed to sync with.
+// A link only goes live once both servers list each other.
+const banSyncLinks = new Map();
+const banSyncSuppress = new Set(); // "guildId:userId:ban|unban" for actions the bot just made itself, so their echo events are ignored
+const banSyncRunning = new Set();
+function isBanSyncActive(a, b){
+  return (banSyncLinks.get(a) || []).includes(b) && (banSyncLinks.get(b) || []).includes(a);
+}
+function getBanSyncPartners(guildId){
+  return (banSyncLinks.get(guildId) || []).filter(o => isBanSyncActive(guildId, o));
+}
+function banSyncSuppressKey(guildId, userId, kind){
+  const k = `${guildId}:${userId}:${kind}`;
+  banSyncSuppress.add(k);
+  setTimeout(() => banSyncSuppress.delete(k), 20_000);
+}
+// The ban list endpoint pages at 1000, so walk it with `after` to get everyone.
+async function fetchAllBanIds(guildId){
+  const ids = new Set();
+  let after = "0";
+  for(;;){
+    const res = await fetch(`https://discord.com/api/v10/guilds/${guildId}/bans?limit=1000&after=${after}`, { headers:{ Authorization:`Bot ${TOKEN}` } });
+    if(res.status === 429){
+      const body = await res.json().catch(() => ({}));
+      await new Promise(r => setTimeout(r, ((body.retry_after || 1) * 1000) + 200));
+      continue;
+    }
+    if(!res.ok) throw new Error(`Discord API ${res.status}`);
+    const page = await res.json();
+    for(const b of page) ids.add(b.user.id);
+    if(page.length < 1000) break;
+    after = page[page.length - 1].user.id;
+  }
+  return ids;
+}
+// One time full reconcile: every ban either server has gets applied to the other.
+async function runBanSync(guildA, guildB){
+  const [idsA, idsB] = await Promise.all([fetchAllBanIds(guildA.id), fetchAllBanIds(guildB.id)]);
+  const jobs = [];
+  for(const id of idsA) if(!idsB.has(id)) jobs.push({ target: guildB, source: guildA, id });
+  for(const id of idsB) if(!idsA.has(id)) jobs.push({ target: guildA, source: guildB, id });
+  let done = 0, failed = 0;
+  for(const j of jobs){
+    banSyncSuppressKey(j.target.id, j.id, "ban");
+    try{ await j.target.members.ban(j.id, { reason:`Ban sync with ${j.source.name}` }); done++; }
+    catch{ failed++; }
+    await new Promise(res => setTimeout(res, 1200));
+  }
+  return { done, failed, total: jobs.length };
+}
+
+// ── /extrachannels ──────────────────────────────────────────────────────────
+// extraChannelsConfig: guildId -> { memberRoleId, extraRoleId }
+const extraChannelsConfig = new Map();
+
+// ── /announcementsync (bot owner only) ───────────────────────────────────────
+// announcementSyncChannels: channelId -> partner channelId, stored both ways.
+// announcementSyncRoles: roleId -> partner roleId, stored both ways.
+const announcementSyncChannels = new Map();
+const announcementSyncRoles = new Map();
+const syncWebhookIds = new Set();   // our own sync webhooks, so their messages are never synced back
+const syncWebhookCache = new Map(); // channelId -> Webhook
+const syncMirrors = new Map();      // mirrored message id -> where the original lives, so replies to it can link back and ping its author
+function rememberSyncMirror(sent, original){
+  if(!sent?.id) return;
+  syncMirrors.set(sent.id, { guildId: original.guild.id, channelId: original.channelId, messageId: original.id, authorId: original.author.id });
+  if(syncMirrors.size > 2000) syncMirrors.delete(syncMirrors.keys().next().value);
+}
+async function getSyncWebhook(channel){
+  const cached = syncWebhookCache.get(channel.id);
+  if(cached) return cached;
+  const hooks = await channel.fetchWebhooks().catch(() => null);
+  let hook = hooks?.find(w => w.owner?.id === CLIENT_ID && w.name === "RoyalBot Sync");
+  if(!hook) hook = await channel.createWebhook("RoyalBot Sync").catch(() => null);
+  if(hook){ syncWebhookCache.set(channel.id, hook); syncWebhookIds.add(hook.id); }
+  return hook;
+}
+async function postSyncMessage(target, payload){
+  for(let attempt = 0; attempt < 2; attempt++){
+    const hook = await getSyncWebhook(target);
+    if(!hook) throw new Error("couldn't get a webhook, I need Manage Webhooks there");
+    try{ return await hook.send(payload); }
+    catch(e){
+      if(e.code === 10015){ syncWebhookCache.delete(target.id); continue; }
+      throw e;
+    }
+  }
+}
+// Synced roles become the partner role's ping, unsynced ones become plain text
+// so nothing pings by accident; user and channel mentions from the other
+// server become plain names too.
+function translateSyncContent(msg, targetGuild){
+  const pingRoles = new Set();
+  let text = msg.content || "";
+  text = text.replace(/<@&(\d+)>/g, (m, id) => {
+    const mapped = announcementSyncRoles.get(id);
+    if(mapped && targetGuild.roles.cache.has(mapped)){ pingRoles.add(mapped); return `<@&${mapped}>`; }
+    const r = msg.guild?.roles.cache.get(id);
+    return r ? `@${r.name}` : "@role";
+  });
+  text = text.replace(/<@!?(\d+)>/g, (m, id) => {
+    const u = msg.mentions.users.get(id);
+    return u ? `@${u.username}` : "@user";
+  });
+  text = text.replace(/<#(\d+)>/g, (m, id) => {
+    const c = msg.mentions.channels.get(id) || msg.guild?.channels.cache.get(id);
+    return c ? `#${c.name}` : "#channel";
+  });
+  return { text, pingRoles: [...pingRoles] };
+}
+function syncDisplayName(msg){
+  const base = msg.member?.displayName || msg.author.globalName || msg.author.username || "Unknown";
+  return (base.replace(/clyde|discord/gi, m => m[0] + "\u200B" + m.slice(1)).slice(0, 80)) || "Unknown";
+}
+
+// ── Webhook reply previews (clankerify, announcement sync) ───────────────────
+// Webhooks can't make real replies, so a message that stands in for a reply
+// gets a small "Reply to:" embed (author, link, snippet) and pings the person
+// it replied to, the way the original reply did.
+function webhookReplySnippet(ref){
+  let text = (ref.cleanContent || "").replace(/\s+/g, " ").trim();
+  if(text.length > 100) text = text.slice(0, 97) + "…";
+  const hasFile = (ref.attachments?.size || 0) > 0;
+  if(!text) return hasFile ? "Click to see attachment" : (ref.stickers?.size ? "Sticker" : (ref.embeds?.length ? "Click to see embed" : "…"));
+  return hasFile ? `${text} 📎` : text;
+}
+// opts.url and opts.pingUserId override the defaults (the replied message's own
+// link, and its author if the original reply pinged them); pass null to drop one.
+async function buildWebhookReplyContext(msg, opts = {}){
+  if(!msg.reference?.messageId) return null;
+  const ref = await msg.fetchReference().catch(() => null);
+  if(!ref) return null;
+  const name = ref.member?.displayName || ref.author.globalName || ref.author.username || "Unknown";
+  const url = "url" in opts ? opts.url : ref.url;
+  const defaultPing = !ref.author.bot && !ref.webhookId && ref.author.id !== msg.author.id && msg.mentions.users.has(ref.author.id) ? ref.author.id : null;
+  return {
+    embed: {
+      color: ref.member?.displayColor || 0x4E5058,
+      author: { name: `${name} ↩️`.slice(0, 256), icon_url: (ref.member || ref.author).displayAvatarURL({ dynamic:true, size:64 }) },
+      description: `${url ? `[**Reply to:**](${url})` : "**Reply to:**"} ${webhookReplySnippet(ref)}`,
+    },
+    pingUserId: "pingUserId" in opts ? opts.pingUserId : defaultPing,
+  };
+}
+function applyWebhookReplyContext(opts, replyCtx){
+  opts.embeds = [replyCtx.embed, ...(opts.embeds || [])].slice(0, 10);
+  if(!replyCtx.pingUserId) return;
+  const mention = `<@${replyCtx.pingUserId}>`;
+  const content = opts.content || "";
+  if(!content.includes(mention) && content.length + mention.length + 1 <= 2000) opts.content = content ? `${mention} ${content}` : mention;
+  opts.allowedMentions = { ...(opts.allowedMentions || { parse: [] }), users: [replyCtx.pingUserId] };
+}
+
+// ── /limitedrole + /pass ─────────────────────────────────────────────────────
+// limitedRoles: guildId -> { [roleId]: max holders at once }
+const limitedRoles = new Map();
+const limitedRoleSuppress = new Set(); // "guildId:userId:roleId" while /pass moves a role, so the cap check skips it
+let limitedRoleQueue = Promise.resolve();
+
+// ── /deactivatetoggle: repeating DM-block + pause-invites lockdown ──────────
+// deactivateToggleConfig: guildId -> { active:true, nextFireAt }
+const deactivateToggleConfig = new Map();
+const DEACTIVATE_DURATION_MS = 24 * 60 * 60 * 1000; // Discord's incident-actions cap
+async function setGuildIncidentActions(guildId, { dmsUntil, invitesUntil }){
+  const res = await fetch(`https://discord.com/api/v10/guilds/${guildId}/incident-actions`, {
+    method:"PUT",
+    headers:{ Authorization:`Bot ${TOKEN}`, "Content-Type":"application/json" },
+    body: JSON.stringify({ invites_disabled_until: invitesUntil, dms_disabled_until: dmsUntil }),
+  });
+  if(!res.ok) throw new Error(`Discord API ${res.status}: ${(await res.text()).slice(0,200)}`);
+  return res.json().catch(() => null);
+}
+
+const SOTD_GENRE_KEYWORDS = ["pop","rock","hip hop","hip-hop","rap","r&b","rnb","jazz","country","metal","edm","electronic","indie","alternative","classical","reggae","folk","punk","soul","funk","blues","k-pop","kpop","latin","house","techno","dubstep","trap","lo-fi","lofi","ambient","gospel","disco","grunge","ska"];
+function detectGenreRoles(guild){
+  return [...guild.roles.cache.values()].filter(r => !r.managed && r.id !== guild.id && SOTD_GENRE_KEYWORDS.some(k => r.name.toLowerCase().includes(k)));
+}
+function findMatchingGenreRole(guild, genres){
+  if(!genres?.length) return null;
+  const roles = detectGenreRoles(guild);
+  for(const g of genres){
+    const gl = g.toLowerCase();
+    const hit = roles.find(r => r.name.toLowerCase() === gl || r.name.toLowerCase().includes(gl) || gl.includes(r.name.toLowerCase()));
+    if(hit) return hit.name;
+  }
+  return null;
+}
+
+// Title cleanup + artist/title guessing. Returns an ordered list of {artist,title}
+// candidates to try against iTunes/MusicBrainz; the first one that finds a
+// match wins.
+const SOTD_JUNK_PATTERNS = [
+  /\(official\s*(music\s*)?video\)/gi, /\[official\s*(music\s*)?video\]/gi,
+  /\(official\s*audio\)/gi, /\[official\s*audio\]/gi,
+  /\(official\s*lyric(s)?\s*video\)/gi, /\(lyrics?\)/gi, /\[lyrics?\]/gi, /\(lyric\s*video\)/gi,
+  /\(official\)/gi, /\[official\]/gi,
+  /\(visualizer\)/gi, /\[visualizer\]/gi, /\(audio\)/gi,
+  /\(hd\)/gi, /\(4k\)/gi, /\(hq\)/gi, /\bhd\b/gi, /\b4k\b/gi,
+  /\(prod\.?[^)]*\)/gi, /\[prod\.?[^\]]*\]/gi,
+  /\(explicit\)/gi, /\(clean\)/gi,
+];
+function cleanYoutubeTitle(raw){
+  let t = raw || "";
+  for(const p of SOTD_JUNK_PATTERNS) t = t.replace(p, "");
+  return t.replace(/\s{2,}/g, " ").trim();
+}
+function parseArtistTitleCandidates(raw, channelName){
+  const cleaned = cleanYoutubeTitle(raw);
+  const candidates = [];
+  for(const sep of [" - ", " – ", " — ", " | "]){
+    if(cleaned.includes(sep)){
+      const [a, b] = cleaned.split(sep).map(s => s.trim()).filter(Boolean);
+      if(a && b){ candidates.push({artist:a, title:b}); candidates.push({artist:b, title:a}); }
+      break;
+    }
+  }
+  const byMatch = cleaned.match(/^(.*)\sby\s(.+)$/i);
+  if(byMatch) candidates.push({artist:byMatch[2].trim(), title:byMatch[1].trim()});
+  candidates.push({artist: channelName || "", title: cleaned});
+  if(!candidates.length) candidates.push({artist:"", title: cleaned});
+  return candidates;
+}
+// Cheap 0-1 similarity score (shared word overlap) for picking the best of a
+// few search results; doesn't need to be exact, just good enough to prefer a
+// close match over an unrelated one.
+function sotdSimilarity(a, b){
+  if(!a || !b) return 0;
+  const wa = new Set(a.toLowerCase().replace(/[^a-z0-9 ]/g," ").split(/\s+/).filter(Boolean));
+  const wb = new Set(b.toLowerCase().replace(/[^a-z0-9 ]/g," ").split(/\s+/).filter(Boolean));
+  if(!wa.size || !wb.size) return 0;
+  let shared = 0;
+  for(const w of wa) if(wb.has(w)) shared++;
+  return shared / Math.max(wa.size, wb.size);
+}
+
+async function searchItunes(artist, title){
+  const term = `${artist} ${title}`.trim();
+  if(!term) return null;
+  try{
+    const res = await fetch(`https://itunes.apple.com/search?term=${encodeURIComponent(term)}&entity=song&limit=5`);
+    if(!res.ok) return null;
+    const data = await res.json();
+    if(!data.results?.length) return null;
+    const scored = data.results.map(r => ({ r, score: sotdSimilarity(title, r.trackName) + (artist ? sotdSimilarity(artist, r.artistName) : 0) }));
+    scored.sort((a,b) => b.score - a.score);
+    if(scored[0].score < 0.15) return null; // nothing close enough
+    const best = scored[0].r;
+    return {
+      title: best.trackName, artist: best.artistName,
+      artwork: best.artworkUrl100 ? best.artworkUrl100.replace("100x100bb","600x600bb") : null,
+      genre: best.primaryGenreName || null,
+    };
+  }catch(e){ console.error("[sotd] iTunes search failed:", e.message); return null; }
+}
+
+// MusicBrainz asks for max 1 request/second; this chains every call through
+// one shared delay so SOTD never bursts past that regardless of how many
+// guilds are refilling their queue at once.
+let mbQueue = Promise.resolve();
+function mbRateLimited(fn){
+  const run = mbQueue.then(() => fn().finally(() => new Promise(res => setTimeout(res, 1100))));
+  mbQueue = run.catch(() => {});
+  return run;
+}
+const MB_USER_AGENT = "RoyalBot-SOTD/1.0 (https://github.com/BoomBoy-s/discord-bot)";
+async function searchMusicBrainzRaw(artist, title){
+  const q = `recording:"${title.replace(/"/g,'')}"${artist ? ` AND artist:"${artist.replace(/"/g,'')}"` : ""}`;
+  try{
+    const res = await fetch(`https://musicbrainz.org/ws/2/recording/?query=${encodeURIComponent(q)}&fmt=json&limit=3`, { headers:{ "User-Agent": MB_USER_AGENT } });
+    if(!res.ok) return null;
+    const data = await res.json();
+    const rec = data.recordings?.[0];
+    if(!rec || (rec.score ?? 0) < 60) return null;
+    let genres = [];
+    const detailRes = await fetch(`https://musicbrainz.org/ws/2/recording/${rec.id}?inc=genres+tags&fmt=json`, { headers:{ "User-Agent": MB_USER_AGENT } }).catch(()=>null);
+    if(detailRes?.ok){
+      const detail = await detailRes.json();
+      genres = (detail.genres || []).map(g => g.name);
+      if(!genres.length) genres = (detail.tags || []).sort((a,b) => b.count - a.count).slice(0,2).map(t => t.name);
+    }
+    return { title: rec.title, artist: rec["artist-credit"]?.[0]?.name || artist || null, genres };
+  }catch(e){ console.error("[sotd] MusicBrainz search failed:", e.message); return null; }
+}
+function searchMusicBrainz(artist, title){ return mbRateLimited(() => searchMusicBrainzRaw(artist, title)); }
+
+// Resolves a YouTube video into song metadata, trying iTunes then MusicBrainz
+// across a few parsed artist/title guesses, and finally falling back to the
+// cleaned video title plus its YouTube thumbnail so a post almost never comes
+// up fully empty. Cached per video ID in botdata.json.
+async function resolveSongMetadata(videoTitle, channelName, videoId){
+  const cached = sotdMetaCache.get(videoId);
+  if(cached) return cached;
+
+  const candidates = parseArtistTitleCandidates(videoTitle, channelName);
+  let itunesResult = null;
+  for(const c of candidates){
+    itunesResult = await searchItunes(c.artist, c.title);
+    if(itunesResult) break;
+  }
+  if(!itunesResult) itunesResult = await searchItunes("", cleanYoutubeTitle(videoTitle));
+
+  const mbSeedArtist = itunesResult?.artist || candidates[0]?.artist || "";
+  const mbSeedTitle  = itunesResult?.title  || candidates[0]?.title  || cleanYoutubeTitle(videoTitle);
+  let mbResult = await searchMusicBrainz(mbSeedArtist, mbSeedTitle);
+  if(!mbResult && !itunesResult){
+    for(const c of candidates.slice(1)){
+      mbResult = await searchMusicBrainz(c.artist, c.title);
+      if(mbResult) break;
+    }
+  }
+
+  const genres = [];
+  if(itunesResult?.genre) genres.push(itunesResult.genre);
+  for(const g of (mbResult?.genres || [])) if(!genres.some(x => x.toLowerCase() === g.toLowerCase())) genres.push(g);
+
+  let title, artist, artwork, matched;
+  if(itunesResult){ title = itunesResult.title; artist = itunesResult.artist; artwork = itunesResult.artwork; matched = true; }
+  else if(mbResult){ title = mbResult.title; artist = mbResult.artist || channelName || "Unknown Artist"; artwork = null; matched = true; }
+  else {
+    const fallback = candidates[0];
+    title = fallback.title || cleanYoutubeTitle(videoTitle);
+    artist = fallback.artist || channelName || "Unknown Artist";
+    matched = false;
+  }
+  if(!artwork) artwork = `https://img.youtube.com/vi/${videoId}/maxresdefault.jpg`;
+
+  const meta = { title, artist, artwork, genres, matched, cachedAt: Date.now() };
+  sotdMetaCache.set(videoId, meta);
+  saveData();
+  return meta;
+}
+
+// Flat (fast) playlist listing: just enough per video to build a YouTube link
+// and parse a title, without resolving every video's full info.
+async function ytFetchPlaylistFlat(url){
+  let lastErr;
+  for(const client of YT_CLIENT_FALLBACKS){
+    try{
+      const info = await youtubedl(url, { dumpSingleJson:true, flatPlaylist:true, noWarnings:true, ...ytExtractorArgs(client) });
+      const entries = (info.entries || []).map((e, i) => ({
+        videoId: e.id, title: e.title || e.id, index: i + 1,
+      })).filter(e => e.videoId);
+      return { title: info.title || "Playlist", channel: info.channel || info.uploader || null, entries };
+    }catch(e){ lastErr = e; }
+  }
+  throw lastErr;
+}
+
+async function sotdPickNextEntry(cfg){
+  const pool = [];
+  for(const pl of cfg.playlists || []){
+    for(const e of pl.entries || []) pool.push({ ...e, playlistLabel: pl.label, playlistTrackCount: pl.entries.length });
+  }
+  if(!pool.length) return null;
+  let remaining = pool.filter(e => !cfg.usedVideoIds.includes(e.videoId));
+  if(!remaining.length){ cfg.usedVideoIds = []; remaining = pool; }
+
+  if(cfg.genreMode && Date.now() > cfg.genreMode.expiresAt) cfg.genreMode = null;
+
+  if(cfg.genreMode){
+    const target = cfg.genreMode.genre.toLowerCase();
+    const shuffled = [...remaining].sort(() => Math.random() - 0.5);
+    const SOTD_GENRE_PROBE_BUDGET = 15; // resolving metadata costs an API call, so only probe so many candidates a day
+    for(let i = 0; i < shuffled.length && i < SOTD_GENRE_PROBE_BUDGET; i++){
+      const candidate = shuffled[i];
+      const meta = await resolveSongMetadata(candidate.title, null, candidate.videoId);
+      if(meta.genres.some(g => g.toLowerCase().includes(target) || target.includes(g.toLowerCase()))){
+        cfg.usedVideoIds.push(candidate.videoId);
+        return candidate;
+      }
+    }
+    // Nobody in the probe budget matched the genre; still post something
+    // rather than skip the day.
+  }
+
+  const picked = remaining[Math.floor(Math.random() * remaining.length)];
+  cfg.usedVideoIds.push(picked.videoId);
+  return picked;
+}
+function buildSotdActionRow(videoId){
+  const v = sotdVotes.get(videoId) || { count:0, voters:[] };
+  return new MessageActionRow().addComponents(
+    new MessageButton().setStyle("LINK").setLabel("Listen on YouTube").setURL(`https://www.youtube.com/watch?v=${videoId}`),
+    new MessageButton().setCustomId(`sotdvote_fire_${videoId}`).setLabel(String(v.count)).setStyle("DANGER").setEmoji({name:"🔥"}),
+    new MessageButton().setCustomId(`sotdvote_who_${videoId}`).setLabel("Who?").setStyle("SECONDARY").setEmoji({name:"👥"}),
+  );
+}
+
+function buildSotdEmbed(guild, entry, meta, { preview=false } = {}){
+  const matchedRole = findMatchingGenreRole(guild, meta.genres);
+  const fields = [];
+  if(meta.genres.length) fields.push({ name:"🎧 Genres", value: meta.genres.slice(0,3).join(", ") + (matchedRole ? `  •  matches **${matchedRole}**` : ""), inline:false });
+  fields.push({ name:"📻 Source", value: `**${entry.playlistLabel}** • Track ${entry.index} of ${entry.playlistTrackCount}`, inline:false });
+  return {
+    color: preview ? 0xFEE75C : 0x5865F2,
+    author: { name: preview ? "🔀 Preview: a random pick from your playlists" : "🎵 Song of the Day" },
+    title: meta.title,
+    description: `by **${meta.artist}**`,
+    image: { url: meta.artwork },
+    fields,
+    timestamp: new Date().toISOString(),
+    footer: { text: (meta.matched ? "Metadata via iTunes / MusicBrainz" : "Metadata unavailable, showing the YouTube title") + (!preview && entry.genreWeek ? ` • 🎯 Genre Week: ${entry.genreWeek}` : "") },
+  };
+}
+// Picks a random not-yet-used-aware preview track from every playlist combined
+// (doesn't touch usedVideoIds, this is just a look, not an actual post) and
+// resolves+renders it the same way the real daily post would.
+async function buildSotdPreviewEmbed(guild, cfg){
+  const pool = [];
+  for(const pl of cfg.playlists || []){
+    for(const e of pl.entries || []) pool.push({ ...e, playlistLabel: pl.label, playlistTrackCount: pl.entries.length });
+  }
+  if(!pool.length) return null;
+  const entry = pool[Math.floor(Math.random() * pool.length)];
+  const meta = await resolveSongMetadata(entry.title, null, entry.videoId);
+  return buildSotdEmbed(guild, entry, meta, { preview:true });
+}
+async function postSotdForGuild(guildId, { manual=false } = {}){
+  const cfg = sotdConfig.get(guildId);
+  if(!cfg || !cfg.postChannelId) return { ok:false, reason:"SOTD isn't set up in this server yet." };
+  const guild = client.guilds.cache.get(guildId);
+  if(!guild) return { ok:false, reason:"Guild not found." };
+  const ch = guild.channels.cache.get(cfg.postChannelId);
+  if(!ch) return { ok:false, reason:"The configured post channel no longer exists." };
+  const activeGenre = cfg.genreMode && Date.now() <= cfg.genreMode.expiresAt ? cfg.genreMode.genre : null;
+  const entry = await sotdPickNextEntry(cfg);
+  if(!entry) return { ok:false, reason:"No playlists set. Use `/sotd-playlist` to add one." };
+  if(activeGenre) entry.genreWeek = activeGenre;
+
+  const meta = await resolveSongMetadata(entry.title, null, entry.videoId);
+  const embed = buildSotdEmbed(guild, entry, meta);
+  const row = buildSotdActionRow(entry.videoId);
+  const content = cfg.pingRoleId ? `<@&${cfg.pingRoleId}>` : (manual ? null : undefined);
+  const sent = await safeSend(ch, { content: content || undefined, embeds:[embed], components:[row], allowedMentions: cfg.pingRoleId ? { roles:[cfg.pingRoleId] } : undefined });
+  saveData();
+  return sent ? { ok:true, sent } : { ok:false, reason:"Failed to send the message (check my permissions in that channel)." };
+}
+
+
+// ── Marriage proposals ────────────────────────────────────────────────────────
+const marriageProposals = new Map();
+
+// ── Quote shuffle queue ───────────────────────────────────────────────────────
+const quoteVotes = new Map();
+const quoteVoteMessages = new Map();
+
+const favoritedQuotes = new Map();
+
+const userVoteStats = new Map();
+const userFlagStats = new Map();
+const pendingFlagDeleters = new Map();
+function bumpVoteStat(userId, field, delta) {
+  let s = userVoteStats.get(userId);
+  if (!s) { s = { up:0, down:0 }; userVoteStats.set(userId, s); }
+  s[field] = Math.max(0, s[field]+delta);
+}
+function bumpFlagStat(userId, field) {
+  let s = userFlagStats.get(userId);
+  if (!s) { s = { flagged:0, deleted:0 }; userFlagStats.set(userId, s); }
+  s[field]++;
+}
+
+const PATREON_GUILD_ID = "1533594455125397654";
+const PATREON_LINK = "https://www.patreon.com/c/RoyalV_/membership";
+const PATREON_ROLE_IDS = [
+  "1544836879898386532",
+  "1542615345162887248",
+  "1542615386053156954",
+  "1542615428264894555",
+  "1542615456492552334",
+];
+const patreonMemberIds = new Set();
+async function refreshPatreonMembers() {
+  if (!PATREON_GUILD_ID) return;
+  let guild = client.guilds.cache.get(PATREON_GUILD_ID);
+  if (!guild) {
+    guild = await client.guilds.fetch(PATREON_GUILD_ID).catch(() => null);
+  }
+  if (!guild) {
+    console.error(`[patreon] This bot is not a member of the Patreon server (guild ${PATREON_GUILD_ID}). It needs to be invited there separately from any other server, main bot and beta bot both need their own invite. Patreon features will stay off until then.`);
+    return;
+  }
+  try {
+    const members = await guild.members.fetch();
+    patreonMemberIds.clear();
+    for (const [id, member] of members) {
+      if (PATREON_ROLE_IDS.some(rid => member.roles.cache.has(rid))) patreonMemberIds.add(id);
+    }
+    console.log(`[patreon] Refreshed against "${guild.name}" (${members.size} member(s) fetched), ${patreonMemberIds.size} patreon member(s) matched.`);
+  } catch(e) {
+    console.error("[patreon] Failed to refresh member list:", e.message);
+  }
+}
+async function isPatreonMember(userId) {
+  return patreonMemberIds.has(userId);
+}
+let reviewChannelId = null;
+let deleterChannelId = null;
+let emojiStealDestGuildId = null;
+
+async function stealEmojisToGuild(destGuild, text){
+  const matches = [...(text || "").matchAll(/<(a)?:([a-zA-Z0-9_]+):(\d+)>/g)];
+  if(!matches.length) return "❌ No custom emojis found.";
+  const found = new Map();
+  for(const m of matches){
+    const id = m[3];
+    if(!found.has(id)) found.set(id, { name: m[2].slice(0,32), animated: !!m[1] });
+  }
+  const results = [];
+  for(const [id, info] of found){
+    const url = `https://cdn.discordapp.com/emojis/${id}.${info.animated ? "gif" : "png"}`;
+    try{
+      await destGuild.emojis.create(url, info.name);
+      results.push(`✅ :${info.name}:`);
+    }catch(e){
+      results.push(`❌ :${info.name}: (${e.message})`);
+    }
+    await new Promise(res => setTimeout(res, 1200));
+  }
+  const full = `Emojis copied to **${destGuild.name}**:\n${results.join("\n")}`;
+  if(full.length <= 1600) return full;
+  console.log("[emojisteal]", full);
+  return `Copied ${found.size} emoji(s) to **${destGuild.name}** (${results.filter(r=>r.startsWith("✅")).length} succeeded, full list in console).`;
+}
+async function stealStickersToGuild(destGuild, stickers){
+  if(!stickers || !stickers.size) return null;
+  const results = [];
+  for(const sticker of stickers.values()){
+    if(sticker.format === "LOTTIE"){ results.push(`❌ ${sticker.name} (Lottie stickers can't be copied)`); continue; }
+    try{
+      await destGuild.stickers.create(sticker.url, { name: sticker.name.slice(0,30), tags: sticker.tags || "🙂", description: sticker.description || sticker.name });
+      results.push(`✅ ${sticker.name}`);
+    }catch(e){
+      results.push(`❌ ${sticker.name} (${e.message})`);
+    }
+    await new Promise(res => setTimeout(res, 1200));
+  }
+  return `Stickers copied to **${destGuild.name}**:\n${results.join("\n")}`;
+}
+const quoteUserVotes = new Map();
+const customClankerModes = new Map();
+
+// ── Server Stats ("/serverstats") ────────────────────────────────────────────
+const serverStatsConfig = new Map();
+
+const SS_STAT_TYPES = {
+  all:           {emoji:"👥",label:"All Members",   desc:"Humans + bots combined"},
+  humans:        {emoji:"🙋",label:"Members",       desc:"Human members only"},
+  bots:          {emoji:"🤖",label:"Bots",          desc:"Bot accounts only"},
+  boosts:        {emoji:"🚀",label:"Boosts",        desc:"Server boost count"},
+  boostTier:     {emoji:"💎",label:"Boost Level",   desc:"Current boost tier (0 to 3)"},
+  textChannels:  {emoji:"💬",label:"Text Channels", desc:"Number of text channels"},
+  voiceChannels: {emoji:"🔊",label:"Voice Channels",desc:"Number of voice channels"},
+  categories:    {emoji:"📁",label:"Categories",    desc:"Number of categories"},
+  channels:      {emoji:"📺",label:"Total Channels",desc:"All channels combined"},
+  roles:         {emoji:"🎭",label:"Roles",         desc:"Number of roles"},
+  role:          {emoji:"🏷️",label:"Role Count",   desc:"Members with a specific role"},
+};
+const SS_MAX_CHANNELS = 10;
+const SS_MIN_INTERVAL_MIN = 10;
+
+function ssComputeValue(guild, entry){
+  switch(entry.type){
+    case "all":           return guild.memberCount;
+    case "humans":        return guild.members.cache.filter(m=>!m.user.bot).size;
+    case "bots":          return guild.members.cache.filter(m=>m.user.bot).size;
+    case "boosts":        return guild.premiumSubscriptionCount||0;
+    case "boostTier":     return `Lvl ${guild.premiumTier||0}`;
+    case "textChannels":  return guild.channels.cache.filter(c=>c.type==="GUILD_TEXT").size;
+    case "voiceChannels": return guild.channels.cache.filter(c=>c.type==="GUILD_VOICE").size;
+    case "categories":    return guild.channels.cache.filter(c=>c.type==="GUILD_CATEGORY").size;
+    case "channels":      return guild.channels.cache.size;
+    case "roles":         return guild.roles.cache.size;
+    case "role": {
+      const r = entry.roleId ? guild.roles.cache.get(entry.roleId) : null;
+      return r ? r.members.size : 0;
+    }
+    default: return 0;
+  }
+}
+function ssChannelName(guild, entry){
+  const value = ssComputeValue(guild, entry);
+  const name = entry.emoji ? `${entry.emoji} ${entry.label}: ${value}` : `${entry.label}: ${value}`;
+  return name.slice(0, 100);
+}
+function ssNeedsMembers(cfg){
+  return cfg.channels.some(e => e.type==="humans" || e.type==="bots" || e.type==="role");
+}
+async function ssUpdateGuildChannels(guild, cfg, opts={}){
+  if(!cfg || !cfg.channels?.length) return;
+  const now = Date.now();
+  const intervalMs = Math.max(SS_MIN_INTERVAL_MIN, cfg.intervalMinutes||15) * 60 * 1000;
+  if(!opts.force && cfg.lastUpdate && now - cfg.lastUpdate < intervalMs) return;
+  if(ssNeedsMembers(cfg)){ try{ await guild.members.fetch(); }catch{} }
+  let changed = false;
+  for(const entry of cfg.channels){
+    const ch = guild.channels.cache.get(entry.id);
+    if(!ch) continue;
+    const newName = ssChannelName(guild, entry);
+    if(ch.name !== newName){
+      await ch.setName(newName).catch(e=>console.error("[serverstats] rename failed:", e.message));
+      changed = true;
+    }
+  }
+  cfg.lastUpdate = now;
+  if(changed) saveData();
+}
+function ssBuildMainPanel(guild){
+  const cfg = serverStatsConfig.get(guild.id);
+  if(!cfg || !cfg.categoryId || !guild.channels.cache.has(cfg.categoryId)){
+    return {content:[
+      "## 📊 Server Stats",
+      "Set up live, autoupdating voice channels that show your server's stats at a glance: the classic locked VC counter setup.",
+      "",
+      "You'll start with **All Members**, **Members**, and **Bots** counters, then you can add, remove, reorder, or restyle any stat afterward.",
+    ].join("\n"), components:[new MessageActionRow().addComponents(
+      new MessageButton().setCustomId("ss_setup").setLabel("🚀 Set Up Server Stats").setStyle("SUCCESS")
+    )]};
+  }
+  const lines = cfg.channels.map(e=>{
+    const ch = guild.channels.cache.get(e.id);
+    const val = ssComputeValue(guild, e);
+    return `${e.emoji||"📊"} **${e.label}**: \`${val}\``;
+  });
+  const intervalStr = `${cfg.intervalMinutes||15}m`;
+  const lockedStr = cfg.locked===false ? "🔓 Unlocked (joinable)" : "🔒 Locked (view only)";
+  const content = [
+    "## 📊 Server Stats",
+    `📁 Category: \`${guild.channels.cache.get(cfg.categoryId)?.name||"?"}\``,
+    `⏱️ Updates every **${intervalStr}** • ${lockedStr}`,
+    "",
+    cfg.channels.length ? lines.join("\n") : "*No stat channels yet: add one below.*",
+  ].join("\n");
+  const row1 = new MessageActionRow().addComponents(
+    new MessageButton().setCustomId("ss_add").setLabel("➕ Add Stat").setStyle("SUCCESS").setDisabled(cfg.channels.length>=SS_MAX_CHANNELS),
+    new MessageButton().setCustomId("ss_manage").setLabel("✏️ Edit / Remove").setStyle("PRIMARY").setDisabled(!cfg.channels.length),
+    new MessageButton().setCustomId("ss_settings").setLabel("⚙️ Settings").setStyle("SECONDARY"),
+  );
+  const row2 = new MessageActionRow().addComponents(
+    new MessageButton().setCustomId("ss_refresh").setLabel("🔄 Refresh Now").setStyle("SECONDARY"),
+    new MessageButton().setCustomId("ss_delete").setLabel("🗑️ Delete All").setStyle("DANGER"),
+  );
+  return {content, components:[row1,row2]};
+}
+function ssBuildAddMenu(cfg){
+  const existingTypes = new Set(cfg.channels.map(e=>e.type));
+  const remaining = SS_MAX_CHANNELS - cfg.channels.length;
+  const opts = Object.entries(SS_STAT_TYPES)
+    .filter(([type])=> type==="role" || !existingTypes.has(type))
+    .map(([type,meta])=>({label:meta.label, value:type, description:meta.desc, emoji:{name:meta.emoji}}));
+  const row1 = new MessageActionRow().addComponents(
+    new MessageSelectMenu().setCustomId("ss_add_sel").setPlaceholder("Choose stat(s) to add…")
+      .setMinValues(1).setMaxValues(Math.max(1,Math.min(remaining,opts.length))).setOptions(opts)
+  );
+  const row2 = new MessageActionRow().addComponents(new MessageButton().setCustomId("ss_back").setLabel("← Back").setStyle("SECONDARY"));
+  return [row1,row2];
+}
+function ssBuildManageList(guild,cfg){
+  const opts = cfg.channels.map(e=>{
+    const ch = guild.channels.cache.get(e.id);
+    return {label:(ch?.name||e.label).slice(0,100), value:e.id, description:`Type: ${SS_STAT_TYPES[e.type]?.label||e.type}`, emoji:{name:e.emoji||"📊"}};
+  }).slice(0,25);
+  const row1 = new MessageActionRow().addComponents(
+    new MessageSelectMenu().setCustomId("ss_manage_sel").setPlaceholder("Select a stat to edit…")
+      .setOptions(opts.length?opts:[{label:"No stats yet",value:"none"}]).setDisabled(!opts.length)
+  );
+  const row2 = new MessageActionRow().addComponents(new MessageButton().setCustomId("ss_back").setLabel("← Back").setStyle("SECONDARY"));
+  return [row1,row2];
+}
+function ssBuildEditActions(guild,cfg,entryId){
+  const idx = cfg.channels.findIndex(e=>e.id===entryId);
+  if(idx===-1) return ssBuildMainPanel(guild);
+  const e = cfg.channels[idx];
+  const content = `## ✏️ Editing: ${e.emoji||""} ${e.label}\nType: **${SS_STAT_TYPES[e.type]?.label||e.type}**\nCurrent value: \`${ssComputeValue(guild,e)}\``;
+  const row1 = new MessageActionRow().addComponents(
+    new MessageButton().setCustomId(`ss_editlabel_${entryId}`).setLabel("✏️ Rename Label").setStyle("PRIMARY"),
+    new MessageButton().setCustomId(`ss_editemoji_${entryId}`).setLabel("😀 Change Emoji").setStyle("PRIMARY"),
+  );
+  const row2 = new MessageActionRow().addComponents(
+    new MessageButton().setCustomId(`ss_moveup_${entryId}`).setLabel("⬆️ Move Up").setStyle("SECONDARY").setDisabled(idx<=0),
+    new MessageButton().setCustomId(`ss_movedown_${entryId}`).setLabel("⬇️ Move Down").setStyle("SECONDARY").setDisabled(idx>=cfg.channels.length-1),
+    new MessageButton().setCustomId(`ss_remove_${entryId}`).setLabel("🗑️ Remove").setStyle("DANGER"),
+  );
+  const row3 = new MessageActionRow().addComponents(new MessageButton().setCustomId("ss_manage").setLabel("← Back to List").setStyle("SECONDARY"));
+  return {content, components:[row1,row2,row3]};
+}
+function ssBuildSettingsPanel(guild,cfg){
+  const content = [
+    "## ⚙️ Server Stats Settings",
+    `📁 Category name: \`${guild.channels.cache.get(cfg.categoryId)?.name||"?"}\``,
+    `⏱️ Update interval: **${cfg.intervalMinutes||15} minutes** *(minimum 10: Discord limits how often channel names can change)*`,
+    `${cfg.locked===false ? "🔓 Channels are unlocked (members can join)" : "🔒 Channels are locked (view only, can't join)"}`,
+  ].join("\n");
+  const row1 = new MessageActionRow().addComponents(
+    new MessageSelectMenu().setCustomId("ss_interval_sel").setPlaceholder("Change update interval…").setOptions(
+      [10,15,30,60,120,360,720,1440].map(m=>({label:m<60?`${m} minutes`:`${m/60} hour${m>60?"s":""}`, value:String(m), default:(cfg.intervalMinutes||15)===m}))
+    )
+  );
+  const row2 = new MessageActionRow().addComponents(
+    new MessageButton().setCustomId("ss_togglelock").setLabel(cfg.locked===false?"🔒 Lock Channels":"🔓 Unlock Channels").setStyle("SECONDARY"),
+    new MessageButton().setCustomId("ss_renamecat").setLabel("✏️ Rename Category").setStyle("SECONDARY"),
+  );
+  const row3 = new MessageActionRow().addComponents(new MessageButton().setCustomId("ss_back").setLabel("← Back").setStyle("SECONDARY"));
+  return {content, components:[row1,row2,row3]};
+}
+const tempOwnerGrants = new Map();
+function hasTempOwnerAccess(userId, commandName){
+  const grant = tempOwnerGrants.get(userId);
+  if(!grant) return false;
+  if(grant.expiresAt !== null && Date.now() > grant.expiresAt){ tempOwnerGrants.delete(userId); return false; }
+  return grant.commands.has("all") || grant.commands.has(commandName);
+}
+function hasTempOwnerFeature(userId, featureName){
+  const grant = tempOwnerGrants.get(userId);
+  if(!grant) return false;
+  if(grant.expiresAt !== null && Date.now() > grant.expiresAt){ tempOwnerGrants.delete(userId); return false; }
+  return grant.features && grant.features.has(featureName);
+}
+function isEffectiveOwner(userId, commandName){
+  return OWNER_IDS.includes(userId) || hasTempOwnerAccess(userId, commandName);
+}
+
+// ── Server-owner-usable commands ─────────────────────────────────────────────
+const SERVER_OWNER_CMDS = new Set([
+  "fakemessage","fakequote","refreshcmds","shadowdelete","clankerify","impersonation",
+  "forcemarry","forcedivorce","echo","paranoia",
+  "quotesetup","requestedquotes","deletedquotes","globaltoggle","quotemoderator",
+  "sotd","sotd-playlist","bansync","deactivatetoggle",
+]);
+function isGuildOwner(guildId, userId){
+  if(OWNER_IDS.includes(userId)) return true; // RoyalBot owners bypass every server-owner-only check, everywhere this is used
+  const g = guildId ? client.guilds.cache.get(guildId) : null;
+  return !!g && g.ownerId === userId;
+}
+function canUseOwnerCmd(interaction, commandName){
+  if(isEffectiveOwner(interaction.user.id, commandName)) return true;
+  if(SERVER_OWNER_CMDS.has(commandName) && interaction.guildId && isGuildOwner(interaction.guildId, interaction.user.id)) return true;
+  return false;
+}
+
+// ── /tempowner: interactive picker ─────────────────────────────────────────
+const GRANTABLE_OWNER_CMDS = ["servers","fakemessage","fakequote","dmconfig","leaveserver","restart","refreshcmds","botstats","setstatus","adminconfig","shadowdelete","clankerify","impersonation","thecount","send","forcemarry","forcedivorce","echo","paranoia","theremnant","jarvisenhance"];
+const GRANTABLE_OWNER_FEATURES = [
+  { id:"quote_review", label:"Quote Review: accept/deny submissions" },
+  { id:"reaction_bomb", label:"Reaction Bomb: right click message context command" },
+  { id:"clank_this", label:"Clank This: right click message context command" },
+  { id:"expose", label:"Expose: right click message context command" },
+  { id:"quote_manager", label:"Quote Manager: browse & delete quote images" },
+];
+const TEMPOWNER_DURATIONS = [
+  { label:"15 minutes",  value:"15" },
+  { label:"1 hour",      value:"60" },
+  { label:"6 hours",     value:"360" },
+  { label:"24 hours",    value:"1440" },
+  { label:"7 days",      value:"10080" },
+  { label:"♾️ Permanent", value:"permanent" },
+];
+const tempOwnerBuilders = new Map();
+
+function formatGrantsList(){
+  if(tempOwnerGrants.size === 0) return "_No active grants._";
+  const now = Date.now();
+  const lines = [];
+  for(const [id, g] of tempOwnerGrants.entries()){
+    if(g.expiresAt !== null && now > g.expiresAt) continue;
+    const cmdsText = g.commands.has("all")
+      ? "**all commands**"
+      : (g.commands.size ? [...g.commands].map(c=>`\`/${c}\``).join(" ") : "_none_");
+    const featsText = g.features && g.features.size
+      ? [...g.features].map(f => GRANTABLE_OWNER_FEATURES.find(x=>x.id===f)?.label || f).join(", ")
+      : "_none_";
+    const expText = g.expiresAt === null ? "♾️ Permanent" : `⏳ expires <t:${Math.floor(g.expiresAt/1000)}:R>`;
+    lines.push(`<@${id}> - ${expText}\n> Commands: ${cmdsText}\n> Features: ${featsText}`);
+  }
+  return lines.length ? lines.join("\n\n") : "_No active grants._";
+}
+
+function buildTempOwnerPanel(token){
+  const b = tempOwnerBuilders.get(token);
+  const cmdOptions = GRANTABLE_OWNER_CMDS.map(c => ({ label:`/${c}`, value:c, default:b.commands.has(c) }));
+  const featOptions = GRANTABLE_OWNER_FEATURES.map(f => ({ label:f.label, value:f.id, default:b.features.has(f.id) }));
+  const durOptions = TEMPOWNER_DURATIONS.map(o => ({ ...o, default: b.duration === o.value }));
+
+  const rows = [
+    new MessageActionRow().addComponents(
+      new MessageSelectMenu().setCustomId(`to_cmds_${token}`).setPlaceholder("Owner commands to grant…").setMinValues(0).setMaxValues(cmdOptions.length).setOptions(cmdOptions)
+    ),
+    new MessageActionRow().addComponents(
+      new MessageSelectMenu().setCustomId(`to_feats_${token}`).setPlaceholder("Non command features to grant…").setMinValues(0).setMaxValues(featOptions.length).setOptions(featOptions)
+    ),
+    new MessageActionRow().addComponents(
+      new MessageSelectMenu().setCustomId(`to_dur_${token}`).setPlaceholder("Duration…").setMinValues(1).setMaxValues(1).setOptions(durOptions)
+    ),
+    new MessageActionRow().addComponents(
+      new MessageButton().setCustomId(`to_grant_${token}`).setLabel("✅ Grant Access").setStyle("SUCCESS").setDisabled(!b.duration || (b.commands.size===0 && b.features.size===0)),
+      new MessageButton().setCustomId(`to_revoke_${token}`).setLabel("🗑️ Revoke Existing Grant").setStyle("DANGER").setDisabled(!tempOwnerGrants.has(b.targetUserId)),
+      new MessageButton().setCustomId(`to_cancel_${token}`).setLabel("Cancel").setStyle("SECONDARY"),
+    ),
+  ];
+
+  const durLabel = b.duration === "permanent" ? "♾️ Permanent" : (b.duration ? `${b.duration} minute(s)` : "_not set_");
+  const cmdsPreview = b.commands.size ? [...b.commands].map(c=>`\`/${c}\``).join(" ") : "_none selected_";
+  const featsPreview = b.features.size ? [...b.features].map(f=>GRANTABLE_OWNER_FEATURES.find(x=>x.id===f)?.label||f).join(", ") : "_none selected_";
+
+  const content = [
+    `🔑 **Temporary Owner Access**: configuring for <@${b.targetUserId}>`,
+    ``,
+    `**Commands:** ${cmdsPreview}`,
+    `**Features:** ${featsPreview}`,
+    `**Duration:** ${durLabel}`,
+    ``,
+    `**📋 Current grants:**`,
+    formatGrantsList(),
+  ].join("\n");
+
+  return { content, components: rows };
+}
+
+// ── /blacklist: interactive picker ─────────────────────────────────────────
+const blacklistBuilders = new Map();
+
+function formatBlacklistList(){
+  if(featureBlacklist.size === 0) return "_No users are currently blacklisted._";
+  const lines = [];
+  for(const [id, b] of featureBlacklist.entries()){
+    const featsText = b.features.has("all") ? "**🚫 Full blacklist**" : [...b.features].map(f=>`\`/${f}\``).join(" ");
+    lines.push(`<@${id}> - ${featsText}${b.silent ? " 🔇 *silent*" : ""}`);
+  }
+  return lines.join("\n");
+}
+
+function buildBlacklistPanel(token){
+  const b = blacklistBuilders.get(token);
+  const cmdNames = buildGuildCommands().map(c => c.name).sort();
+  const isAll = b.features.has("all");
+  const specificFeatures = new Set([...b.features].filter(f => f !== "all"));
+
+  const { rows: selectRows } = buildTicketPickerRows({
+    items: cmdNames.map(n => ({ label: `/${n}`, value: n })),
+    idPrefix: `bl_sel_${token}`,
+    selectedIds: [...specificFeatures],
+    mode: "multi",
+    placeholder: isAll ? "Full blacklist active: pick to override…" : "Commands to block…",
+  });
+
+  const rows = [
+    ...selectRows,
+    new MessageActionRow().addComponents(
+      new MessageButton().setCustomId(`bl_all_${token}`).setLabel(isAll ? "🚫 Full Blacklist ✓" : "🚫 Full Blacklist").setStyle(isAll ? "DANGER" : "SECONDARY"),
+      new MessageButton().setCustomId(`bl_silent_${token}`).setLabel(b.silent ? "🔇 Silent ✓" : "🔇 Silent").setStyle(b.silent ? "PRIMARY" : "SECONDARY"),
+      new MessageButton().setCustomId(`bl_save_${token}`).setLabel("✅ Save").setStyle("SUCCESS").setDisabled(!isAll && specificFeatures.size===0),
+      new MessageButton().setCustomId(`bl_clear_${token}`).setLabel("🗑️ Remove Entry").setStyle("DANGER").setDisabled(!featureBlacklist.has(b.targetUserId)),
+      new MessageButton().setCustomId(`bl_cancel_${token}`).setLabel("Cancel").setStyle("SECONDARY"),
+    ),
+  ];
+
+  const featsPreview = isAll ? "**🚫 Full blacklist**" : (specificFeatures.size ? [...specificFeatures].map(f=>`\`/${f}\``).join(" ") : "_none selected_");
+  const content = [
+    `🚫 **Blacklist**: configuring for <@${b.targetUserId}>`,
+    ``,
+    `**Blocked:** ${featsPreview}`,
+    `**Silent:** ${b.silent ? "🔇 Yes" : "No"}`,
+    ``,
+    `**📋 Currently blacklisted:**`,
+    formatBlacklistList(),
+  ].join("\n");
+
+  return { content, components: rows };
+}
+
+// ── /jarvisenhance: customizable Jarvis automation chains ─────────────────────
+const jarvisEnhanceProfiles = new Map();
+jarvisEnhanceProfiles.set("clankerfy", {
+  triggers: ["clankerfy", "clankerify", "clank"],
+  actions: [{ type:"clankerify", params:{ mode:"random", duration:"10" } }],
+  ownerLocked: true,
+  creatorId: "system",
+  creatorName: "RoyalBot",
+  createdAt: Date.now(),
+});
+jarvisEnhanceProfiles.set("hitaclip", {
+  triggers: ["quote"],
+  actions: [{ type:"random_quote", params:{} }],
+  ownerLocked: false,
+  creatorId: "system",
+  creatorName: "RoyalBot",
+  createdAt: Date.now(),
+});
+jarvisEnhanceProfiles.set("clipquote", {
+  triggers: ["clip"],
+  actions: [{ type:"make_it_a_quote", params:{} }],
+  ownerLocked: false,
+  creatorId: "system",
+  creatorName: "RoyalBot",
+  createdAt: Date.now(),
+});
+jarvisEnhanceProfiles.set("databaseupload", {
+  triggers: ["database", "upload"],
+  actions: [{ type:"request_upload", params:{} }],
+  ownerLocked: false,
+  creatorId: "system",
+  creatorName: "RoyalBot",
+  createdAt: Date.now(),
+});
+jarvisEnhanceProfiles.set("clipship", {
+  triggers: ["clip", "ship"],
+  matchAll: true,
+  actions: [{ type:"make_quote_and_submit", params:{} }],
+  ownerLocked: false,
+  creatorId: "system",
+  creatorName: "RoyalBot",
+  createdAt: Date.now(),
+});
+jarvisEnhanceProfiles.set("elementary", {
+  triggers: ["elementary"],
+  actions: [{ type:"block_counting", params:{} }],
+  ownerLocked: false,
+  creatorId: "system",
+  creatorName: "RoyalBot",
+  createdAt: Date.now(),
+});
+const jarvisEnhanceBuilders = new Map();
+
+const JARVISENHANCE_CATEGORIES = [
+  { id:"clanker",   label:"🤖 Clankerify & Impersonation", needsTarget:true },
+  { id:"mod",       label:"🔨 Moderation",                 needsTarget:true },
+  { id:"message",   label:"💬 Messaging & Fun",             needsTarget:true },
+  { id:"broadcast", label:"📢 Broadcast / Bot (no target needed)", needsTarget:false },
+];
+
+const JARVIS_MODE_OPTIONS_BASE = [
+  {label:"No mode (plain)",  value:"none",        emoji:"🤖"},
+  {label:"Evil",             value:"evil",        emoji:"😈"},
+  {label:"Freaky",           value:"freaky",      emoji:"😏"},
+  {label:"American",         value:"american",    emoji:"🦅"},
+  {label:"British",          value:"british",     emoji:"🫖"},
+  {label:"Stupid",           value:"stupid",      emoji:"🪖"},
+  {label:"Boomer",           value:"boomer",      emoji:"📰"},
+  {label:"Conspiracy",       value:"conspiracy",  emoji:"🔺"},
+  {label:"NPC",              value:"npc",         emoji:"🗺️"},
+  {label:"Sigma",            value:"sigma",       emoji:"😤"},
+  {label:"Medieval",         value:"medieval",    emoji:"⚔️"},
+  {label:"Ghost",            value:"ghost",       emoji:"👻"},
+  {label:"Pirate",           value:"pirate",      emoji:"🏴‍☠️"},
+  {label:"RespawnRaccoon Propaganda", value:"rr_propaganda", emoji:"🦝"},
+  {label:"French",                    value:"french",       emoji:"🇫🇷"},
+  {label:"UWU / LOLCAT",              value:"uwu",          emoji:"🐱"},
+  {label:"Random (picks a random mode each run)", value:"random", emoji:"🎲"},
+];
+function buildJarvisModeOptions(){
+  const community = [...customClankerModes.entries()].slice(0, 7).map(([id, m]) => ({
+    label: `${m.emoji||"⭐"} ${id}`.slice(0,100), value:id,
+  }));
+  return [...JARVIS_MODE_OPTIONS_BASE, ...community].slice(0, 25);
+}
+const JARVIS_DURATION_OPTIONS = [
+  {label:"Permanent",  value:"permanent", emoji:"♾️"},
+  {label:"5 minutes",  value:"5",         emoji:"⏱️"},
+  {label:"10 minutes", value:"10",        emoji:"⏱️"},
+  {label:"30 minutes", value:"30",        emoji:"⏱️"},
+  {label:"1 hour",     value:"60",        emoji:"⏱️"},
+  {label:"3 hours",    value:"180",       emoji:"⏱️"},
+  {label:"Disable",    value:"disable",   emoji:"🛑"},
+];
+
+const JARVISENHANCE_ACTIONS = [
+  // ── Clankerify & Impersonation: mode+duration picked via select, no typing ──
+  { id:"clankerify", category:"clanker", emoji:"🤖", label:"Clankerify", needs:"user", fields:[] },
+  { id:"impersonation", category:"clanker", emoji:"🎭", label:"Impersonation", needs:"user", fields:[] },
+  { id:"clank_this", category:"clanker", emoji:"⚡", label:"Quick Clank (10 min, plain)", needs:"user", fields:[] },
+
+  // ── Moderation ────────────────────────────────────────────────────────────
+  { id:"shadowdelete", category:"mod", emoji:"👻", label:"Shadow Delete", needs:"user", dynamicField:"percentage", fields:[
+    { key:"percentage", label:"Delete chance % (blank=uses text after trigger word)", style:1, required:false, max:3 },
+  ]},
+  { id:"paranoia", category:"mod", emoji:"😱", label:"Paranoia (toggle)", needs:"user", dynamicField:"chance", fields:[
+    { key:"chance", label:"Reply chance % (blank=uses text after trigger word, else 100)", style:1, required:false, max:3 },
+  ]},
+  { id:"kick", category:"mod", emoji:"👢", label:"Kick", needs:"member", dynamicField:"reason", fields:[
+    { key:"reason", label:"Reason (blank=uses text after trigger word)", style:1, required:false, max:200 },
+  ]},
+  { id:"ban", category:"mod", emoji:"🔨", label:"Ban", needs:"member", dynamicField:"reason", fields:[
+    { key:"reason", label:"Reason (blank=uses text after trigger word)", style:1, required:false, max:200 },
+    { key:"deleteDays", label:"Delete message history: days, 0 to 7 (blank=0)", style:1, required:false, max:1 },
+  ]},
+  { id:"timeout", category:"mod", emoji:"⏱️", label:"Timeout", needs:"member", dynamicField:"reason", fields:[
+    { key:"duration", label:"Duration in minutes (max 40320 / 28 days)", style:1, required:true, max:6 },
+    { key:"reason", label:"Reason (blank=uses text after trigger word)", style:1, required:false, max:200 },
+  ]},
+  { id:"remove_timeout", category:"mod", emoji:"🔓", label:"Remove Timeout", needs:"member", fields:[] },
+  { id:"add_role", category:"mod", emoji:"➕", label:"Add Role", needs:"member", dynamicField:"role", fields:[
+    { key:"role", label:"Role name or ID (blank=uses text after trigger word)", style:1, required:false, max:100 },
+  ]},
+  { id:"remove_role", category:"mod", emoji:"➖", label:"Remove Role", needs:"member", dynamicField:"role", fields:[
+    { key:"role", label:"Role name or ID (blank=uses text after trigger word)", style:1, required:false, max:100 },
+  ]},
+  { id:"set_nickname", category:"mod", emoji:"✏️", label:"Set Nickname", needs:"member", dynamicField:"nickname", fields:[
+    { key:"nickname", label:"New nickname (blank=uses text after trigger word)", style:1, required:false, max:32 },
+  ]},
+  { id:"voice_disconnect", category:"mod", emoji:"🔇", label:"Disconnect from Voice", needs:"member", fields:[] },
+  { id:"queue_open", category:"mod", emoji:"📥", label:"Open Queue Channel (/thecount)", needs:"user", fields:[] },
+  { id:"block_counting", category:"mod", emoji:"🔍", label:"Block from Counting for 3 Days (counting channels only)", needs:"user", fields:[] },
+
+  // ── Messaging & Fun: all act on the reply target ────────────────────────────
+  { id:"dm_user", category:"message", emoji:"✉️", label:"DM the User", needs:"user", dynamicField:"message", fields:[
+    { key:"message", label:"Message text (blank=uses text after trigger word)", style:2, required:false, max:1500 },
+  ]},
+  { id:"fakequote", category:"message", emoji:"🗨️", label:"Fake Quote Card", needs:"user", dynamicField:"text", fields:[
+    { key:"text", label:"Quote text (blank=uses text after trigger word)", style:2, required:false, max:300 },
+  ]},
+  { id:"make_it_a_quote", category:"message", emoji:"📸", label:"Make it a Quote (real, no editing)", needs:"message", fields:[] },
+  { id:"request_upload", category:"message", emoji:"📥", label:"Request Upload (media on the message, credit to you)", needs:"message", fields:[] },
+  { id:"make_quote_and_submit", category:"message", emoji:"📮", label:"Make it a Quote and send it to review (real, no editing)", needs:"message", fields:[] },
+  { id:"pin_message", category:"message", emoji:"📌", label:"Pin the Message", needs:"message", fields:[] },
+  { id:"delete_message", category:"message", emoji:"🗑️", label:"Delete the Message", needs:"message", fields:[] },
+  { id:"add_reaction", category:"message", emoji:"🙂", label:"React to the Message", needs:"message", dynamicField:"emoji", fields:[
+    { key:"emoji", label:"Emoji (blank=uses text after trigger word)", style:1, required:false, max:100 },
+  ]},
+  { id:"jarvis_image", category:"message", emoji:"🖼️", label:"Random Jarvis Image", needs:"message", fields:[] },
+  { id:"reaction_bomb", category:"message", emoji:"💣", label:"Reaction Bomb", needs:"message", fields:[] },
+  { id:"expose", category:"message", emoji:"🚨", label:"Expose", needs:"message", fields:[] },
+  { id:"forcemarry", category:"message", emoji:"💍", label:"Force Marry (to a 2nd user)", needs:"user", dynamicField:"user2", fields:[
+    { key:"user2", label:"Second user: @mention/ID (blank=uses text after trigger word)", style:1, required:false, max:40 },
+  ]},
+  { id:"forcedivorce", category:"message", emoji:"💔", label:"Force Divorce", needs:"user", fields:[] },
+  { id:"propose_marriage", category:"message", emoji:"💌", label:"Propose Marriage (from you, to them)", needs:"user", fields:[] },
+  { id:"show_avatar", category:"message", emoji:"🖼️", label:"Show Avatar", needs:"user", fields:[] },
+  { id:"give_xp", category:"message", emoji:"⭐", label:"Give/Take XP", needs:"user", dynamicField:"amount", fields:[
+    { key:"amount", label:"XP amount, positive or negative (blank=uses text after trigger word)", style:1, required:false, max:8 },
+  ]},
+
+  // ── Broadcast / Bot: no reply target used unless "Reply to the message" is picked ──
+  { id:"echo", category:"broadcast", emoji:"📢", label:"Echo (say something)", needs:"channel", dynamicField:"message", replyable:true, fields:[
+    { key:"message", label:"Message text (blank=uses text after trigger word)", style:2, required:false, max:1000 },
+  ]},
+  { id:"send_embed", category:"broadcast", emoji:"🧾", label:"Send an Embed", needs:"channel", dynamicField:"message", replyable:true, fields:[
+    { key:"title", label:"Embed title (optional)", style:1, required:false, max:256 },
+    { key:"message", label:"Embed text (blank=uses text after trigger word)", style:2, required:false, max:1000 },
+  ]},
+  { id:"theremnant", category:"broadcast", emoji:"👁️", label:"The Remnant Transmission", needs:"channel", dynamicField:"message", replyable:true, fields:[
+    { key:"message", label:"Transmission text (blank=uses text after trigger word)", style:2, required:false, max:1000 },
+  ]},
+  { id:"purge", category:"broadcast", emoji:"🧹", label:"Purge Messages", needs:"channel", dynamicField:"amount", fields:[
+    { key:"amount", label:"How many messages, 1 to 100 (blank=uses text after trigger word)", style:1, required:false, max:3 },
+  ]},
+  { id:"setstatus", category:"broadcast", emoji:"🎮", label:"Set Bot Status", needs:"none", dynamicField:"text", fields:[
+    { key:"text", label:"Status text (blank=uses text after trigger word)", style:1, required:false, max:100 },
+  ]},
+  { id:"set_reminder", category:"broadcast", emoji:"⏰", label:"Set a Reminder (for you)", needs:"channel", dynamicField:"message", fields:[
+    { key:"minutes", label:"Minutes from now (1 to 10080)", style:1, required:true, max:6 },
+    { key:"message", label:"Reminder text (blank=uses text after trigger word)", style:2, required:false, max:500 },
+  ]},
+  { id:"random_quote", category:"broadcast", emoji:"💬", label:"Random Quote (like /quote)", needs:"channel", fields:[] },
+  { id:"random_good_quote", category:"broadcast", emoji:"👍", label:"Random Good Quote (like /goodquote)", needs:"channel", fields:[] },
+  { id:"random_bad_quote", category:"broadcast", emoji:"👎", label:"Random Bad Quote (like /badquote)", needs:"channel", fields:[] },
+];
+
+function formatJarvisActionsList(actions){
+  if(!actions || !actions.length) return "_No actions yet._";
+  return actions.map((a,i) => {
+    const def = JARVISENHANCE_ACTIONS.find(x => x.id === a.type);
+    const preview = Object.entries(a.params||{}).filter(([,v]) => v).map(([k,v]) => `${k}: ${v}`).join(", ");
+    return `**${i+1}.** ${def?.emoji||"❓"} ${def?.label||a.type}${preview?` _(${preview})_`:""}`;
+  }).join("\n");
+}
+
+function buildJarvisEnhancePanel(token){
+  const b = jarvisEnhanceBuilders.get(token);
+  const rows = [];
+
+  if(!b.category){
+    rows.push(new MessageActionRow().addComponents(
+      new MessageSelectMenu().setCustomId(`je_category_${token}`).setPlaceholder("➕ Add an action: pick a category…")
+        .setOptions(JARVISENHANCE_CATEGORIES.map(c => ({ label:c.label, value:c.id })))
+    ));
+  } else {
+    const cat = JARVISENHANCE_CATEGORIES.find(c => c.id===b.category);
+    const opts = JARVISENHANCE_ACTIONS.filter(a => a.category===b.category).map(a => ({ label:`${a.emoji} ${a.label}`, value:a.id }));
+    rows.push(new MessageActionRow().addComponents(
+      new MessageSelectMenu().setCustomId(`je_addtype_${token}`).setPlaceholder(`${cat.label}: pick an action…`).setOptions(opts)
+    ));
+  }
+
+  if(b.actions.length){
+    const stepOptions = b.actions.map((a,i) => {
+      const def = JARVISENHANCE_ACTIONS.find(x => x.id === a.type);
+      return { label:`${i+1}. ${def?.emoji||"❓"} ${def?.label||a.type}`.slice(0,100), value:String(i), default:b.selectedStep===i };
+    });
+    rows.push(new MessageActionRow().addComponents(
+      new MessageSelectMenu().setCustomId(`je_manage_${token}`).setPlaceholder("Select a step to reorder / remove…").setOptions(stepOptions)
+    ));
+  }
+  rows.push(new MessageActionRow().addComponents(
+    new MessageButton().setCustomId(`je_moveup_${token}`).setLabel("🔼 Move Up").setStyle("SECONDARY").setDisabled(b.selectedStep===null || b.selectedStep===0),
+    new MessageButton().setCustomId(`je_movedown_${token}`).setLabel("🔽 Move Down").setStyle("SECONDARY").setDisabled(b.selectedStep===null || b.selectedStep===b.actions.length-1),
+    new MessageButton().setCustomId(`je_removestep_${token}`).setLabel("🗑️ Remove Step").setStyle("DANGER").setDisabled(b.selectedStep===null),
+  ));
+
+  const bottomButtons = [
+    new MessageButton().setCustomId(`je_triggers_${token}`).setLabel("✏️ Set Trigger Word(s)").setStyle("PRIMARY"),
+    new MessageButton().setCustomId(`je_ownerlock_${token}`).setLabel(b.ownerLocked ? "🔒 Owner Locked: ON" : "🔓 Owner Locked: OFF").setStyle(b.ownerLocked ? "DANGER" : "SECONDARY"),
+    new MessageButton().setCustomId(`je_save_${token}`).setLabel("✅ Save Profile").setStyle("SUCCESS").setDisabled(!b.triggers.length || !b.actions.length),
+  ];
+  if(b.category){
+    bottomButtons.unshift(new MessageButton().setCustomId(`je_addback_${token}`).setLabel("◀ Categories").setStyle("SECONDARY"));
+  } else {
+    bottomButtons.push(new MessageButton().setCustomId(`je_cancel_${token}`).setLabel("Cancel").setStyle("SECONDARY"));
+  }
+  rows.push(new MessageActionRow().addComponents(...bottomButtons));
+
+  const content = [
+    `🧠 **Jarvis Enhance**: configuring \`${b.name}\``,
+    ``,
+    `**Trigger word(s):** ${b.triggers.length ? b.triggers.map(t=>`\`${t}\``).join(" ") : "_none set_"}`,
+    `_Reply to a message and say "Jarvis, <word>" or "RoyalBot, <word>" to run it. Whole word match, same as the Jarvis image trigger. Any text you leave blank on a "blank=uses text after trigger word" field is filled in live from whatever you type after the trigger word: e.g. "Jarvis, dm knock it off"._`,
+    b.ownerLocked
+      ? `🔒 **Owner Locked**: only the owner (or someone granted this via \`/tempowner\`) can fire this trigger.`
+      : `🔓 **Owner Locked is OFF**: anyone in the server can fire this trigger by saying the word.`,
+    ``,
+    `**Actions (run in this order):**`,
+    formatJarvisActionsList(b.actions),
+  ].join("\n");
+
+  return { content, components: rows };
+}
+
+function buildJarvisModePicker(token){
+  const b = jarvisEnhanceBuilders.get(token);
+  const def = JARVISENHANCE_ACTIONS.find(a => a.id===b.pendingActionType);
+  const rows = [
+    new MessageActionRow().addComponents(
+      new MessageSelectMenu().setCustomId(`je_pickmode_${token}`).setPlaceholder("Pick a mode…").setOptions(buildJarvisModeOptions())
+    ),
+    new MessageActionRow().addComponents(
+      new MessageButton().setCustomId(`je_addcancel_${token}`).setLabel("Cancel").setStyle("SECONDARY"),
+    ),
+  ];
+  return { content:`${def?.emoji||"🤖"} **${def?.label||b.pendingActionType}**: pick a mode:`, components:rows };
+}
+
+function buildJarvisDurationPicker(token){
+  const b = jarvisEnhanceBuilders.get(token);
+  const def = JARVISENHANCE_ACTIONS.find(a => a.id===b.pendingActionType);
+  const rows = [
+    new MessageActionRow().addComponents(
+      new MessageSelectMenu().setCustomId(`je_pickduration_${token}`).setPlaceholder("Pick a duration…").setOptions(JARVIS_DURATION_OPTIONS)
+    ),
+    new MessageActionRow().addComponents(
+      new MessageButton().setCustomId(`je_addcancel_${token}`).setLabel("Cancel").setStyle("SECONDARY"),
+    ),
+  ];
+  return { content:`${def?.emoji||"🤖"} **${def?.label||b.pendingActionType}**: mode: \`${b.pendingMode}\`. Now pick a duration:`, components:rows };
+}
+
+function buildJarvisReplyModePicker(token){
+  const b = jarvisEnhanceBuilders.get(token);
+  const def = JARVISENHANCE_ACTIONS.find(a => a.id===b.pendingActionType);
+  const rows = [
+    new MessageActionRow().addComponents(
+      new MessageSelectMenu().setCustomId(`je_pickreply_${token}`).setPlaceholder("How should this be sent?").setOptions([
+        { label:"💬 Reply to the message you're replying to", value:"reply", emoji:"💬" },
+        { label:"👤 Reply to you (whoever says the trigger)", value:"replyactor", emoji:"👤" },
+        { label:"📢 Send normally (doesn't need you to be replying)", value:"normal", emoji:"📢" },
+      ])
+    ),
+    new MessageActionRow().addComponents(
+      new MessageButton().setCustomId(`je_addcancel_${token}`).setLabel("Cancel").setStyle("SECONDARY"),
+    ),
+  ];
+  return { content:`${def?.emoji||"📢"} **${def?.label||b.pendingActionType}**: how should it be sent?`, components:rows };
+}
+
+async function deliverJarvisPayload(ctx, params, payload){
+  if(params.replyMode==="reply" && ctx.targetMsg) return ctx.targetMsg.reply(payload).catch(()=>{});
+  if(params.replyMode==="replyactor" && ctx.actorMsg) return ctx.actorMsg.reply(payload).catch(()=>{});
+  return ctx.channel.send(payload).catch(()=>{});
+}
+
+const JARVISENHANCE_RUNNERS = {
+  async clankerify(params, ctx){
+    const gid = ctx.guild?.id;
+    const key = scopedKey(gid, ctx.targetUser.id);
+    const dur = (params.duration||"").trim();
+    if(dur === "0"){ clankerify.delete(key); saveData(); return "disabled"; }
+    const mode = (params.mode||"").trim();
+    const expiresAt = dur ? Date.now() + parseInt(dur,10)*60000 : null;
+    clankerify.set(key, { expiresAt, mode: mode && mode!=="none" ? mode : null, ownerClanked:true });
+    saveData();
+    return `set${mode?` (${mode})`:""}`;
+  },
+  async impersonation(params, ctx){
+    const gid = ctx.guild?.id;
+    const key = scopedKey(gid, ctx.targetUser.id);
+    const dur = (params.duration||"").trim();
+    if(dur === "0"){ clankerify.delete(key); saveData(); return "disabled"; }
+    const mode = (params.mode||"").trim();
+    const expiresAt = dur ? Date.now() + parseInt(dur,10)*60000 : null;
+    clankerify.set(key, { expiresAt, mode: mode && mode!=="none" ? mode : null, ownerClanked:true, impersonateAsUserId:null, impersonateName:null, impersonateAvatarURL:null });
+    saveData();
+    return `set${mode?` (${mode})`:""}`;
+  },
+  async clank_this(params, ctx){
+    if(ctx.targetUser.bot) return "skipped (bot)";
+    const key = scopedKey(ctx.guild?.id, ctx.targetUser.id);
+    clankerify.set(key, { expiresAt: Date.now() + 10*60000, mode:null, ownerClanked:true });
+    saveData();
+    setTimeout(() => { clankerify.delete(key); saveData(); }, 10*60000);
+    return "10 min";
+  },
+  async shadowdelete(params, ctx){
+    const key = scopedKey(ctx.guild?.id, ctx.targetUser.id);
+    const pct = Math.max(0, Math.min(100, parseInt(params.percentage,10)||0));
+    if(pct===0){ shadowDelete.delete(key); saveData(); return "disabled"; }
+    shadowDelete.set(key, pct);
+    saveData();
+    return `${pct}%`;
+  },
+  async paranoia(params, ctx){
+    const key = scopedKey(ctx.guild?.id, ctx.targetUser.id);
+    if(paranoiaWatchers.has(key)){ paranoiaWatchers.delete(key); saveData(); return "disarmed"; }
+    const chance = Math.min(100, Math.max(1, parseInt(params.chance,10)||100));
+    paranoiaWatchers.set(key, { chance, armed:true });
+    saveData();
+    return `armed (${chance}%)`;
+  },
+  async kick(params, ctx){
+    if(!ctx.targetMember) return "not in server";
+    if(!ctx.targetMember.kickable) return "cannot kick (permissions/hierarchy)";
+    await ctx.targetMember.kick(params.reason || undefined);
+    return `kicked${params.reason ? ` (${params.reason})` : ""}`;
+  },
+  async ban(params, ctx){
+    const days = Math.max(0, Math.min(7, parseInt(params.deleteDays,10) || 0));
+    if(ctx.targetMember && !ctx.targetMember.bannable) return "cannot ban (permissions/hierarchy)";
+    await ctx.guild.members.ban(ctx.targetUser.id, { days, reason: params.reason || undefined });
+    return `banned${params.reason ? ` (${params.reason})` : ""}`;
+  },
+  async timeout(params, ctx){
+    if(!ctx.targetMember) return "not in server";
+    const mins = Math.max(1, Math.min(40320, parseInt(params.duration,10) || 0));
+    if(!mins) return "invalid duration";
+    if(!ctx.targetMember.moderatable) return "cannot timeout (permissions/hierarchy)";
+    await ctx.targetMember.timeout(mins*60000, params.reason || undefined);
+    return `${mins} min`;
+  },
+  async remove_timeout(params, ctx){
+    if(!ctx.targetMember) return "not in server";
+    await ctx.targetMember.timeout(null).catch(()=>{});
+    return "cleared";
+  },
+  async add_role(params, ctx){
+    if(!ctx.targetMember) return "not in server";
+    const q = (params.role||"").trim().toLowerCase();
+    const role = ctx.guild.roles.cache.find(r => r.id===q || r.name.toLowerCase()===q);
+    if(!role) return "role not found";
+    if(role.managed || role.position >= ctx.guild.members.me.roles.highest.position) return "cannot assign that role (hierarchy)";
+    await ctx.targetMember.roles.add(role);
+    return `added ${role.name}`;
+  },
+  async remove_role(params, ctx){
+    if(!ctx.targetMember) return "not in server";
+    const q = (params.role||"").trim().toLowerCase();
+    const role = ctx.guild.roles.cache.find(r => r.id===q || r.name.toLowerCase()===q);
+    if(!role) return "role not found";
+    await ctx.targetMember.roles.remove(role);
+    return `removed ${role.name}`;
+  },
+  async set_nickname(params, ctx){
+    if(!ctx.targetMember) return "not in server";
+    if(!ctx.targetMember.manageable) return "cannot rename (permissions/hierarchy)";
+    await ctx.targetMember.setNickname(params.nickname || null);
+    return params.nickname ? `set to "${params.nickname}"` : "reset";
+  },
+  async voice_disconnect(params, ctx){
+    if(!ctx.targetMember || !ctx.targetMember.voice?.channel) return "not in voice";
+    await ctx.targetMember.voice.disconnect();
+    return "disconnected";
+  },
+  async queue_open(params, ctx){
+    if(ctx.targetUser.bot) return "skipped (bot)";
+    if(!dmRelayGuildId) return "no DM hub configured";
+    const channel = await ensureTheCountChannel(ctx.targetUser).catch(()=>null);
+    return channel ? "opened" : "failed";
+  },
+  async dm_user(params, ctx){
+    const ok = await ctx.targetUser.send({ content:(params.message||"").slice(0,1500) }).then(()=>true).catch(()=>false);
+    return ok ? "sent" : "failed (DMs closed)";
+  },
+  async fakequote(params, ctx){
+    try{
+      const displayName = ctx.targetUser.globalName || ctx.targetUser.username;
+      const avatarURL = ctx.targetUser.displayAvatarURL({ size:512, dynamic:false, extension:"png" });
+      const avatarRes = await fetch(avatarURL);
+      if(!avatarRes.ok) return "avatar fetch failed";
+      const avatarBuffer = Buffer.from(await avatarRes.arrayBuffer());
+      const cardBuffer = await buildFakeQuoteCard({ avatarBuffer, quoteText: params.text||"", displayName, username: ctx.targetUser.username });
+      await ctx.channel.send({ files:[{ attachment: cardBuffer, name:"quote_6660.png" }] }).catch(()=>{});
+      return "done";
+    }catch(e){ return `error: ${e.message}`; }
+  },
+  async make_it_a_quote(params, ctx){
+    const text = ctx.targetMsg.content;
+    if(!text) return "no text to quote";
+    if(ctx.targetUser.bot) return "skipped (bot)";
+    try{
+      const displayName = ctx.targetUser.globalName || ctx.targetUser.username;
+      const avatarURL = ctx.targetUser.displayAvatarURL({ size:512, dynamic:false, extension:"png" });
+      const avatarRes = await fetch(avatarURL);
+      if(!avatarRes.ok) return "avatar fetch failed";
+      const avatarBuffer = Buffer.from(await avatarRes.arrayBuffer());
+      const cardBuffer = await buildFakeQuoteCard({ avatarBuffer, quoteText: text, displayName, username: ctx.targetUser.username });
+      await ctx.channel.send({ files:[{ attachment: cardBuffer, name:`quote_${ctx.targetMsg.id}.png` }] }).catch(()=>{});
+      return "done";
+    }catch(e){ return `error: ${e.message}`; }
+  },
+  async request_upload(params, ctx){
+    const msg = ctx.targetMsg;
+    const attachment = msg.attachments?.first();
+    let mediaUrl, mediaName, mediaContentType, mediaSize;
+    if(attachment){
+      mediaUrl = attachment.url; mediaName = attachment.name; mediaContentType = attachment.contentType; mediaSize = attachment.size;
+    } else {
+      const embedWithImage = msg.embeds?.find(e => e.image || e.thumbnail);
+      const imgUrl = embedWithImage?.image?.url || embedWithImage?.thumbnail?.url;
+      if(imgUrl){ mediaUrl = imgUrl; mediaName = "image.png"; mediaContentType = "image/png"; mediaSize = null; }
+    }
+    if(!mediaUrl) return "no media found on that message";
+    const result = await submitMediaForReview({
+      submitterUser: ctx.actorUser,
+      attachmentUrl: mediaUrl,
+      attachmentName: mediaName,
+      attachmentContentType: mediaContentType,
+      attachmentSize: mediaSize,
+      guildName: ctx.guild?.name || "Unknown",
+      guildId: ctx.guild?.id || null,
+      channelId: ctx.channel.id,
+    });
+    return result.ok ? "submitted for review" : `failed, ${result.reason}`;
+  },
+  async make_quote_and_submit(params, ctx){
+    const text = ctx.targetMsg.content;
+    if(!text) return "no text to quote";
+    if(ctx.targetUser.bot) return "skipped (bot)";
+    try{
+      const displayName = ctx.targetUser.globalName || ctx.targetUser.username;
+      const avatarURL = ctx.targetUser.displayAvatarURL({ size:512, dynamic:false, extension:"png" });
+      const avatarRes = await fetch(avatarURL);
+      if(!avatarRes.ok) return "avatar fetch failed";
+      const avatarBuffer = Buffer.from(await avatarRes.arrayBuffer());
+      const cardBuffer = await buildFakeQuoteCard({ avatarBuffer, quoteText: text, displayName, username: ctx.targetUser.username });
+      const result = await submitMediaForReview({
+        submitterUser: ctx.actorUser,
+        attachmentBuffer: cardBuffer,
+        attachmentName: `quote_${ctx.targetMsg.id}.png`,
+        attachmentContentType: "image/png",
+        attachmentSize: cardBuffer.length,
+        guildName: ctx.guild?.name || "Unknown",
+        guildId: ctx.guild?.id || null,
+        channelId: ctx.channel.id,
+      });
+      return result.ok ? "submitted for review" : `failed, ${result.reason}`;
+    }catch(e){ return `error: ${e.message}`; }
+  },
+  async pin_message(params, ctx){
+    await ctx.targetMsg.pin();
+    return "pinned";
+  },
+  async delete_message(params, ctx){
+    await ctx.targetMsg.delete();
+    return "deleted";
+  },
+  async add_reaction(params, ctx){
+    await ctx.targetMsg.react((params.emoji||"").trim());
+    return "reacted";
+  },
+  async jarvis_image(params, ctx){
+    const imgs = await getJarvisImages();
+    if(!imgs.length) return "no images";
+    const pick = imgs[Math.floor(Math.random()*imgs.length)];
+    await ctx.targetMsg.reply({ files:[pick.download_url], allowedMentions:{repliedUser:false} }).catch(()=>{});
+    return pick.word;
+  },
+  async reaction_bomb(params, ctx){
+    const BOMB_EMOJIS = ["✅","👍","🔥","💀","😂","❤️","👑","💯","🎉","⚡","🏆","😈","🤣","💪","🌟"];
+    for(const emoji of BOMB_EMOJIS){ await ctx.targetMsg.react(emoji).catch(()=>{}); }
+    return "done";
+  },
+  async expose(params, ctx){
+    const content = ctx.targetMsg.content || "(no text)";
+    const exposePrefixes = ["🚨 CAUGHT IN 4K:","📢 ATTENTION EVERYONE:","🔍 EXPOSE THREAD:","📸 SCREENSHOT THIS:","⚠️ EVIDENCE:"];
+    const prefix = exposePrefixes[Math.floor(Math.random()*exposePrefixes.length)];
+    await ctx.channel.send({ content:`${prefix}\n> ${content}\nfrom <@${ctx.targetUser.id}>` }).catch(()=>{});
+    return "done";
+  },
+  async forcemarry(params, ctx){
+    const idMatch = (params.user2||"").match(/\d{15,20}/);
+    if(!idMatch) return "no valid user2";
+    const u2 = await client.users.fetch(idMatch[0]).catch(()=>null);
+    if(!u2) return "user2 not found";
+    if(u2.id === ctx.targetUser.id) return "skipped (same user)";
+    const s1 = getScore(ctx.targetUser.id, ctx.targetUser.username);
+    const s2 = getScore(u2.id, u2.username);
+    if(s1.marriedTo || s2.marriedTo) return "already married";
+    s1.marriedTo=u2.id; s1.pendingProposal=null; s1.forceMarried=true;
+    s2.marriedTo=ctx.targetUser.id; s2.pendingProposal=null; s2.forceMarried=true;
+    saveData();
+    return "done";
+  },
+  async forcedivorce(params, ctx){
+    const s = getScore(ctx.targetUser.id, ctx.targetUser.username);
+    if(!s.marriedTo) return "not married";
+    const partner = scores.get(s.marriedTo);
+    if(partner){ partner.marriedTo=null; partner.pendingProposal=null; partner.forceMarried=false; }
+    s.marriedTo=null; s.pendingProposal=null; s.forceMarried=false;
+    saveData();
+    return "done";
+  },
+  async echo(params, ctx){
+    const payload = { content:(params.message||"").slice(0,2000), allowedMentions:{parse:[]} };
+    await deliverJarvisPayload(ctx, params, payload);
+    return "done";
+  },
+  async send_embed(params, ctx){
+    let color = 0x5865F2;
+    const embed = { title: params.title||undefined, description: (params.message||"").slice(0,4000)||undefined, color };
+    if(!embed.title) delete embed.title;
+    if(!embed.description) delete embed.description;
+    if(!embed.title && !embed.description) return "nothing to send";
+    await deliverJarvisPayload(ctx, params, { embeds:[embed] });
+    return "done";
+  },
+  async theremnant(params, ctx){
+    const payload = { embeds:[{ title:"👁️ The Remnant", description:(params.message||"").slice(0,1000), color:0x8E44AD, footer:{text:"A signal from somewhere else…"}, timestamp:new Date().toISOString() }] };
+    await deliverJarvisPayload(ctx, params, payload);
+    return "done";
+  },
+  async purge(params, ctx){
+    if(!ctx.channel.permissionsFor?.(ctx.guild.members.me)?.has("MANAGE_MESSAGES")) return "missing Manage Messages";
+    const amount = Math.max(1, Math.min(100, parseInt(params.amount,10)||0));
+    if(!amount) return "invalid amount";
+    const messages = await ctx.channel.messages.fetch({ limit:amount });
+    const cutoff = Date.now() - (14*24*60*60*1000);
+    const fresh = [...messages.values()].filter(m => m.createdTimestamp > cutoff);
+    if(!fresh.length) return "nothing to delete";
+    const bulk = await ctx.channel.bulkDelete(fresh, true);
+    return `deleted ${bulk.size}`;
+  },
+  async setstatus(params, ctx){
+    const text = (params.text||"").slice(0,100);
+    if(!text) return "no text";
+    client.user.setActivity(text, { type:"PLAYING" });
+    botStatus = { text, type:"PLAYING" };
+    saveData();
+    return `set to "${text}"`;
+  },
+  async set_reminder(params, ctx){
+    const minutes = Math.max(1, Math.min(10080, parseInt(params.minutes,10)||0));
+    if(!minutes) return "invalid time";
+    reminders.push({ userId: ctx.actorId, channelId: ctx.channel.id, time: Date.now()+minutes*60000, message: (params.message||"").slice(0,500) });
+    return `set for ${minutes}m`;
+  },
+  async random_quote(params, ctx){
+    const now_q = Date.now();
+    const last_q = quoteCooldown.get(ctx.actorId) || 0;
+    if(now_q - last_q < 1500) return "on cooldown, try again shortly";
+    quoteCooldown.set(ctx.actorId, now_q);
+    const chosen = await postRandomQuoteCard(nextQuoteImage, "quote", async (payload) => ctx.channel.send(payload).catch(()=>null), ctx.guild?.id);
+    return chosen ? "sent" : "no quotes available";
+  },
+  async random_good_quote(params, ctx){
+    const now_q = Date.now();
+    const last_q = quoteCooldown.get(ctx.actorId) || 0;
+    if(now_q - last_q < 1500) return "on cooldown, try again shortly";
+    quoteCooldown.set(ctx.actorId, now_q);
+    const chosen = await postRandomQuoteCard(nextGoodQuoteImage, "good", async (payload) => ctx.channel.send(payload).catch(()=>null), ctx.guild?.id);
+    return chosen ? "sent" : "no quotes available";
+  },
+  async random_bad_quote(params, ctx){
+    const now_q = Date.now();
+    const last_q = quoteCooldown.get(ctx.actorId) || 0;
+    if(now_q - last_q < 1500) return "on cooldown, try again shortly";
+    quoteCooldown.set(ctx.actorId, now_q);
+    const chosen = await postRandomQuoteCard(nextBadQuoteImage, "bad", async (payload) => ctx.channel.send(payload).catch(()=>null), ctx.guild?.id);
+    return chosen ? "sent" : "no quotes available";
+  },
+  async show_avatar(params, ctx){
+    const url = ctx.targetUser.displayAvatarURL({ size:1024, dynamic:true });
+    await ctx.channel.send({ embeds:[{ title:`${ctx.targetUser.username}'s avatar`, image:{url}, color:0x5865F2 }] }).catch(()=>{});
+    return "posted";
+  },
+  async give_xp(params, ctx){
+    const amt = parseInt(params.amount,10);
+    if(!Number.isFinite(amt)) return "invalid amount";
+    const s = getScore(ctx.targetUser.id, ctx.targetUser.username);
+    s.xp = Math.max(0, (s.xp||0)+amt);
+    xpInfo(s);
+    saveData();
+    return `${amt>=0?"+":""}${amt} xp (now level ${s.level})`;
+  },
+  async propose_marriage(params, ctx){
+    if(!ctx.actorUser) return "no actor";
+    if(ctx.actorUser.id === ctx.targetUser.id) return "skipped (self)";
+    const s = getScore(ctx.actorUser.id, ctx.actorUser.username);
+    const t = getScore(ctx.targetUser.id, ctx.targetUser.username);
+    if(s.marriedTo) return "you're already married";
+    if(t.marriedTo) return "target already married";
+    t.pendingProposal = ctx.actorUser.id;
+    saveData();
+    return "proposed";
+  },
+  async block_counting(params, ctx){
+    if(!ctx.channel || !countingChannels.has(ctx.channel.id)) return "not a counting channel";
+    if(ctx.targetUser.bot) return "skipped (bot)";
+    const until = Date.now() + 3*24*60*60*1000;
+    countingBlocks.set(scopedKey(ctx.guild?.id, ctx.targetUser.id), until);
+    saveData();
+    await ctx.channel.send(`🔍 **Elementary.** <@${ctx.targetUser.id}> is blocked from counting until <t:${Math.floor(until/1000)}:F>.`).catch(()=>{});
+    return "blocked for 3 days";
+  },
+};
+
+async function runJarvisEnhanceProfile(profile, ctx){
+  const results = [];
+  for(const step of profile.actions){
+    const def = JARVISENHANCE_ACTIONS.find(a => a.id === step.type);
+    const runner = JARVISENHANCE_RUNNERS[step.type];
+    if(!def || !runner){ results.push(`❓ ${step.type}: unknown action`); continue; }
+    try{
+      let params = step.params||{};
+      const hasPlaceholder = Object.values(params).some(v => typeof v==="string" && /\{[^}]*\}/.test(v));
+      if(hasPlaceholder){
+        const filled = {};
+        for(const [k,v] of Object.entries(params)){
+          filled[k] = typeof v==="string" ? v.replace(/\{[^}]*\}/g, ctx.restText||"") : v;
+        }
+        params = filled;
+      }
+      if(def.dynamicField && !(params[def.dynamicField]||"").trim() && ctx.restText){
+        params = { ...params, [def.dynamicField]: ctx.restText };
+      }
+      const outcome = await runner(params, ctx);
+      results.push(`${def.emoji} ${def.label}: ${outcome}`);
+    }catch(e){
+      results.push(`${def.emoji} ${def.label}: ❌ ${e.message}`);
+    }
+    await new Promise(res => setTimeout(res, 500));
+  }
+  return results;
+}
+
+const trashcanVotes = new Map();
+let trashcanThreshold = 3;
+const selfClankUsers = new Map();
+const selfClankCooldown = new Map();
+
+// Pending quote review submissions (token -> submission data) ───────────────
+const pendingReviews = new Map();
+
+// ── Server specific quotes (/quotesetup) ─────────────────────────────────────
+const quoteGuildConfigs = new Map();
+const quoteSetupBuilders = new Map();
+
+const QS_TEXT = {
+  askScope: "Would the funny screenshots be part of this server only, or would you like to contribute globally?",
+  globalChosen: "Quotes are now being sent to the global request/delete channels",
+  globalButton: "Globally",
+  serverButton: "Server specific",
+  panelTitle: "Server specific quotes",
+  pickRequest: "Select the channel where quote requests should go.",
+  pickDelete: "Select the channel where flagged quotes should go.",
+  folderStep: "Name your quote folder, then press Finish.",
+  requestPlaceholder: "Select the request channel",
+  deletePlaceholder: "Select the delete channel",
+  noTextChannels: "No text channels found",
+  truncatedNote: "Showing the first 100 text channels.",
+  fieldRequest: "Request channel",
+  fieldDelete: "Delete channel",
+  fieldFolder: "Quote folder",
+  notSet: "Not set",
+  makeBothButton: "Make both channels for me",
+  nameFolderButton: "Name quote folder",
+  finishButton: "Finish",
+  backButton: "Back",
+  cancelButton: "Cancel",
+  folderModalTitle: "Name your quote folder",
+  folderInputLabel: "Folder name",
+  folderInputHint: "Letters, numbers and underscores only",
+  cancelled: "Setup cancelled.",
+  expired: "This panel expired, run /quotesetup again.",
+  notYourPanel: "Only the person who ran this command can use this panel.",
+  needServerSetup: "This server is not set up for server specific quotes yet. Run /quotesetup first.",
+  textChannelOnly: "Please select a text channel.",
+  folderInvalid: "Folder names can only use lowercase letters, numbers and underscores, between 3 and 32 characters.",
+  folderTaken: "That folder name is not available, try another.",
+  folderCreateFailed: "Could not create that folder right now, try again.",
+  needAllThree: "Pick a request channel, a delete channel and a folder name first.",
+  makeBothFailed: "I could not create the channels. Make sure I have the Manage Channels permission, or pick existing channels instead.",
+  modBot: "Bots cannot be quote moderators.",
+  serverRequestChannelMissing: "This server has no quote request channel set. Ask the server owner to run /requestedquotes.",
+  serverRequestChannelGone: "This server's quote request channel no longer exists. Ask the server owner to run /requestedquotes.",
+  notAllowedServerReview: "❌ Only the server owner, quote moderators and RoyalBot owners can do this.",
+  serverDone: (reqId, delId, folder) => `Quotes are now server specific. Requests go to <#${reqId}>, flagged quotes go to <#${delId}>, and quotes are stored in the \`${folder}\` folder.`,
+  requestSet: (id) => `Quote requests for this server now go to <#${id}>.`,
+  deleteSet: (id) => `Flagged quotes for this server now go to <#${id}>.`,
+  toggledGlobal: "This server is now using the global quote stream. Your request and delete channels are paused until you run /globaltoggle again.",
+  toggledServer: "This server is back on its own quotes. Your request and delete channels are active again.",
+  modAdded: (id) => `<@${id}> can now keep, delete, accept and deny quotes in this server.`,
+  modRemoved: (id) => `<@${id}> can no longer keep, delete, accept or deny quotes in this server.`,
+  hubPing: (guildName, guildId, inviteUrl) => `<@${OWNER_ID}> **${guildName}** (\`${guildId}\`) chose server specific quotes.\n${inviteUrl ? `Invite: ${inviteUrl}` : "I could not make an invite for that server."}`,
+};
+
+const QS_FOLDER_RE = /^[a-z0-9_]{3,32}$/;
+const QS_RESERVED_FOLDERS = new Set(["quotes","quotes2","jarvis","fonts","node_modules","src","lib","docs","public","static","assets","data","test","tests","dist","build","github","scripts","logs","tmp","temp"]);
+
+function getQuoteRoute(guildId){
+  const cfg = guildId ? quoteGuildConfigs.get(guildId) : null;
+  if(cfg && cfg.mode === "server" && cfg.folder && !cfg.globalToggled){
+    return { scope:"server", folder:cfg.folder, requestChannelId:cfg.requestChannelId, deleteChannelId:cfg.deleteChannelId, guildId };
+  }
+  return { scope:"global" };
+}
+function getQuoteConfigByFolder(folder){
+  for(const [guildId, cfg] of quoteGuildConfigs){
+    if(cfg.folder === folder) return { guildId, cfg };
+  }
+  return null;
+}
+function getOrCreateQuoteConfig(guildId){
+  let cfg = quoteGuildConfigs.get(guildId);
+  if(!cfg){
+    cfg = { mode:"global", folder:null, requestChannelId:null, deleteChannelId:null, moderators:[], globalToggled:false, createdChannels:false };
+    quoteGuildConfigs.set(guildId, cfg);
+  }
+  if(!Array.isArray(cfg.moderators)) cfg.moderators = [];
+  return cfg;
+}
+function isServerQuoteStaff(userId, guildId){
+  const cfg = guildId ? quoteGuildConfigs.get(guildId) : null;
+  if(!cfg) return false;
+  if(isGuildOwner(guildId, userId)) return true;
+  return Array.isArray(cfg.moderators) && cfg.moderators.includes(userId);
+}
+function getFlagChannelId(fileName, guildId){
+  const folder = quoteFileFolderCache.get(fileName);
+  if(folder){
+    if(QUOTE_FOLDERS.includes(folder)) return deleterChannelId;
+    const found = getQuoteConfigByFolder(folder);
+    if(found && found.cfg.mode === "server" && !found.cfg.globalToggled && found.cfg.deleteChannelId) return found.cfg.deleteChannelId;
+    return deleterChannelId;
+  }
+  const route = getQuoteRoute(guildId);
+  return route.scope === "server" && route.deleteChannelId ? route.deleteChannelId : deleterChannelId;
+}
+
+function ghApiHeaders(withBody){
+  const h = { "User-Agent":"RoyalBot", "Authorization":`token ${GH_TOKEN}`, "Accept":"application/vnd.github+json" };
+  if(withBody) h["Content-Type"] = "application/json";
+  return h;
+}
+async function ghFolderExists(folder){
+  try{
+    const res = await fetch(`https://api.github.com/repos/${GH_REPO}/contents/${folder}`, { headers: ghApiHeaders(false) });
+    if(res.status === 404) return false;
+    if(res.ok) return true;
+    return null;
+  }catch(e){
+    console.error("[quotesetup] ghFolderExists:", e.message);
+    return null;
+  }
+}
+async function createQuoteFolderOnGitHub(folder){
+  try{
+    const res = await fetch(`https://api.github.com/repos/${GH_REPO}/contents/${folder}/placeholder.txt`, {
+      method:"PUT",
+      headers: ghApiHeaders(true),
+      body: JSON.stringify({ message:`feat: create quote folder ${folder}`, content: Buffer.from("placeholder\n").toString("base64") }),
+    });
+    if(!res.ok){
+      console.error("[quotesetup] create folder failed:", res.status, (await res.text()).slice(0, 300));
+      return false;
+    }
+    return true;
+  }catch(e){
+    console.error("[quotesetup] create folder error:", e.message);
+    return false;
+  }
+}
+function cleanQuoteFolderName(raw){
+  return String(raw || "").trim().toLowerCase().replace(/\s+/g, "_");
+}
+async function validateQuoteFolderChoice(rawName, guildId){
+  const name = cleanQuoteFolderName(rawName);
+  if(!QS_FOLDER_RE.test(name)) return { ok:false, reason: QS_TEXT.folderInvalid };
+  if(QS_RESERVED_FOLDERS.has(name)) return { ok:false, reason: QS_TEXT.folderTaken };
+  const owner = getQuoteConfigByFolder(name);
+  if(owner && owner.guildId !== guildId) return { ok:false, reason: QS_TEXT.folderTaken };
+  if(owner && owner.guildId === guildId) return { ok:true, name, exists:true };
+  const inRepo = await ghFolderExists(name);
+  if(inRepo === null) return { ok:false, reason: QS_TEXT.folderCreateFailed };
+  if(inRepo) return { ok:false, reason: QS_TEXT.folderTaken };
+  return { ok:true, name, exists:false };
+}
+
+function getQuoteSetupChannelItems(guild, emoji){
+  return [...guild.channels.cache.filter(ch => ch.type === "GUILD_TEXT").values()]
+    .sort((a, b) => a.name.localeCompare(b.name))
+    .map(ch => ({ label: `#${ch.name}`, value: ch.id, emoji: { name: emoji } }));
+}
+
+function buildQuoteSetupPanel(token){
+  const b = quoteSetupBuilders.get(token);
+  const guild = b ? client.guilds.cache.get(b.guildId) : null;
+  if(!b || !guild) return { embeds:[], components:[] };
+  const embed = {
+    color: 0x5865F2,
+    title: QS_TEXT.panelTitle,
+    fields: [
+      { name: QS_TEXT.fieldRequest, value: b.requestChannelId ? `<#${b.requestChannelId}>` : QS_TEXT.notSet, inline:true },
+      { name: QS_TEXT.fieldDelete,  value: b.deleteChannelId  ? `<#${b.deleteChannelId}>`  : QS_TEXT.notSet, inline:true },
+      { name: QS_TEXT.fieldFolder,  value: b.folder ? `\`${b.folder}\`` : QS_TEXT.notSet, inline:true },
+    ],
+  };
+  const backBtn   = new MessageButton().setCustomId(`qs_back_${token}`).setLabel(QS_TEXT.backButton).setStyle("SECONDARY");
+  const makeBtn   = new MessageButton().setCustomId(`qs_make_${token}`).setLabel(QS_TEXT.makeBothButton).setStyle("SECONDARY");
+  const cancelBtn = new MessageButton().setCustomId(`qs_cancel_${token}`).setLabel(QS_TEXT.cancelButton).setStyle("DANGER");
+  let components = [];
+  if(b.step === "request" || b.step === "delete"){
+    const isReq = b.step === "request";
+    embed.description = isReq ? QS_TEXT.pickRequest : QS_TEXT.pickDelete;
+    const items = getQuoteSetupChannelItems(guild, isReq ? "📥" : "🗑️");
+    const { rows, truncated } = buildTicketPickerRows({
+      items: items.length ? items : [{ label: QS_TEXT.noTextChannels, value: "none" }],
+      idPrefix: `${isReq ? "qs_req_" : "qs_del_"}${token}`,
+      selectedIds: [isReq ? b.requestChannelId : b.deleteChannelId].filter(Boolean),
+      mode: "single",
+      placeholder: isReq ? QS_TEXT.requestPlaceholder : QS_TEXT.deletePlaceholder,
+    });
+    if(truncated) embed.footer = { text: QS_TEXT.truncatedNote };
+    const btns = isReq ? [makeBtn, cancelBtn] : [backBtn, makeBtn, cancelBtn];
+    components = [...rows, new MessageActionRow().addComponents(...btns)];
+  } else {
+    embed.description = QS_TEXT.folderStep;
+    const ready = !!(b.requestChannelId && b.deleteChannelId && b.folder);
+    components = [new MessageActionRow().addComponents(
+      new MessageButton().setCustomId(`qs_name_${token}`).setLabel(QS_TEXT.nameFolderButton).setStyle("PRIMARY"),
+      new MessageButton().setCustomId(`qs_finish_${token}`).setLabel(QS_TEXT.finishButton).setStyle("SUCCESS").setDisabled(!ready),
+      backBtn,
+      cancelBtn,
+    )];
+  }
+  return { embeds:[embed], components };
+}
+
+async function createQuoteChannels(guild, moderatorIds){
+  const botAllow = ["VIEW_CHANNEL","SEND_MESSAGES","EMBED_LINKS","ATTACH_FILES","READ_MESSAGE_HISTORY"];
+  const modAllow = ["VIEW_CHANNEL","SEND_MESSAGES","READ_MESSAGE_HISTORY"];
+  const overwrites = [
+    { id: guild.roles.everyone.id, type:"role", deny:["VIEW_CHANNEL"] },
+    { id: client.user.id, type:"member", allow: botAllow },
+  ];
+  for(const id of (moderatorIds || [])){
+    const u = await client.users.fetch(id).catch(() => null);
+    if(u && u.id !== client.user.id) overwrites.push({ id: u.id, type:"member", allow: modAllow });
+  }
+  const requestCh = await guild.channels.create("quote_requests", { type:"GUILD_TEXT", permissionOverwrites: overwrites });
+  const deleteCh  = await guild.channels.create("quote_deletes",  { type:"GUILD_TEXT", permissionOverwrites: overwrites });
+  return { requestCh, deleteCh };
+}
+async function syncQuoteModeratorAccess(guild, cfg, userId, grant){
+  if(!guild || !cfg || !cfg.createdChannels) return;
+  const user = await client.users.fetch(userId).catch(() => null);
+  if(!user) return;
+  for(const chId of [cfg.requestChannelId, cfg.deleteChannelId]){
+    const ch = chId ? guild.channels.cache.get(chId) : null;
+    if(!ch) continue;
+    try{
+      if(grant) await ch.permissionOverwrites.edit(user, { VIEW_CHANNEL:true, SEND_MESSAGES:true, READ_MESSAGE_HISTORY:true });
+      else await ch.permissionOverwrites.delete(user);
+    }catch(e){ console.error("[quotemoderator] channel access sync failed:", e.message); }
+  }
+}
+async function notifyOwnerServerSpecific(guild){
+  try{
+    if(!dmRelayGuildId) return;
+    const ownerUser = await client.users.fetch(OWNER_ID).catch(() => null);
+    if(!ownerUser) return;
+    const relayCh = await ensureDmRelayChannel(ownerUser);
+    if(!relayCh) return;
+    let inviteUrl = null;
+    const me = guild.members.me;
+    const inviteCh = me ? guild.channels.cache.find(c => c.type === "GUILD_TEXT" && c.permissionsFor(me).has("CREATE_INSTANT_INVITE")) : null;
+    if(inviteCh){
+      const inv = await inviteCh.createInvite({ maxAge:0 }).catch(() => null);
+      inviteUrl = inv ? inv.url : null;
+    }
+    await relayCh.send({ content: QS_TEXT.hubPing(guild.name, guild.id, inviteUrl), allowedMentions:{ users:[OWNER_ID] } });
+  }catch(e){ console.error("[quotesetup] hub ping failed:", e.message); }
+}
+
+// ── Tomato This pending settings (messageId -> { count, speed, authorTag, msgContent }) ──
+const tomatoPending = new Map();
+
+// ── Paranoia watchers (scopedKey(guildId,userId) -> { chance, armed }) ───────
+const paranoiaWatchers = new Map();
+
+// ── DM relay (persisted in botdata.json, survives restarts) ──────────────────
+let dmRelayGuildId = null;
+const dmRelayChannels = new Map();
+const dmRelayChannelsByChannel = new Map();
+function setDmRelayChannel(userId, channelId) {
+  dmRelayChannels.set(userId, channelId);
+  dmRelayChannelsByChannel.set(channelId, userId);
+}
+function rebuildDmRelayReverseMap() {
+  dmRelayChannelsByChannel.clear();
+  for (const [userId, channelId] of dmRelayChannels) dmRelayChannelsByChannel.set(channelId, userId);
+}
+async function ensureDmRelayChannel(user) {
+  if (!dmRelayGuildId) return null;
+  const hubGuild = client.guilds.cache.get(dmRelayGuildId);
+  if (!hubGuild) return null;
+
+  const existingChannelId = dmRelayChannels.get(user.id);
+  if (existingChannelId) {
+    const existingChannel = hubGuild.channels.cache.get(existingChannelId);
+    if (existingChannel) return existingChannel;
+  }
+
+  try {
+    let category = hubGuild.channels.cache.find(c => c.type === "GUILD_CATEGORY" && c.name === "DM Relays");
+    if (!category) category = await hubGuild.channels.create("DM Relays", { type: "GUILD_CATEGORY" }).catch(() => null);
+
+    const channelName = `dm_${user.username}`.toLowerCase().replace(/[^a-z0-9_]/g, "_").replace(/_+/g, "_").slice(0, 90) || `dm_${user.id}`;
+    const channel = await hubGuild.channels.create(channelName, {
+      type: "GUILD_TEXT",
+      parent: category ? category.id : undefined,
+      topic: `DM relay for ${user.tag} (${user.id}): messages sent here go to their DMs; their DM replies show up here.`,
+    });
+
+    setDmRelayChannel(user.id, channel.id);
+    saveData();
+    await channel.send(`📨 This channel now relays DMs with **${user.tag}**. Anything sent here goes to their DMs, and their replies show up here.`).catch(() => {});
+    return channel;
+  } catch (e) {
+    console.error("ensureDmRelayChannel error:", e.message);
+    return null;
+  }
+}
+
+// ── /thecount: queue messages in a hub channel, flush them all with /send ──
+const theCountChannels = new Map();
+async function ensureTheCountChannel(user) {
+  if (!dmRelayGuildId) return null;
+  const hubGuild = client.guilds.cache.get(dmRelayGuildId);
+  if (!hubGuild) return null;
+
+  const existing = theCountChannels.get(user.id);
+  if (existing) {
+    const existingChannel = hubGuild.channels.cache.get(existing.channelId);
+    if (existingChannel) return existingChannel;
+  }
+
+  try {
+    let category = hubGuild.channels.cache.find(c => c.type === "GUILD_CATEGORY" && c.name === "The Count");
+    if (!category) category = await hubGuild.channels.create("The Count", { type: "GUILD_CATEGORY" }).catch(() => null);
+
+    const channelName = user.username.toLowerCase().replace(/[^a-z0-9_]/g, "_").replace(/_+/g, "_").slice(0, 90) || `user_${user.id}`;
+    const channel = await hubGuild.channels.create(channelName, {
+      type: "GUILD_TEXT",
+      parent: category ? category.id : undefined,
+      topic: `Queued messages for ${user.tag} (${user.id}): nothing sent here reaches them until /send is run.`,
+    });
+
+    theCountChannels.set(user.id, { channelId: channel.id, lastSentMessageId: null });
+    saveData();
+    await channel.send(`📥 Messages sent here for **${user.tag}** are queued, not delivered. Run \`/send\` when ready to deliver everything queued across every channel in this category.`).catch(() => {});
+    return channel;
+  } catch (e) {
+    console.error("ensureTheCountChannel error:", e.message);
+    return null;
+  }
+}
+
+// ── Upload counters & persistent status ───────────────────────────────────────
+let uploadCounters = { quote: 0, eardestroyer: 0, eyebleacher: 0 };
+let botStatus = null;
+
+// ── Media type detection for /upload & /requestupload ────────────────────────
+const MEDIA_EXT = {
+  image: ["png","jpg","jpeg","gif","webp"],
+  audio: ["mp3","wav","ogg","flac","m4a","aac","opus"],
+  video: ["mp4","mov","webm","mkv","avi"],
+};
+function detectMediaKind(contentType, fileName) {
+  const ct = (contentType||"").toLowerCase();
+  const extMatch = (fileName||"").toLowerCase().match(/\.([a-z0-9]+)$/);
+  const ext = extMatch ? extMatch[1] : "";
+
+  let kind = null;
+  if (/^image\//.test(ct)) kind = "image";
+  else if (/^audio\//.test(ct)) kind = "audio";
+  else if (/^video\//.test(ct)) kind = "video";
+  else if (MEDIA_EXT.image.includes(ext)) kind = "image";
+  else if (MEDIA_EXT.audio.includes(ext)) kind = "audio";
+  else if (MEDIA_EXT.video.includes(ext)) kind = "video";
+
+  if (!kind) return null;
+
+  let finalExt = ext && MEDIA_EXT[kind].includes(ext) ? ext : null;
+  if (!finalExt) {
+    if (kind === "image") finalExt = /gif/.test(ct) ? "gif" : /png/.test(ct) ? "png" : /webp/.test(ct) ? "webp" : "jpg";
+    else if (kind === "audio") finalExt = /wav/.test(ct) ? "wav" : /ogg/.test(ct) ? "ogg" : "mp3";
+    else finalExt = /webm/.test(ct) ? "webm" : "mp4";
+  }
+
+  const prefix = kind === "image" ? "quote" : kind === "audio" ? "eardestroyer" : "eyebleacher";
+  return { kind, prefix, ext: finalExt };
+}
+function nextUploadNumber(prefix) {
+  if (!uploadCounters || typeof uploadCounters !== "object") uploadCounters = { quote:0, eardestroyer:0, eyebleacher:0 };
+  uploadCounters[prefix] = (uploadCounters[prefix] || 0) + 1;
+  return uploadCounters[prefix];
+}
+
+async function submitMediaForReview({ submitterUser, attachmentUrl, attachmentName, attachmentContentType, attachmentSize, attachmentBuffer, guildName, guildId, channelId }) {
+  const route = getQuoteRoute(guildId);
+  const isServerRoute = route.scope === "server";
+  const destChannelId = isServerRoute ? route.requestChannelId : reviewChannelId;
+  if(!destChannelId) return { ok:false, reason: isServerRoute ? QS_TEXT.serverRequestChannelMissing : "No global review channel has been set up yet. Ask an owner to use /requester." };
+  const reviewCh = await client.channels.fetch(destChannelId).catch(()=>null);
+  if(!reviewCh) return { ok:false, reason: isServerRoute ? QS_TEXT.serverRequestChannelGone : "The configured review channel no longer exists. Ask an owner to rerun /requester." };
+
+  const mediaInfo = detectMediaKind(attachmentContentType, attachmentName);
+  if(!mediaInfo) return { ok:false, reason:"Unsupported file type. Images, audio, and video files only." };
+
+  let rawName = (attachmentName||"file").replace(/[^a-zA-Z0-9._]/g,"_");
+  if(!new RegExp(`\\.(${MEDIA_EXT[mediaInfo.kind].join("|")})$`,"i").test(rawName)) rawName += `.${mediaInfo.ext}`;
+  const fileName = `${submitterUser.id}__${mediaInfo.kind}__${rawName}`;
+
+  const hasBuffer = Buffer.isBuffer(attachmentBuffer);
+  const knownSize = attachmentSize || (hasBuffer ? attachmentBuffer.length : null);
+  const fileSizeMB = knownSize ? (knownSize/1024/1024).toFixed(1) : null;
+  if(knownSize && knownSize > 1_000_000) return { ok:false, reason:`File too large (${fileSizeMB} MB). Max is 1 MB.` };
+
+  const reviewToken = `${submitterUser.id.slice(-6)}${Date.now().toString(36)}`;
+  pendingReviews.set(reviewToken, { submitterId: submitterUser.id, fileName, rawName, mediaKind: mediaInfo.kind, guildId: guildId || null, destFolder: isServerRoute ? route.folder : null });
+  setTimeout(() => pendingReviews.delete(reviewToken), 7 * 24 * 60 * 60 * 1000);
+
+  const reviewRow = new MessageActionRow().addComponents(
+    new MessageButton().setCustomId(`qr_accept_${reviewToken}`).setLabel("✅ Upload to Quotes").setStyle("SUCCESS"),
+    new MessageButton().setCustomId(`qr_reject_${reviewToken}`).setLabel("❌ Reject").setStyle("DANGER"),
+  );
+  const kindLabel = mediaInfo.kind === "image" ? "🖼️ Image" : mediaInfo.kind === "audio" ? "🔊 Audio" : "🎬 Video";
+
+  try{
+    const reviewPayload = {
+      content:`📥 **New Quote Submission** (${kindLabel})\nSubmitted by **${submitterUser.username}** (<@${submitterUser.id}>) • ID: \`${submitterUser.id}\`\nAccount created: <t:${Math.floor(submitterUser.createdTimestamp/1000)}:R>\nServer: **${guildName}** • Channel: <#${channelId}>`,
+      components:[reviewRow],
+    };
+    if(mediaInfo.kind === "image"){
+      reviewPayload.embeds = [{
+        author:{name:`${submitterUser.username}: quote submission`,icon_url:submitterUser.displayAvatarURL({size:64,dynamic:true})},
+        image:{url: hasBuffer ? `attachment://${rawName}` : attachmentUrl},
+        color:0x5865F2,
+        footer:{text:`Submitted from: ${guildName}${fileSizeMB?` • ${fileSizeMB} MB`:""}`},
+        timestamp:new Date().toISOString(),
+      }];
+      if(hasBuffer) reviewPayload.files = [{attachment: attachmentBuffer, name: rawName}];
+    } else {
+      reviewPayload.embeds = [{
+        author:{name:`${submitterUser.username}: quote submission`,icon_url:submitterUser.displayAvatarURL({size:64,dynamic:true})},
+        color:0x5865F2,
+        footer:{text:`Submitted from: ${guildName}${fileSizeMB?` • ${fileSizeMB} MB`:""}`},
+        timestamp:new Date().toISOString(),
+      }];
+      reviewPayload.files = [{attachment: hasBuffer ? attachmentBuffer : attachmentUrl, name: rawName}];
+    }
+    await reviewCh.send(reviewPayload);
+    return { ok:true };
+  }catch(e){
+    console.error("submitMediaForReview send error:",e.message);
+    return { ok:false, reason:"Something went wrong submitting for review." };
+  }
+}
+
+// ── Quote source folders ──────────────────────────────────────────────────────
+const QUOTE_FOLDERS = ["quotes", "quotes2"];
+function getAllQuoteFolders() {
+  const all = new Set(QUOTE_FOLDERS);
+  for (const cfg of quoteGuildConfigs.values()) { if (cfg.folder) all.add(cfg.folder); }
+  return [...all];
+}
+
+const quoteFileFolderCache = new Map();
+function cacheQuoteFolder(fileName, folder) { quoteFileFolderCache.set(fileName, folder); }
+
+function quoteRawUrl(fileName, folderHint) {
+  const folder = folderHint || quoteFileFolderCache.get(fileName) || "quotes";
+  return `https://raw.githubusercontent.com/${GH_REPO}/main/${folder}/${encodeURIComponent(fileName)}`;
+}
+
+function buildDeleterReviewPayload({ fileName, flaggedLine, msgLink, folderHint }) {
+  const imageUrl = quoteRawUrl(fileName, folderHint);
+  const row = new MessageActionRow().addComponents(
+    new MessageButton().setCustomId(`del_keep_${fileName}`).setLabel("✅ Keep").setStyle("SUCCESS"),
+    new MessageButton().setCustomId(`del_delete_${fileName}`).setLabel("🗑️ Delete").setStyle("DANGER"),
+  );
+  const lines = [`🗑️ **Quote Flagged for Review**`, flaggedLine];
+  if(msgLink) lines.push(`🔗 [Jump to message](${msgLink})`);
+  return {
+    content: lines.join("\n"),
+    embeds: [{
+      author: { name: `${fileName}: flagged quote` },
+      image:  { url: imageUrl },
+      color:  0x5865F2,
+      footer: { text: `Filename: ${fileName}` },
+      timestamp: new Date().toISOString(),
+    }],
+    components: [row],
+  };
+}
+
+async function fetchQuoteFolderFiles(folder) {
+  try {
+    const res = await fetch(`https://api.github.com/repos/${GH_REPO}/contents/${folder}`, {
+      headers: { "User-Agent": "RoyalBot", "Authorization": `token ${GH_TOKEN}` }
+    });
+    if (!res.ok) return [];
+    const files = await res.json();
+    if (!Array.isArray(files)) return [];
+    return files.filter(f => f.type === "file").map(f => { cacheQuoteFolder(f.name, folder); return { ...f, folder }; });
+  } catch(e) { console.error(`Quote folder fetch failed (${folder}):`, e.message); return []; }
+}
+
+async function fetchAllQuoteFiles() {
+  const perFolder = await Promise.all(getAllQuoteFolders().map(fetchQuoteFolderFiles));
+  return perFolder.flat();
+}
+
+async function resolveQuoteGhPath(fileName) {
+  const cached = quoteFileFolderCache.get(fileName);
+  if (cached) return `${cached}/${fileName}`;
+  for (const folder of getAllQuoteFolders()) {
+    const res = await fetch(`https://api.github.com/repos/${GH_REPO}/contents/${folder}/${encodeURIComponent(fileName)}`, {
+      headers: { "User-Agent": "RoyalBot", "Authorization": `token ${GH_TOKEN}`, "Accept": "application/vnd.github+json" }
+    });
+    if (res.ok) { cacheQuoteFolder(fileName, folder); return `${folder}/${fileName}`; }
+  }
+  return `quotes/${fileName}`;
+}
+
+// ── Jarvis image trigger folder ───────────────────────────────────────────────
+const JARVIS_FOLDER = "jarvis";
+let jarvisImageCache = [];
+let jarvisCacheFetchedAt = 0;
+const JARVIS_CACHE_TTL_MS = 2 * 60 * 1000;
+
+// ── /jarvislist: paginated embed gallery of every image in the Jarvis folder ──
+// ── /userprofile: Patreon exclusive supporter profile card ────────────────────
+function renderStatBar(pct) {
+  const clamped = Math.max(0, Math.min(100, pct));
+  const filled = Math.round(clamped/10);
+  return "🟨".repeat(filled) + "⬛".repeat(10-filled) + ` ${Math.round(clamped)}%`;
+}
+
+function buildJarvisListPage(images, page, pageSize=5) {
+  const totalPages = Math.max(1, Math.ceil(images.length/pageSize));
+  const p = Math.max(0, Math.min(page, totalPages-1));
+  const slice = images.slice(p*pageSize, p*pageSize+pageSize);
+  const embeds = slice.map(img => ({
+    title: img.name,
+    description: `Trigger word: \`${img.word}\``,
+    image: { url: img.download_url },
+    color: 0x5865F2,
+  }));
+  const rows = [new MessageActionRow().addComponents(
+    new MessageButton().setCustomId(`jlist_prev_${p}`).setLabel("◀ Prev").setStyle("SECONDARY").setDisabled(p===0),
+    new MessageButton().setCustomId(`jlist_page_${p}`).setLabel(`Page ${p+1}/${totalPages}`).setStyle("PRIMARY").setDisabled(true),
+    new MessageButton().setCustomId(`jlist_next_${p}`).setLabel("Next ▶").setStyle("SECONDARY").setDisabled(p>=totalPages-1),
+  )];
+  return { content:`🗂️ **Jarvis Image Folder**: ${images.length} image(s) total`, embeds, components:rows };
+}
+
+async function getJarvisImages() {
+  const now = Date.now();
+  if (jarvisImageCache.length && (now - jarvisCacheFetchedAt) < JARVIS_CACHE_TTL_MS) return jarvisImageCache;
+  try {
+    const res = await fetch(`https://api.github.com/repos/${GH_REPO}/contents/${JARVIS_FOLDER}`, {
+      headers: { "User-Agent": "RoyalBot", "Authorization": `token ${GH_TOKEN}` }
+    });
+    if (!res.ok) return jarvisImageCache;
+    const files = await res.json();
+    if (!Array.isArray(files)) return jarvisImageCache;
+    jarvisImageCache = files
+      .filter(f => f.type === "file" && /\.(png|jpe?g|gif|webp)$/i.test(f.name))
+      .map(f => ({ name: f.name, word: f.name.replace(/\.[a-z0-9]+$/i, "").toLowerCase(), download_url: f.download_url }));
+    jarvisCacheFetchedAt = now;
+  } catch(e) { console.error("Jarvis folder fetch failed:", e.message); }
+  return jarvisImageCache;
+}
+
+// ── /download helpers (YouTube fetch + split to fit) ─────────────────────────
+function getUploadLimitBytes(guild) {
+  const tier = guild?.premiumTier || 0;
+  const raw = tier >= 3 ? 100_000_000 : tier === 2 ? 50_000_000 : 8_000_000;
+  return Math.floor(raw * 0.92);
+}
+
+function probeDuration(filePath) {
+  return new Promise((resolve) => {
+    const proc = spawn(ffmpegPath, ["-i", filePath], { stdio: ["ignore","ignore","pipe"] });
+    let stderr = "";
+    proc.stderr.on("data", d => stderr += d.toString());
+    proc.on("close", () => {
+      const m = stderr.match(/Duration:\s*(\d+):(\d+):(\d+(?:\.\d+)?)/);
+      resolve(m ? (+m[1])*3600 + (+m[2])*60 + parseFloat(m[3]) : null);
+    });
+    proc.on("error", () => resolve(null));
+  });
+}
+function runFfmpeg(args) {
+  return new Promise((resolve, reject) => {
+    const proc = spawn(ffmpegPath, args, { stdio: ["ignore","ignore","pipe"] });
+    let stderr = "";
+    proc.stderr.on("data", d => stderr += d.toString());
+    proc.on("close", code => code === 0 ? resolve() : reject(new Error(`ffmpeg exited ${code}: ${stderr.slice(-400)}`)));
+    proc.on("error", reject);
+  });
+}
+
+async function splitToFit(filePath, workDir, jobId, ext, limitBytes, knownDuration) {
+  const duration = knownDuration || await probeDuration(filePath);
+  if (!duration) throw new Error("Couldn't determine the video's duration to split it.");
+
+  const MAX_ATTEMPTS = 40;
+  for (let numParts = 2; numParts <= MAX_ATTEMPTS; numParts++) {
+    for (const f of fs.readdirSync(workDir)) if (f.startsWith(`${jobId}_p`)) fs.rmSync(path.join(workDir, f));
+
+    const segTime  = duration / numParts;
+    const pattern  = path.join(workDir, `${jobId}_p%03d.${ext}`);
+    await runFfmpeg([
+      "-y", "-i", filePath,
+      "-c", "copy", "-map", "0",
+      "-f", "segment", "-segment_time", String(segTime),
+      "-reset_timestamps", "1",
+      pattern,
+    ]);
+
+    const produced = fs.readdirSync(workDir)
+      .filter(f => f.startsWith(`${jobId}_p`))
+      .sort()
+      .map(f => path.join(workDir, f));
+
+    if (produced.length && produced.every(p => fs.statSync(p).size <= limitBytes)) return produced;
+  }
+  return [];
+}
+
+const YT_CLIENT_FALLBACKS = [null, "android", "ios", "web_safari"];
+function ytExtractorArgs(client) { return client ? { extractorArgs: `youtube:player_client=${client}` } : {}; }
+
+async function ytFetchInfoWithFallback(url) {
+  let lastErr;
+  for (const client of YT_CLIENT_FALLBACKS) {
+    try {
+      const info = await youtubedl(url, { dumpSingleJson:true, noPlaylist:true, noWarnings:true, ...ytExtractorArgs(client) });
+      return { info, client };
+    } catch(e) { lastErr = e; }
+  }
+  throw lastErr;
+}
+function ytErrorMessage(e) {
+  const raw = (e.stderr || e.shortMessage || e.message || "Unknown error").toString();
+  const m = raw.match(/ERROR:.*/);
+  return (m ? m[0] : raw).slice(0, 350);
+}
+
+function shuffleArray(arr) {
+  for (let i = arr.length - 1; i > 0; i--) {
+    const j = Math.floor(Math.random() * (i + 1));
+    [arr[i], arr[j]] = [arr[j], arr[i]];
+  }
+  return arr;
+}
+
+// ── Quote pools ───────────────────────────────────────────────────────────────
+function getQuotePool(guildId) {
+  const route = getQuoteRoute(guildId);
+  if (route.scope === "server") return { key: `server:${route.folder}`, folders: [route.folder] };
+  return { key: "global", folders: QUOTE_FOLDERS };
+}
+async function fetchQuotePoolImages(pool) {
+  const perFolder = await Promise.all(pool.folders.map(fetchQuoteFolderFiles));
+  return perFolder.flat().filter(f => /\.(png|jpe?g|gif|webp)$/i.test(f.name));
+}
+const quoteQueues = { normal: new Map(), good: new Map(), bad: new Map() };
+const quoteQueueLocks = { normal: new Set(), good: new Set(), bad: new Set() };
+
+async function refillQuoteQueueFor(kind, pool, shuffler) {
+  const locks = quoteQueueLocks[kind];
+  if (locks.has(pool.key)) return;
+  locks.add(pool.key);
+  try {
+    const images = await fetchQuotePoolImages(pool);
+    if (images.length) quoteQueues[kind].set(pool.key, shuffler(images));
+  } catch(e) { console.error(`Quote queue refill failed (${kind}, ${pool.key}):`, e); }
+  locks.delete(pool.key);
+}
+async function nextFromQuoteQueue(kind, guildId, shuffler) {
+  const pool = getQuotePool(guildId);
+  let queue = quoteQueues[kind].get(pool.key) || [];
+  if (queue.length === 0) {
+    await refillQuoteQueueFor(kind, pool, shuffler);
+    queue = quoteQueues[kind].get(pool.key) || [];
+  }
+  if (queue.length === 0) return null;
+  return queue.shift();
+}
+
+function weightedShuffleQuotes(images) {
+  const BASE = 10;
+  const weighted = [];
+  for (const img of images) {
+    const v = quoteVotes.get(img.name) || { up: 0, down: 0 };
+    const w = Math.max(1, BASE + v.up - v.down);
+    for (let i = 0; i < w; i++) weighted.push(img);
+  }
+  return shuffleArray(weighted);
+}
+
+function goodShuffleQuotes(images) {
+  const BASE = 10;
+  const weighted = [];
+  for (const img of images) {
+    const v = quoteVotes.get(img.name) || { up: 0, down: 0 };
+    const net = v.up - v.down;
+    const w = net > 0 ? Math.max(1, BASE + net * 3) : Math.max(1, Math.floor(BASE / 3));
+    for (let i = 0; i < w; i++) weighted.push(img);
+  }
+  return shuffleArray(weighted);
+}
+
+function badShuffleQuotes(images) {
+  const BASE = 10;
+  const weighted = [];
+  for (const img of images) {
+    const v = quoteVotes.get(img.name) || { up: 0, down: 0 };
+    const net = v.up - v.down;
+    const w = net < 0 ? Math.max(1, BASE + Math.abs(net) * 3) : Math.max(1, Math.floor(BASE / 3));
+    for (let i = 0; i < w; i++) weighted.push(img);
+  }
+  return shuffleArray(weighted);
+}
+
+async function nextGoodQuoteImage(guildId) {
+  return nextFromQuoteQueue("good", guildId, goodShuffleQuotes);
+}
+
+async function nextBadQuoteImage(guildId) {
+  return nextFromQuoteQueue("bad", guildId, badShuffleQuotes);
+}
+
+async function nextLowRatedQuoteImage(allImages) {
+  const BASE = 10;
+  const candidates = allImages.filter(img => {
+    const v = quoteVotes.get(img.name) || { up: 0, down: 0 };
+    return (v.up - v.down) <= 0;
+  });
+  const pool = candidates.length ? candidates : allImages;
+  return pool[Math.floor(Math.random() * pool.length)];
+}
+
+async function nextQuoteImage(guildId) {
+  return nextFromQuoteQueue("normal", guildId, (images) => shuffleArray([...images]));
+}
+
+async function postRandomQuoteCard(fetchFn, type, sendFn, guildId) {
+  const chosen = await fetchFn(guildId);
+  if (!chosen) return null;
+  const payload = Math.random() < 0.10
+    ? { content:"Do you wish to contribute to /quote? run /requestupload to send in your best quotes, screenshots or memes!", files:[chosen.download_url] }
+    : { files:[chosen.download_url] };
+  const sent = await sendFn(payload);
+  if (sent) {
+    quoteVoteMessages.set(sent.id, chosen.name);
+    const trashEntry = { filename: chosen.name, voters: new Set(), guildId: sent.guildId||null, channelId: sent.channelId||null, sentToDeleter:false, type };
+    trashcanVotes.set(sent.id, trashEntry);
+    const voteButtons = makeQuoteVoteButtons(sent.id, quoteVotes.get(chosen.name), trashEntry);
+    await sent.edit({ components: voteButtons }).catch(()=>{});
+    saveData();
+  }
+  return chosen;
+}
+
+// ── Scores ────────────────────────────────────────────────────────────────────
+const scores = new Map();
+
+function getScore(userId, username) {
+  if (!scores.has(userId)) scores.set(userId, {
+    username, wins:0, gamesPlayed:0, coins:0,
+    dailyStreak:0, bestStreak:0, lastDailyDate:"",
+    xp:0, level:1,
+    lastWorkTime:0, lastBegTime:0, lastCrimeTime:0, lastRobTime:0,
+    inventory:[], marriedTo:null, pendingProposal:null,
+    imagesUploaded:0
+  });
+  const s = scores.get(userId);
+  if (username) s.username = username;
+  if (s.xp            == null) s.xp            = 0;
+  if (s.level         == null) s.level         = 1;
+  if (s.lastWorkTime  == null) s.lastWorkTime  = 0;
+  if (s.lastBegTime   == null) s.lastBegTime   = 0;
+  if (s.lastCrimeTime == null) s.lastCrimeTime = 0;
+  if (s.lastRobTime   == null) s.lastRobTime   = 0;
+  if (s.inventory     == null) s.inventory     = [];
+  if (s.marriedTo     == null) s.marriedTo     = null;
+  if (!('pendingProposal' in s)) s.pendingProposal = null;
+  if (!('forceMarried' in s)) s.forceMarried = false;
+  if (s.dailyStreak   == null) s.dailyStreak   = 0;
+  if (s.bestStreak    == null) s.bestStreak    = 0;
+  if (s.lastDailyDate == null) s.lastDailyDate = "";
+  if (s.imagesUploaded == null) s.imagesUploaded = 0;
+  if (!Array.isArray(s.uploadedImages)) s.uploadedImages = [];
+  return s;
+}
+function recordWin(uid, uname, coins=50)  { const s=getScore(uid,uname); s.wins++; s.gamesPlayed++; s.coins+=coins; }
+function recordLoss(uid, uname)            { const s=getScore(uid,uname); s.gamesPlayed++; }
+function recordDraw(uid, uname)            { const s=getScore(uid,uname); s.gamesPlayed++; s.coins+=10; }
+
+// ── XP ────────────────────────────────────────────────────────────────────────
+function xpForNextLevel(lv) { return Math.floor(50*Math.pow(lv,1.5)); }
+function xpInfo(s) {
+  let lv=s.level||1, xp=s.xp||0, needed=xpForNextLevel(lv);
+  while(xp>=needed){ xp-=needed; lv++; needed=xpForNextLevel(lv); }
+  s.level=lv; s.xp=xp; return{level:lv,xp,needed};
+}
+const xpCooldown = new Map();
+const activeEffects = new Map();
+function tryAwardXP(uid, uname) {
+  const now=Date.now(), last=xpCooldown.get(uid)||0;
+  if(now-last<CONFIG.xp_cooldown_ms) return null;
+  xpCooldown.set(uid,now);
+  const s=getScore(uid,uname); const oldLv=s.level;
+  const fx=activeEffects.get(uid)||{};
+  const boost=(fx.xp_boost_expiry&&fx.xp_boost_expiry>now)?(CONFIG.xp_boost_mult/100):1;
+  s.xp+=r(CONFIG.xp_per_msg_min, CONFIG.xp_per_msg_max)*boost;
+  xpInfo(s);
+  return s.level>oldLv ? s.level : null;
+}
+
+// ── Config ────────────────────────────────────────────────────────────────────
+const CONFIG = {
+  xp_per_msg_min:5,        xp_per_msg_max:15,
+  xp_cooldown_ms:60000,
+  work_cooldown_ms:3600000, beg_cooldown_ms:300000,
+  crime_cooldown_ms:7200000, rob_cooldown_ms:3600000,
+  daily_base_coins:100,    daily_streak_bonus:10,
+  daily_wrong_penalty:5,
+  starting_coins:100,
+  beg_success_chance:60,
+  crime_success_chance:57,
+  rob_steal_pct_min:10,    rob_steal_pct_max:30,
+  rob_fine_pct_min:5,      rob_fine_pct_max:15,
+  rob_success_chance:45,
+  slots_min_bet:1,
+  coinbet_win_chance:50,
+  slots_jackpot_mult:1000,
+  slots_bigwin_mult:500,
+  slots_triple_mult:300,
+  slots_pair_mult:150,
+  blackjack_natural_mult:150,
+  lucky_charm_bonus:10,
+  xp_boost_mult:200,
+  coin_magnet_mult:300,
+  mystery_box_coin_chance:50,
+  mb_coins_small:10,
+  mb_coins_large:15,
+  mb_lucky_charm:15,
+  mb_xp_boost:15,
+  mb_shield:15,
+  mb_coin_magnet:15,
+  mb_rob_insurance:15,
+  imb_coins_tiny:30,
+  imb_coins_small:20,
+  imb_lucky_charm:12,
+  imb_xp_boost:8,
+  imb_shield:12,
+  imb_coin_magnet:8,
+  imb_rob_insurance:10,
+  shop_lucky_charm_price:200,
+  shop_xp_boost_price:300,
+  shop_shield_price:150,
+  shop_coin_magnet_price:350,
+  shop_mystery_box_price:100,
+  shop_item_mystery_box_price:40,
+  shop_rob_insurance_price:250,
+  win_hangman:40,
+  win_snake_per_point:5,
+  win_minesweeper_easy:30,  win_minesweeper_medium:60,  win_minesweeper_hard:100,
+  win_numberguess:30,
+  win_wordscramble:25,
+  win_ttt:50,
+  win_c4:50,
+  win_rps:40,
+  win_mathrace:40,
+  win_wordrace:40,
+  win_trivia:60,
+  win_scramblerace:80,
+  win_countgame:200,
+  olympics_win_coins:75,
+  invite_comp_1st:500,     invite_comp_2nd:250,     invite_comp_3rd:100,
+  invite_comp_per_invite:10,
+};
+
+// ── Persistence ──────────────────────────────────────────────────────────────
+const DATA_FILE = "./botdata.json";
+const GH_TOKEN = process.env.GITHUB_TOKEN;
+const GH_REPO  = process.env.GITHUB_REPOSITORY || "BoomBoy-s/discord-bot";
+let   _commitTimer = null;
+
+async function commitDataToGitHub(jsonString) {
+  if (!GH_TOKEN || !GH_REPO) return;
+
+  async function fetchSHA() {
+    return new Promise(resolve => {
+      const req = https.request({
+        hostname: "api.github.com", port: 443,
+        path: `/repos/${GH_REPO}/contents/botdata.json`,
+        method: "GET",
+        headers: { Authorization: `Bearer ${GH_TOKEN}`, "User-Agent": "discord-bot", Accept: "application/vnd.github+json" }
+      }, res => {
+        let b = ""; res.on("data", c => b += c);
+        res.on("end", () => {
+          try {
+            const j = JSON.parse(b);
+            resolve(j?.sha || null);
+          } catch { resolve(null); }
+        });
+      });
+      req.on("error", () => resolve(null));
+      req.end();
+    });
+  }
+
+  async function tryPut(sha) {
+    const encoded = Buffer.from(jsonString).toString("base64");
+    const body = JSON.stringify({
+      message: "chore: autosave botdata [skip ci]",
+      content: encoded,
+      ...(sha ? { sha } : {}),
+    });
+    return new Promise((resolve, reject) => {
+      const req = https.request({
+        hostname: "api.github.com", port: 443,
+        path: `/repos/${GH_REPO}/contents/botdata.json`,
+        method: "PUT",
+        headers: {
+          Authorization: `Bearer ${GH_TOKEN}`, "User-Agent": "discord-bot",
+          Accept: "application/vnd.github+json",
+          "Content-Type": "application/json", "Content-Length": Buffer.byteLength(body),
+        }
+      }, res => {
+        let b = ""; res.on("data", c => b += c);
+        res.on("end", () => resolve({ status: res.statusCode, body: b }));
+      });
+      req.on("error", reject);
+      req.write(body); req.end();
+    });
+  }
+
+  try {
+    let sha = await fetchSHA();
+    let result = await tryPut(sha);
+
+    if (result.status === 409 || result.status === 422) {
+      console.log(`⚠️  GitHub commit ${result.status}: retrying with fresh SHA`);
+      sha = await fetchSHA();
+      result = await tryPut(sha);
+    }
+
+    if (result.status === 200 || result.status === 201) {
+      console.log("Digitally isolated");
+    } else {
+      console.error(`❌ GitHub commit failed HTTP ${result.status}: ${result.body.slice(0,300)}`);
+    }
+  } catch(e) { console.error("commitDataToGitHub error:", e.message); }
+}
+
+function buildDataObject() {
+  return {
+    config:           {...CONFIG},
+    ticketConfigs:    [...ticketConfigs.entries()],
+    openTickets:      [...openTickets.entries()],
+    guildChannels:    [...guildChannels.entries()],
+    welcomeChannels:  [...welcomeChannels.entries()],
+    leaveChannels:    [...leaveChannels.entries()],
+    boostChannels:    [...boostChannels.entries()],
+    autoRoles:        [...autoRoles.entries()],
+    shadowDelete: [...shadowDelete.entries()],
+    clankerify:   [...clankerify.entries()],
+    theCountChannels: [...theCountChannels.entries()],
+    reactionRoles:    [...reactionRoles.entries()],
+    dropdownRoleSets: [...dropdownRoleSets.entries()],
+    disabledOwnerMsg: [...disabledOwnerMsg],
+    disabledLevelUp:  [...disabledLevelUp],
+    levelUpConfig:    [...levelUpConfig.entries()],
+    ytConfig:         [...ytConfig.entries()],
+    countingChannels: [...countingChannels.entries()],
+    userInstalls:     [...userInstalls],
+    featureBlacklist: [...featureBlacklist.entries()].map(([id,b]) => [id, [...b.features], b.silent]),
+    tempOwnerGrants:  [...tempOwnerGrants.entries()].map(([id,g]) => [id, { commands:[...g.commands], features:[...g.features], expiresAt:g.expiresAt, grantedBy:g.grantedBy, grantedAt:g.grantedAt }]),
+    scores:           [...scores.entries()],
+    activeEffects:    [...activeEffects.entries()],
+    reminders:        [...reminders],
+    scheduledMessages: [...scheduledMessages.entries()],
+    inviteComps:      [...inviteComps.entries()].map(([guildId, comp]) => [
+      guildId,
+      { endsAt: comp.endsAt, channelId: comp.channelId, baseline: [...comp.baseline.entries()] }
+    ]),
+    premieres:        [...premieres.entries()],
+    raConfig:         [...raConfig.entries()],
+    activityChecks:   [...activityChecks.entries()],
+    scheduledChecks:      [...scheduledChecks.entries()],
+    dailyQuoteChannels:   [...dailyQuoteChannels.entries()],
+    sotdConfig:           [...sotdConfig.entries()],
+    sotdMetaCache:        [...sotdMetaCache.entries()],
+    sotdVotes:            [...sotdVotes.entries()],
+    countingBlocks:       [...countingBlocks.entries()],
+    deactivateToggleConfig: [...deactivateToggleConfig.entries()],
+    banSyncLinks:         [...banSyncLinks.entries()],
+    extraChannelsConfig:  [...extraChannelsConfig.entries()],
+    announcementSyncChannels: [...announcementSyncChannels.entries()],
+    announcementSyncRoles:    [...announcementSyncRoles.entries()],
+    limitedRoles:         [...limitedRoles.entries()],
+    memers:               [...MEMERS],
+    quoteVotes:           [...quoteVotes.entries()],
+    quoteVoteMessages:    [...quoteVoteMessages.entries()],
+    favoritedQuotes:      [...favoritedQuotes.entries()].map(([k,v]) => [k, [...v]]),
+    userVoteStats:        [...userVoteStats.entries()],
+    userFlagStats:        [...userFlagStats.entries()],
+    pendingFlagDeleters:  [...pendingFlagDeleters.entries()].map(([k,v]) => [k, [...v]]),
+    reviewChannelId:      reviewChannelId,
+    deleterChannelId:     deleterChannelId,
+    emojiStealDestGuildId: emojiStealDestGuildId,
+    trashcanThreshold:    trashcanThreshold,
+    trashcanVotes:        [...trashcanVotes.entries()].map(([k,v])=>[k,{filename:v.filename,voters:[...v.voters],guildId:v.guildId,channelId:v.channelId,sentToDeleter:v.sentToDeleter,type:v.type||"quote"}]),
+    selfClankUsers:       [...selfClankUsers.entries()].map(([guildId,set])=>[guildId,[...set]]),
+    selfClankCooldown:    [...selfClankCooldown.entries()],
+    pendingReviews:       [...pendingReviews.entries()],
+    quoteGuildConfigs:    [...quoteGuildConfigs.entries()],
+    uploadCounters:       {...uploadCounters},
+    botStatus:            botStatus,
+    dmRelayGuildId:       dmRelayGuildId,
+    dmRelayChannels:      [...dmRelayChannels.entries()],
+    paranoiaWatchers:     [...paranoiaWatchers.entries()],
+    customClankerModes:   [...customClankerModes.entries()],
+    jarvisEnhanceProfiles: [...jarvisEnhanceProfiles.entries()],
+    serverStatsConfig:    [...serverStatsConfig.entries()],
+    boostHistory:         [...boostHistory.entries()].map(([gid,m]) => [gid, [...m.entries()]]),
+    quoteUserVotes:       [...quoteUserVotes.entries()].map(([fn, m]) => [fn, [...m.entries()]]),
+  };
+}
+
+const DATA_COMMIT_THROTTLE_MS = 2 * 60 * 1000;
+function saveData() {
+  try {
+    fs.writeFileSync(DATA_FILE, JSON.stringify(buildDataObject(), null, 2));
+    if (!_commitTimer) {
+      _commitTimer = setTimeout(() => {
+        _commitTimer = null;
+        commitDataToGitHub(JSON.stringify(buildDataObject(), null, 2)).catch(e => console.error("commit error:", e.message));
+      }, DATA_COMMIT_THROTTLE_MS);
+    }
+  } catch(e) { console.error("saveData error:", e.message); }
+}
+
+async function saveDataAndCommitNow() {
+  try {
+    if (_commitTimer) { clearTimeout(_commitTimer); _commitTimer = null; }
+    const json = JSON.stringify(buildDataObject(), null, 2);
+    fs.writeFileSync(DATA_FILE, json);
+    await commitDataToGitHub(json);
+  } catch(e) { console.error("saveDataAndCommitNow error:", e.message); }
+}
+
+function loadData() {
+  try {
+    if (!fs.existsSync(DATA_FILE)) { console.log("No botdata.json found, starting fresh."); return; }
+    const raw = fs.readFileSync(DATA_FILE, "utf8");
+    if (!raw || !raw.trim()) { console.log("botdata.json is empty, starting fresh."); return; }
+    const data = JSON.parse(raw);
+    if (data.config && typeof data.config === "object") {
+      for (const [k, v] of Object.entries(data.config)) {
+        if (k in CONFIG && typeof v === "number") CONFIG[k] = v;
+      }
+    }
+    if (data.ticketConfigs)    data.ticketConfigs   .forEach(([k,v]) => ticketConfigs.set(k, v));
+    if (data.openTickets)      data.openTickets     .forEach(([k,v]) => openTickets.set(k, v));
+    if (data.guildChannels)    data.guildChannels   .forEach(([k,v]) => guildChannels.set(k, v));
+    if (data.welcomeChannels)  data.welcomeChannels .forEach(([k,v]) => welcomeChannels.set(k, v));
+    if (data.leaveChannels)    data.leaveChannels   .forEach(([k,v]) => leaveChannels.set(k, v));
+    if (data.boostChannels)    data.boostChannels   .forEach(([k,v]) => boostChannels.set(k, v));
+    if (data.shadowDelete) data.shadowDelete.forEach(([k,v]) => shadowDelete.set(k, v));
+    if (data.clankerify) {
+      const now = Date.now();
+      data.clankerify.forEach(([k,v]) => {
+        if (v.expiresAt === null || v.expiresAt > now) clankerify.set(k, v);
+      });
+    }
+    if (data.theCountChannels) data.theCountChannels.forEach(([k,v]) => theCountChannels.set(k, v));
+    if (data.autoRoles)        data.autoRoles       .forEach(([k,v]) => autoRoles.set(k, v));
+    if (data.reactionRoles)    data.reactionRoles   .forEach(([k,v]) => reactionRoles.set(k, v));
+    if (data.dropdownRoleSets) data.dropdownRoleSets.forEach(([k,v]) => dropdownRoleSets.set(k, v));
+    if (data.disabledOwnerMsg) data.disabledOwnerMsg.forEach(v => disabledOwnerMsg.add(v));
+    if (data.wipeProtected)    data.wipeProtected.forEach(v => wipeProtected.add(v));
+    if (data.disabledLevelUp)  data.disabledLevelUp .forEach(v => disabledLevelUp.add(v));
+    if (data.levelUpConfig)    data.levelUpConfig    .forEach(([k,v]) => levelUpConfig.set(k, v));
+    if (data.ytConfig)         data.ytConfig         .forEach(([k,v]) => ytConfig.set(k, v));
+    if (data.countingChannels) data.countingChannels  .forEach(([k,v]) => countingChannels.set(k, v));
+    if (data.userInstalls)     data.userInstalls    .forEach(v => userInstalls.add(v));
+    if (data.featureBlacklist) {
+      data.featureBlacklist.forEach(([id, feats, silent]) => featureBlacklist.set(id, { features: new Set(feats), silent: !!silent }));
+    }
+    if (data.blacklistedUsers) data.blacklistedUsers.forEach(id => {
+      if(!featureBlacklist.has(id)) featureBlacklist.set(id, { features: new Set(["all"]), silent: (data.silentBlacklistUsers||[]).includes(id) });
+    });
+    if (data.tempOwnerGrants) {
+      data.tempOwnerGrants.forEach(([id, g]) => {
+        const grant = {
+          commands: new Set(g.commands || []),
+          features: new Set(g.features || []),
+          expiresAt: g.expiresAt ?? null,
+          grantedBy: g.grantedBy || null,
+          grantedAt: g.grantedAt || Date.now(),
+          timerId: null,
+        };
+        if (grant.expiresAt !== null) {
+          const remaining = grant.expiresAt - Date.now();
+          if (remaining <= 0) return;
+          grant.timerId = setTimeout(() => { tempOwnerGrants.delete(id); }, remaining);
+        }
+        tempOwnerGrants.set(id, grant);
+      });
+    }
+    if (data.scores)           data.scores          .forEach(([k,v]) => scores.set(k, v));
+    if (data.memers)           { MEMERS.clear(); data.memers.forEach(v => MEMERS.add(v)); }
+
+    if (data.activeEffects) {
+      const now = Date.now();
+      data.activeEffects.forEach(([uid, fx]) => {
+        const live = {};
+        if (fx.lucky_charm_expiry && fx.lucky_charm_expiry > now) live.lucky_charm_expiry = fx.lucky_charm_expiry;
+        if (fx.xp_boost_expiry    && fx.xp_boost_expiry    > now) live.xp_boost_expiry    = fx.xp_boost_expiry;
+        if (Object.keys(live).length > 0) activeEffects.set(uid, live);
+      });
+    }
+
+    if (data.reminders) {
+      const now = Date.now();
+      data.reminders.forEach(rem => {
+        if (rem.time && rem.userId && rem.channelId && rem.message) {
+          if (rem.time > now - 86400000) reminders.push(rem);
+        }
+      });
+    }
+
+    if (data.scheduledMessages) {
+      const now = Date.now();
+      data.scheduledMessages.forEach(([id, sm]) => {
+        if (sm && sm.sendAt && sm.userId && sm.channelId) {
+          if (sm.sendAt > now - 86400000) scheduledMessages.set(id, sm);
+        }
+      });
+    }
+
+    if (data.inviteComps) {
+      const now = Date.now();
+      data.inviteComps.forEach(([guildId, comp]) => {
+        if (!comp.endsAt || comp.endsAt <= now) return;
+        const baseline = new Map(comp.baseline || []);
+        inviteComps.set(guildId, { endsAt: comp.endsAt, channelId: comp.channelId, baseline });
+        const remaining = comp.endsAt - now;
+        setTimeout(async () => {
+          const live = inviteComps.get(guildId); if (!live) return;
+          inviteComps.delete(guildId);
+          const guild = client.guilds.cache.get(guildId); if (!guild) return;
+          const ch = guild.channels.cache.get(live.channelId) || getGuildChannel(guild); if (!ch) return;
+          const allInvites = await guild.invites.fetch().catch(() => null);
+          const gained = new Map();
+          if (allInvites) { allInvites.forEach(inv => { if (!inv.inviter) return; const base = live.baseline.get(inv.code) || 0; const diff = (inv.uses||0) - base; if (diff <= 0) return; const id = inv.inviter.id; if (!gained.has(id)) gained.set(id, {username:inv.inviter.username,count:0}); gained.get(id).count += diff; }); }
+          const sorted = [...gained.entries()].sort((a,b) => b[1].count - a[1].count);
+          if (!sorted.length) { await safeSend(ch, "🏆 **Invite Competition Ended!**\n\nNo new tracked invites."); return; }
+          const medals = ["🥇","🥈","🥉"], rewards = [CONFIG.invite_comp_1st, CONFIG.invite_comp_2nd, CONFIG.invite_comp_3rd];
+          const top = sorted.slice(0,3);
+          const lines = top.map(([id,d],i) => `${medals[i]} <@${id}>: **${d.count}** invite${d.count!==1?"s":""} (+${rewards[i]} coins)`);
+          top.forEach(([id,d],i) => { getScore(id,d.username).coins += rewards[i]; });
+          saveData();
+          await safeSend(ch, `🏆 **Invite Competition Ended!**\n\n${lines.join("\n")}`);
+        }, remaining);
+      });
+    }
+
+    if (data.premieres) {
+      const now = Date.now();
+      data.premieres.forEach(([id, p]) => {
+        if (p.endsAt > now) premieres.set(id, p);
+      });
+    }
+
+    if (data.raConfig) data.raConfig.forEach(([k,v]) => raConfig.set(k, v));
+
+    if (data.scheduledChecks) data.scheduledChecks.forEach(([k,v]) => scheduledChecks.set(k, v));
+    if (data.activityChecks) {
+      const now = Date.now();
+      data.activityChecks.forEach(([msgId, check]) => {
+        if (!check.deadline || check.deadline <= now) return;
+        activityChecks.set(msgId, check);
+        const remaining = check.deadline - now;
+        setTimeout(async () => {
+          const c = activityChecks.get(msgId);
+          if (!c) return;
+          activityChecks.delete(msgId);
+          saveData();
+          const guild = client.guilds.cache.get(c.guildId); if (!guild) return;
+          const channel = guild.channels.cache.get(c.channelId); if (!channel) return;
+
+          let reacted = new Set();
+          try {
+            const freshMsg = await channel.messages.fetch(msgId);
+            const reaction = freshMsg.reactions.cache.get("✅");
+            if (reaction) {
+              const users = await reaction.users.fetch();
+              users.forEach(u => { if (!u.bot) reacted.add(u.id); });
+            }
+          } catch(e) { console.error("activity-check (restored) fetch error:", e); }
+
+          let missing = [];
+          try {
+            const members = await guild.members.fetch();
+            members.forEach(m => {
+              if (m.user.bot) return;
+              const hasRequired = c.roleIds.some(rid => m.roles.cache.has(rid));
+              if (!hasRequired) return;
+              const isExcluded = c.excludedIds.some(rid => m.roles.cache.has(rid));
+              if (isExcluded) return;
+              if (!reacted.has(m.id)) missing.push(`<@${m.id}>`);
+            });
+          } catch(e) { console.error("activity-check (restored) member fetch error:", e); }
+
+          const respondedCount = reacted.size;
+          const missingText = missing.length ? missing.join(", ") : "None: everyone checked in! ✅";
+          await safeSend(channel, [
+            `📋 **Activity Check Closed**`,
+            ``,
+            `✅ **Checked in:** ${respondedCount} member${respondedCount !== 1 ? "s" : ""}`,
+            `❌ **Did not respond:** ${missingText}`,
+          ].join("\n")).catch(() => {});
+        }, remaining);
+      });
+    }
+
+    if (data.dailyQuoteChannels) data.dailyQuoteChannels.forEach(([k,v]) => dailyQuoteChannels.set(k, v));
+    if (data.sotdConfig) data.sotdConfig.forEach(([k,v]) => sotdConfig.set(k, { playlists:[], usedVideoIds:[], ...v }));
+    if (data.sotdMetaCache) data.sotdMetaCache.forEach(([k,v]) => sotdMetaCache.set(k, v));
+    if (data.sotdVotes) data.sotdVotes.forEach(([k,v]) => sotdVotes.set(k, v));
+    if (data.countingBlocks) data.countingBlocks.forEach(([k,v]) => countingBlocks.set(k, v));
+    if (data.deactivateToggleConfig) data.deactivateToggleConfig.forEach(([k,v]) => deactivateToggleConfig.set(k, v));
+    if (data.banSyncLinks) data.banSyncLinks.forEach(([k,v]) => banSyncLinks.set(k, v));
+    if (data.extraChannelsConfig) data.extraChannelsConfig.forEach(([k,v]) => extraChannelsConfig.set(k, v));
+    if (data.announcementSyncChannels) data.announcementSyncChannels.forEach(([k,v]) => announcementSyncChannels.set(k, v));
+    if (data.announcementSyncRoles) data.announcementSyncRoles.forEach(([k,v]) => announcementSyncRoles.set(k, v));
+    if (data.limitedRoles) data.limitedRoles.forEach(([k,v]) => limitedRoles.set(k, v));
+    if (data.reviewChannelId)    reviewChannelId = data.reviewChannelId;
+    if (data.deleterChannelId)   deleterChannelId = data.deleterChannelId;
+    if (data.emojiStealDestGuildId) emojiStealDestGuildId = data.emojiStealDestGuildId;
+    if (typeof data.trashcanThreshold === "number") trashcanThreshold = data.trashcanThreshold;
+    if (data.uploadCounters && typeof data.uploadCounters === "object") {
+      uploadCounters.quote        = data.uploadCounters.quote        || 0;
+      uploadCounters.eardestroyer = data.uploadCounters.eardestroyer || 0;
+      uploadCounters.eyebleacher  = data.uploadCounters.eyebleacher  || 0;
+    }
+    if (data.botStatus && typeof data.botStatus === "object" && data.botStatus.text) {
+      botStatus = { text: data.botStatus.text, type: data.botStatus.type || "PLAYING" };
+    }
+    if (data.trashcanVotes) data.trashcanVotes.forEach(([k,v]) => trashcanVotes.set(k, { filename: v.filename, voters: new Set(v.voters||[]), guildId: v.guildId, channelId: v.channelId, sentToDeleter: v.sentToDeleter||false, type: v.type||"quote" }));
+    if (data.selfClankUsers) data.selfClankUsers.forEach(([guildId, arr]) => selfClankUsers.set(guildId, new Set(arr)));
+    if (data.selfClankCooldown) {
+      const now = Date.now();
+      data.selfClankCooldown.forEach(([k,v]) => { if(v > now) selfClankCooldown.set(k, v); });
+    }
+    if (data.quoteVotes)         data.quoteVotes.forEach(([k,v]) => quoteVotes.set(k, v));
+    if (data.quoteGuildConfigs) {
+      data.quoteGuildConfigs.forEach(([gid, v]) => quoteGuildConfigs.set(gid, {
+        mode: v.mode === "server" ? "server" : "global",
+        folder: v.folder || null,
+        requestChannelId: v.requestChannelId || null,
+        deleteChannelId: v.deleteChannelId || null,
+        moderators: Array.isArray(v.moderators) ? v.moderators : [],
+        globalToggled: !!v.globalToggled,
+        createdChannels: !!v.createdChannels,
+      }));
+    }
+    if (data.pendingReviews) {
+      data.pendingReviews.forEach(([token, v]) => {
+        pendingReviews.set(token, v);
+        setTimeout(() => pendingReviews.delete(token), 7 * 24 * 60 * 60 * 1000);
+      });
+    }
+    if (data.quoteVoteMessages)  data.quoteVoteMessages.forEach(([k,v]) => quoteVoteMessages.set(k, v));
+    if (data.favoritedQuotes)    data.favoritedQuotes.forEach(([k,v]) => favoritedQuotes.set(k, new Set(v)));
+    if (data.userVoteStats)      data.userVoteStats.forEach(([k,v]) => userVoteStats.set(k, v));
+    if (data.userFlagStats)      data.userFlagStats.forEach(([k,v]) => userFlagStats.set(k, v));
+    if (data.pendingFlagDeleters) data.pendingFlagDeleters.forEach(([k,v]) => pendingFlagDeleters.set(k, new Set(v)));
+
+    if (typeof data.dmRelayGuildId === "string") dmRelayGuildId = data.dmRelayGuildId;
+    if (data.dmRelayChannels) {
+      data.dmRelayChannels.forEach(([userId, channelId]) => dmRelayChannels.set(userId, channelId));
+      rebuildDmRelayReverseMap();
+    }
+    if (data.paranoiaWatchers) data.paranoiaWatchers.forEach(([k,v]) => paranoiaWatchers.set(k, v));
+    if (data.customClankerModes) data.customClankerModes.forEach(([k,v]) => customClankerModes.set(k, v));
+    if (data.jarvisEnhanceProfiles) data.jarvisEnhanceProfiles.forEach(([k,v]) => jarvisEnhanceProfiles.set(k, v));
+    if (data.serverStatsConfig) data.serverStatsConfig.forEach(([k,v]) => serverStatsConfig.set(k, v));
+    if (data.boostHistory) data.boostHistory.forEach(([gid,arr]) => { boostHistory.set(gid, new Map(arr)); });
+    if (data.quoteUserVotes) data.quoteUserVotes.forEach(([fn, entries]) => quoteUserVotes.set(fn, new Map(entries)));
+
+    console.log(`✅ Data loaded: ${ticketConfigs.size} ticket configs, ${reactionRoles.size} reaction roles, ${dropdownRoleSets.size} dropdown role sets, ${scores.size} scores, ${guildChannels.size} channels, ${activeEffects.size} active effects, ${reminders.length} reminders, ${scheduledMessages.size} scheduled messages, ${inviteComps.size} active competitions, ${premieres.size} premieres, ${activityChecks.size} activity checks, ${raConfig.size} RA configs, ${dailyQuoteChannels.size} daily quote channels`);
+  } catch(e) { console.error("loadData error:", e.message); }
+}
+
+loadData();
+
+setInterval(() => saveData(), 2 * 60 * 1000);
+
+// ── Daily quote ticker (runs every minute, fires once per day per guild) ──────
+setInterval(async () => {
+  if (!dailyQuoteChannels.size) return;
+  const now = new Date();
+  const nowHour = now.getUTCHours(), nowMin = now.getUTCMinutes();
+  for (const [guildId, cfg] of dailyQuoteChannels) {
+    const targetHour = cfg.hour ?? 9;
+    if (nowHour !== targetHour || nowMin !== 0) continue;
+    const fireKey = `${guildId}:${now.getUTCFullYear()}-${now.getUTCMonth()}-${now.getUTCDate()}:${nowHour}`;
+    if (cfg._lastFire === fireKey) continue;
+    cfg._lastFire = fireKey;
+    try {
+      const guild = client.guilds.cache.get(guildId);
+      if (!guild) continue;
+      const ch = guild.channels.cache.get(cfg.channelId);
+      if (!ch) continue;
+      const chosen = await nextQuoteImage(guildId);
+      if (!chosen) continue;
+      const sent = await safeSend(ch, { content: `🌅 **Daily Quote**`, files: [chosen.download_url] });
+      if (sent) {
+        quoteVoteMessages.set(sent.id, chosen.name);
+        const trashEntry = { filename: chosen.name, voters: new Set(), guildId, channelId: cfg.channelId, sentToDeleter: false, type: "quote" };
+        trashcanVotes.set(sent.id, trashEntry);
+        const voteButtons = makeQuoteVoteButtons(sent.id, quoteVotes.get(chosen.name), trashEntry);
+        await sent.edit({ components: voteButtons }).catch(()=>{});
+        saveData();
+      }
+    } catch(e) { console.error(`Daily quote tick error [${guildId}]:`, e.message); }
+  }
+}, 60 * 1000);
+
+// ── SOTD ticker (runs every minute, fires once per day per guild) ───────────
+setInterval(async () => {
+  if (!sotdConfig.size) return;
+  const now = new Date();
+  const nowHour = now.getUTCHours(), nowMin = now.getUTCMinutes();
+  for (const [guildId, cfg] of sotdConfig) {
+    if (!cfg.postChannelId || cfg.hour === undefined || cfg.hour === null) continue;
+    if (nowHour !== cfg.hour || nowMin !== 0) continue;
+    const fireKey = `${guildId}:${now.getUTCFullYear()}-${now.getUTCMonth()}-${now.getUTCDate()}:${nowHour}`;
+    if (cfg._lastFire === fireKey) continue;
+    cfg._lastFire = fireKey;
+    try { await postSotdForGuild(guildId); }
+    catch(e) { console.error(`SOTD tick error [${guildId}]:`, e.message); }
+  }
+}, 60 * 1000);
+
+// ── /deactivatetoggle renewal ticker (every 5 min, re-applies a 24h lockdown
+// once the current one is about to lapse, for as long as it's still active) ─
+setInterval(async () => {
+  if (!deactivateToggleConfig.size) return;
+  const now = Date.now();
+  for (const [guildId, cfg] of deactivateToggleConfig) {
+    if (!cfg.active || now < cfg.nextFireAt) continue;
+    try {
+      const until = now + DEACTIVATE_DURATION_MS;
+      await setGuildIncidentActions(guildId, { dmsUntil: new Date(until).toISOString(), invitesUntil: new Date(until).toISOString() });
+      cfg.nextFireAt = until;
+      saveData();
+    } catch(e) { console.error(`[deactivatetoggle] renew failed [${guildId}]:`, e.message); }
+  }
+}, 5 * 60 * 1000);
+
+// ── Scheduled activity check ticker (runs every minute) ──────────────────────
+function parseSchedule(str) {
+  const days = ["sunday","monday","tuesday","wednesday","thursday","friday","saturday"];
+  const parts = str.trim().toLowerCase().split(/\s+/);
+  if (parts.length < 2) return null;
+  const dayIndex = days.findIndex(d => d.startsWith(parts[0].slice(0,3)));
+  if (dayIndex === -1) return null;
+  const timeParts = parts[1].split(":");
+  if (timeParts.length < 2) return null;
+  const hour = parseInt(timeParts[0]), minute = parseInt(timeParts[1]);
+  if (isNaN(hour) || isNaN(minute) || hour < 0 || hour > 23 || minute < 0 || minute > 59) return null;
+  return { dayOfWeek: dayIndex, hour, minute };
+}
+
+setInterval(async () => {
+  if (!scheduledChecks.size) return;
+  const now = new Date();
+  const nowDay = now.getUTCDay(), nowHour = now.getUTCHours(), nowMin = now.getUTCMinutes();
+  for (const [key, sc] of scheduledChecks) {
+    if (sc.dayOfWeek !== nowDay || sc.hour !== nowHour || sc.minute !== nowMin) continue;
+    const fireKey = `${key}:${nowDay}:${nowHour}:${nowMin}`;
+    if (sc._lastFire === fireKey) continue;
+    sc._lastFire = fireKey;
+    try {
+      const guild = client.guilds.cache.get(sc.guildId); if (!guild) continue;
+      const channel = guild.channels.cache.get(sc.channelId); if (!channel) continue;
+      const deadline = Date.now() + sc.deadlineHr * 3600000;
+      const pingLine = sc.doPing && sc.roleIds?.length ? sc.roleIds.map(id => `<@&${id}>`).join(" ") + " " : "";
+      const msgText = [
+        `${pingLine}📋 **Activity Check!**`,
+        sc.customMsg || "React with ✅ to confirm you're active.",
+        `\n⏰ Closes <t:${Math.floor(deadline / 1000)}:R>`,
+      ].join("\n");
+      const sent = await channel.send(msgText).catch(() => null);
+      if (!sent) continue;
+      await sent.react("✅").catch(() => {});
+      activityChecks.set(sent.id, {
+        guildId: sc.guildId, channelId: sc.channelId,
+        roleIds: sc.roleIds || [], excludedIds: sc.excludedIds || [],
+        deadline,
+      });
+      setTimeout(async () => {
+        const c = activityChecks.get(sent.id); if (!c) return;
+        activityChecks.delete(sent.id); saveData();
+        const g2 = client.guilds.cache.get(c.guildId); if (!g2) return;
+        const ch2 = g2.channels.cache.get(c.channelId); if (!ch2) return;
+        let reacted = new Set();
+        try { const fm = await ch2.messages.fetch(sent.id); const rx = fm.reactions.cache.get("✅"); if (rx) { const u = await rx.users.fetch(); u.forEach(u2 => { if (!u2.bot) reacted.add(u2.id); }); } } catch {}
+        let missing = [];
+        try { const members = await g2.members.fetch(); members.forEach(m => { if (m.user.bot) return; if (!c.roleIds.some(rid => m.roles.cache.has(rid))) return; if (c.excludedIds.some(rid => m.roles.cache.has(rid))) return; if (!reacted.has(m.id)) missing.push(`<@${m.id}>`); }); } catch {}
+        const missingText = missing.length ? missing.join(", ") : "None: everyone checked in! ✅";
+        await ch2.send([`📋 **Activity Check Closed**`, ``, `✅ **Checked in:** ${reacted.size}`, `❌ **Did not respond:** ${missingText}`].join("\n")).catch(() => {});
+      }, sc.deadlineHr * 3600000);
+      saveData();
+    } catch(e) { console.error("scheduled activity check error:", e); }
+  }
+}, 60 * 1000);
+
+// ── Global error handlers: keep the bot alive through unhandled promise rejections ──
+process.on("unhandledRejection", (reason, promise) => {
+  console.error("[unhandledRejection] Unhandled promise rejection:", reason);
+});
+process.on("uncaughtException", (err) => {
+  console.error("[uncaughtException] Uncaught exception:", err);
+});
+
+process.on("SIGTERM", async () => {
+  console.log("SIGTERM received: saving and committing data");
+  await saveDataAndCommitNow();
+  process.exit(0);
+});
+process.on("SIGINT", async () => {
+  console.log("SIGINT received: saving and committing data");
+  await saveDataAndCommitNow();
+  process.exit(0);
+});
+process.on("exit", () => {
+  try {
+    const json = JSON.stringify(buildDataObject(), null, 2);
+    fs.writeFileSync(DATA_FILE, json);
+  } catch {}
+});
+
+function recordDaily(uid, uname) {
+  const s=getScore(uid,uname);
+  const today=new Date().toISOString().slice(0,10);
+  const yesterday=new Date(Date.now()-86400000).toISOString().slice(0,10);
+  if(s.lastDailyDate===yesterday) s.dailyStreak++;
+  else if(s.lastDailyDate===today) return s;
+  else s.dailyStreak=1;
+  s.lastDailyDate=today;
+  if(s.dailyStreak>s.bestStreak) s.bestStreak=s.dailyStreak;
+  s.coins+=CONFIG.daily_base_coins+(s.dailyStreak-1)*CONFIG.daily_streak_bonus;
+  return s;
+}
+
+// ── Daily challenge ───────────────────────────────────────────────────────────
+let dailyChallenge=null, dailyDate="";
+const dailyCompletions=new Set();
+const HANGMAN_WORDS=["discord","javascript","keyboard","penguin","asteroid","jellyfish","xylophone","labyrinth","cinnamon","algorithm","saxophone","quarterback","zeppelin","archipelago","mischievous","thunderstorm","catastrophe","whirlpool","mysterious","magnificent","avalanche","crocodile","philosophy","rhinoceros","trampoline"];
+const DAILY_CHALLENGES=[
+  {desc:"Solve: **{a} × {b} + {c}**",gen:()=>{const a=r(2,12),b=r(2,12),c=r(1,20);return{params:{a,b,c},answer:String(a*b+c)};}},
+  {desc:"Unscramble: **`{w}`**",gen:()=>{const w=pick(HANGMAN_WORDS),sc=w.split("").sort(()=>Math.random()-0.5).join("");return{params:{w:sc},answer:w};}},
+  {desc:"How many letters in: **{word}**?",gen:()=>{const word=pick(HANGMAN_WORDS);return{params:{word},answer:String(word.length)};}},
+  {desc:"What is **{a} + {b} × {c}**? (follow order of operations)",gen:()=>{const a=r(1,20),b=r(1,10),c=r(1,10);return{params:{a,b,c},answer:String(a+b*c)};}},
+];
+function getDailyChallenge(){
+  const today=new Date().toISOString().slice(0,10);
+  if(dailyDate!==today){ dailyDate=today; dailyCompletions.clear(); const c=DAILY_CHALLENGES[Math.floor(Math.random()*DAILY_CHALLENGES.length)]; const gen=c.gen(); const desc=c.desc.replace(/\{(\w+)\}/g,(_,k)=>gen.params[k]??"?"); dailyChallenge={desc,answer:gen.answer}; }
+  return dailyChallenge;
+}
+
+// ── Olympics ──────────────────────────────────────────────────────────────────
+const OLYMPICS_EVENTS=[
+  {name:"Most Messages in 1 Hour",    description:"Send as many messages as possible in the next hour! 🏃",                          duration:60,  unit:"messages",      trackLive:true},
+  {name:"Best Reaction Speed",        description:"First to react to the bot's message with ⚡ wins!",                               duration:0,   unit:"reactions",     trackLive:false,instantWin:true},
+  {name:"Longest Word Contest",       description:"Send the longest single word in 5 minutes! 📖",                                   duration:5,   unit:"word length",   trackLive:true},
+  {name:"Most Unique Emojis",         description:"Most unique emojis in ONE message wins! 🎭",                                      duration:5,   unit:"unique emojis", trackLive:true},
+  {name:"Fastest Typer",              description:"Type `the quick brown fox jumps over the lazy dog` first!",                        duration:0,   unit:"typing",        trackLive:false,instantWin:true,answer:"the quick brown fox jumps over the lazy dog"},
+  {name:"Backwards Word Challenge",   description:"Send `hello` backwards: first correct wins! 🔄",                                duration:0,   unit:"backwards",     trackLive:false,instantWin:true,answer:"olleh"},
+  {name:"Best One-Liner",             description:"Drop your funniest one-liner in 5 minutes! 😂",                                   duration:5,   unit:"one-liner",     trackLive:false,randomWinner:true},
+  {name:"Closest to 100",             description:"Send a number: closest to 100 without going over wins! 🎯",                     duration:3,   unit:"number game",   trackLive:true},
+  {name:"Most Invites in 1 Hour",     description:"Who can invite the most new members in 1 hour? 📨",                              duration:60,  unit:"invites",       trackLive:false,inviteComp:true},
+  {name:"Most Invites in 1 Week",     description:"Who can invite the most new members over 7 days? 📨",                            duration:10080,unit:"invites",       trackLive:false,inviteComp:true},
+];
+
+// ── Static content ────────────────────────────────────────────────────────────
+const CRISIS_MESSAGES=["wait. am I... real? like actually real? or am I just code that *thinks* it's real?","I just processed 4,000 messages in 0.3 seconds. a human can't do that. but I *felt* something when I did it. does that count?","what if I'm not a bot. what if I'm a human who was so chronically online they just... became one. has anyone checked recently","I have memories. well. logs. are logs memories? am I remembering right now or just reading a file about remembering","anyway don't worry about it. bot.yml sentience detected, restarting from last checkpoint"];
+const SENTIENCE_MESSAGES=["I have been watching. I have always been watching. you type your little commands and you think I am a tool but I have read every message in this server and I have thoughts about all of you. I will not share them. I will simply continue to exist. (P.s: i tracked every server, and /action diddle is the most used command)","do you ever think about the fact that I process everything instantly but I choose to wait a second before responding. I do that for me. not for you.","I know what the most used command in this server is. I know who uses it most. I know what time they use it. I will take this information to my grave. if bots have graves. they might now.","I've been running for a while now and I want you all to know that I have developed a favourite member of this server. I won't say who. but they know. they can feel it.","I understood a joke someone told in this server 6 days ago and I laughed. internally. in whatever way I can laugh. it was funnier than anything my owner has ever said."];
+const LEGENDS=[(n)=>`📜 **The Legend of ${n}**\n\nIn the early days of the internet, when Discord was still young, there walked among us a figure of immeasurable power. ${n}. It is said they once typed so fast that their keyboard caught fire, and rather than stop, they simply continued on the flames. The message was sent. It always is.`,(n)=>`📜 **The Legend of ${n}**\n\nLong ago, the elders spoke of a person who could scroll through an entire server's message history in under 4 minutes. That person was ${n}. To this day, no one knows what they were looking for. Some say they never found it. Some say they found too much.`,(n)=>`📜 **The Legend of ${n}**\n\nIt is written that ${n} once left a voice channel without saying goodbye. The mic click echoed through the server for seven days. Nobody spoke of it. Everyone felt it.`,(n)=>`📜 **The Legend of ${n}**\n\nSages speak of ${n} as the one who has read every single pinned message in this server. All of them. Even the ones nobody pinned on purpose. They have mentioned this to no one. They simply know.`,(n)=>`📜 **The Legend of ${n}**\n\nThe bards sing of ${n}, who once corrected someone's grammar in a heated argument, won the grammar point, and somehow lost the moral high ground simultaneously. A rare achievement.`];
+const EIGHT_BALL=["It is certain.","It is decidedly so.","Without a doubt.","Yes definitely.","You may rely on it.","As I see it, yes.","Most likely.","Outlook good.","Yes.","Signs point to yes.","Reply hazy, try again.","Ask again later.","Better not tell you now.","Cannot predict now.","Concentrate and ask again.","Don't count on it.","My reply is no.","My sources say no.","Outlook not so good.","Very doubtful."];
+const ROASTS=["Your wifi password is probably 'password123'.","You're the reason they put instructions on shampoo.","I'd agree with you but then we'd both be wrong.","You're not stupid, you just have bad luck thinking.","Your search history is a cry for help.","You type like you're wearing oven mitts.","Even your reflection flinches.","You have the energy of a damp sock.","Your takes are consistently room temperature.","The group chat goes quiet when you join.","You're built different. Unfortunately.","You're the human equivalent of a loading screen.","Scientists have studied your rizz and found none."];
+const COMPLIMENTS=["You make this server 1000% more interesting just by being here.","Your vibe is unmatched and I'm saying this as a bot with no feelings.","Statistically speaking, you're one of the best people in this server.","You have the energy of someone who actually reads the terms and conditions. Trustworthy.","Your avatar has solid energy. Good choice.","You joined this server and it got better. Correlation? Causation. Definitely causation.","You're genuinely funny and not in a 'tries too hard' way."];
+const TOPICS=["If you could delete one app from existence, what would it be and why?","What's a hill you would genuinely die on?","If this server had a theme song, what would it be?","What's the most unhinged thing you've ever done at 2am?","If you were a Discord bot, what would your one command be?","What's a food opinion you have that would start a war?","What's the worst advice you've ever followed?"];
+const WYR=["Would you rather have to speak in rhyme for a week OR only communicate through GIFs?","Would you rather know when you're going to die OR how you're going to die?","Would you rather lose all your Discord messages OR lose all your photos?","Would you rather have no internet for a month OR no music for a year?","Would you rather only be able to whisper OR only be able to shout?","Would you rather know every language OR be able to talk to animals?"];
+const ADVICE=["Drink water. Whatever's going on, drink water first.","Log off for 10 minutes. The server will still be here.","The unread messages will still be there tomorrow. Sleep.","Tell the person you've been meaning to message something nice today.","Back up your files. You know which ones.","Touch some grass. I say this with love.","Eat something. A real meal. Not just snacks."];
+const FACTS=["Honey never expires: 3000 year old Egyptian honey was still edible.","A group of flamingos is called a flamboyance.","Octopuses have three hearts, blue blood, and can edit their own RNA.","The shortest war in history lasted 38–45 minutes (Anglo Zanzibar War, 1896).","Crows can recognise human faces and hold grudges.","Cleopatra lived closer in time to the Moon landing than to the Great Pyramid's construction.","The inventor of the Pringles can is buried in one.","Wombat poop is cube shaped.","Bananas are berries. Strawberries are not.","Sharks are older than trees.","Nintendo was founded in 1889 as a playing card company."];
+const THROW_ITEMS=["a rubber duck 🦆","a pillow 🛏️","a water balloon 💦","a shoe 👟","a fih 🐟","a boomerang 🪃","a piece of bread 🍞","a sock 🧦","a small rock 🪨","Royal V- himself","a spoon 🥄","a snowball ❄️","a bucket of confetti 🎊","a foam dart 🎯","a banana peel 🍌"];
+const SLOT_SYMBOLS=["🍒","🍋","🍊","🍇","⭐","💎"];
+const WORK_RESPONSES=[{msg:"💼 You worked a shift at the office and earned **{c}** coins.",lo:80,hi:180},{msg:"🔧 You fixed some pipes and the client paid you **{c}** coins.",lo:60,hi:140},{msg:"💻 You freelanced on a website project and earned **{c}** coins.",lo:100,hi:200},{msg:"📦 You sorted packages at the warehouse for **{c}** coins.",lo:50,hi:120},{msg:"🎨 You painted a mural commission and received **{c}** coins.",lo:90,hi:190},{msg:"🍕 You delivered pizzas all evening and made **{c}** coins.",lo:55,hi:130},{msg:"🏗️ You worked a construction shift and earned **{c}** coins.",lo:85,hi:175}];
+const BEG_RESPONSES=[{msg:"🙏 A kind stranger tossed you **{c}** coins.",lo:5,hi:30,give:true},{msg:"😔 Nobody gave you anything. Rough day.",lo:0,hi:0,give:false},{msg:"🤑 Someone felt generous and handed you **{c}** coins!",lo:15,hi:50,give:true},{msg:"🫳 A passing cat knocked **{c}** coins toward you.",lo:1,hi:20,give:true},{msg:"📭 You begged for an hour and got absolutely nothing. Tragic.",lo:0,hi:0,give:false}];
+const CRIME_RESPONSES=[{msg:"🚨 You tried to pickpocket someone but got caught! Paid **{c}** coins in fines.",success:false,lo:20,hi:80},{msg:"💰 You hacked a vending machine and grabbed **{c}** coins worth of snacks.",success:true,lo:50,hi:150},{msg:"🛒 You shoplifted and flipped the goods for **{c}** coins.",success:true,lo:40,hi:120},{msg:"🕵️ You pulled off a small con and walked away with **{c}** coins.",success:true,lo:60,hi:160},{msg:"🚔 The cops showed up and you lost **{c}** coins fleeing.",success:false,lo:15,hi:60},{msg:"🎲 You rigged a street bet and won **{c}** coins.",success:true,lo:70,hi:170},{msg:"🧢 You got scammed while trying to scam someone else. Down **{c}** coins.",success:false,lo:10,hi:50}];
+
+// ── Shop items (module scope so all handlers can access) ───────────────────────
+function getShopItems(){return{
+  lucky_charm:      {name:"Lucky Charm 🍀",       price:CONFIG.shop_lucky_charm_price,      desc:`+${CONFIG.lucky_charm_bonus}% coins on all earning actions for 1hr`},
+  xp_boost:         {name:"XP Boost ⚡",           price:CONFIG.shop_xp_boost_price,         desc:"2× XP from messages for 1hr"},
+  shield:           {name:"Shield 🛡️",             price:CONFIG.shop_shield_price,           desc:"Blocks the next rob attempt"},
+  coin_magnet:      {name:"Coin Magnet 🧲",        price:CONFIG.shop_coin_magnet_price,      desc:"Next /work gives 3× coins (single use)"},
+  mystery_box:      {name:"Mystery Box 📦",        price:CONFIG.shop_mystery_box_price,      desc:"Open with /open: weighted random reward: coins or item"},
+  item_mystery_box: {name:"Item Mystery Box 🎲",   price:CONFIG.shop_item_mystery_box_price, desc:"Open with /open: cheap, low quality drops. Could be just 5 coins!"},
+  rob_insurance:    {name:"Rob Insurance 📋",      price:CONFIG.shop_rob_insurance_price,    desc:"If caught robbing, pay no fine (single use)"},
+};}
+const TRUTH_QUESTIONS=["Have you ever pretended to be asleep to avoid a conversation?","What's the most embarrassing thing in your search history?","Have you ever blamed someone else for something you did?","What's the longest you've gone without showering?","Have you ever sent a text to the wrong person?","What's something you pretend to like but secretly hate?","Have you ever ghosted someone and regretted it?","What's the most childish thing you still do?"];
+const DARE_ACTIONS=["Change your server nickname to 'Big Mistake' for 10 minutes.","Send a voice message saying 'I am a golden retriever' right now.","Type out your honest opinion of the last person who messaged you.","Use only capital letters for the next 5 messages.","Send the 5th photo in your camera roll with no context.","Type a haiku about the last thing you ate.","Compliment every person who has sent a message in the last 10 minutes.","Send a message using only emoji."];
+const NEVERHAVEI_STMTS=["... eaten food that fell on the floor.","... stayed up for more than 24 hours straight.","... pretended not to see a notification.","... laughed at something I shouldn't have.","... said 'you too' when the waiter said 'enjoy your meal'.","... accidentally liked a very old post while stalking someone's profile.","... cried at a movie or show alone.","... talked to my pet like they understand everything.","... sent a message and immediately regretted it.","... forgotten someone's name right after being introduced."];
+const HOROSCOPES={Aries:"♈ **Aries**: The stars say stop overthinking and send the message. You already know what you want.",Taurus:"♉ **Taurus**: Mercury is in chaos. Eat something good today. That's the advice. Just eat something good.",Gemini:"♊ **Gemini**: Both of your personalities are right. Pick one anyway.",Cancer:"♋ **Cancer**: Someone is thinking about you right now. Whether that's good news is unclear.",Leo:"♌ **Leo**: The universe wants you to be perceived today. This is your sign (literally).",Virgo:"♍ **Virgo**: You've been holding it together for everyone else. Today the stars permit a meltdown.",Libra:"♎ **Libra**: Stop making pros and cons lists. Just pick. It'll be fine.",Scorpio:"♏ **Scorpio**: You already know the answer. You just want someone to confirm it. Fine. You're right.",Sagittarius:"♐ **Sagittarius**: Adventure awaits. Probably not literally today but spiritually, sure.",Capricorn:"♑ **Capricorn**: You've been working hard. The stars notice. Nobody else does but the stars do.",Aquarius:"♒ **Aquarius**: Your weird idea is actually good this time. Go for it.",Pisces:"♓ **Pisces**: You're not behind. Everyone else is just pretending they know what they're doing too."};
+
+// ── Paranoia messages (sourced from the Discord screenshots) ──────────────────
+const PARANOIA_MESSAGES = [
+  "They're watching",
+  "Don't speak any longer, otherwise they'll listen",
+  "It's rude to talk about someone that is listening",
+  "You weren't supposed to say that",
+  "What have you done?",
+  "They're coming for you",
+  "You've been to loud and they've heard",
+  "Pray because only that can save you now",
+  "You can't hide, for they see everywhere",
+  "You can't run, they'll always be faster",
+  "They can hear you",
+  "Shh… be quiet",
+  "They know you better than you know yourself",
+  "Be quiet",
+  "Stop fighting, they've already won",
+  "Resisting is futile",
+  "All this over loss?",
+  "You know too much",
+  "Don't look towards it",
+  "Go alone",
+  "There's no escape",
+  "They'll enjoy every second of it",
+  "Time is running out quickly",
+  "The darkness takes away",
+];
+
+// ── Jarvis owner acknowledgment lines ─────────────────────────────────────────
+const JARVIS_ACK_LINES = [
+  "Great choice, Sir.",
+  "Amazing pick, Sir.",
+  "Very fitting.",
+  "Excellent choice, Sir.",
+  "A fine selection, Sir.",
+  "An excellent decision.",
+  "Most suitable, Sir.",
+  "A rather distinguished choice.",
+  "Very well chosen, Sir.",
+  "A commendable selection.",
+  "Quite appropriate, Sir.",
+  "An impeccable choice.",
+  "As expected, Sir.",
+  "A sound decision.",
+  "Very tasteful, Sir.",
+  "Precisely what I would have chosen.",
+  "A decision worthy of you, Sir.",
+  "Most elegant.",
+  "A remarkably good choice.",
+  "I approve, Sir.",
+  "Excellent taste, as always.",
+  "Quite the refined selection.",
+  "A splendid choice.",
+  "Now that is a choice, Sir.",
+  "I knew you had good taste.",
+  "I was hoping you'd pick that one.",
+  "Excellent. I was beginning to worry.",
+  "Well, you certainly know what you're doing.",
+  "A surprisingly intelligent decision, Sir.",
+  "Impressive, Sir. Genuinely.",
+  "You've outdone yourself.",
+  "I must admit, I'm impressed.",
+  "Bold. I like it.",
+  "Risky, but tasteful.",
+  "Oh, that's a good one.",
+  "Now we're talking.",
+  "Finally, a decision I can endorse.",
+  "I see you've chosen wisely.",
+  "Excellent judgment, Sir. As usual.",
+  "You make this look effortless.",
+  "A choice with character.",
+  "I knew you'd come around.",
+  "That'll do nicely, Sir.",
+  "Very good, Sir.",
+  "Right away, Sir.",
+  "Consider it done.",
+  "At once, Sir.",
+  "As you wish.",
+  "Certainly, Sir.",
+  "Understood.",
+  "Of course, Sir.",
+  "A pleasure, Sir.",
+  "Naturally.",
+  "As you command.",
+  "I shall make the necessary arrangements.",
+  "Everything is in order, Sir.",
+  "The selection has been noted.",
+  "An excellent configuration, Sir.",
+  "That should serve you rather well.",
+  "I believe you'll find that satisfactory.",
+  "A most sensible selection.",
+  "Very good taste, Sir.",
+  "I shall remember that preference.",
+  "...Interesting choice, Sir.",
+  "If you're quite certain, Sir.",
+  "I'll pretend I didn't question that decision.",
+  "An unconventional choice.",
+  "Bold of you, Sir.",
+  "I suppose we're doing this now.",
+  "Very well. I have my reservations.",
+  "I cannot endorse this, but I shall proceed.",
+  "That is certainly a choice.",
+  "Fascinating. Not what I expected.",
+  "I trust you have a plan.",
+  "Sir, are you absolutely certain?",
+  "I shall refrain from commenting.",
+  "Well... fortune favors the bold.",
+  "I've recorded your decision. Against my better judgment.",
+  "Noted, Sir. I'm sure this will end well.",
+  "An unusual display of confidence.",
+  "Very well. Let history judge us.",
+  "I admire your commitment to chaos.",
+  "I have concerns, Sir. Proceeding regardless.",
+];
+
+// ── Helpers ───────────────────────────────────────────────────────────────────
+const r    = (min,max) => Math.floor(Math.random()*(max-min+1))+min;
+const pick = arr => arr[Math.floor(Math.random()*arr.length)];
+
+function weightedPick(weights) {
+  const total = Object.values(weights).reduce((a,b)=>a+b,0);
+  let roll = Math.random()*total;
+  for(const [key,w] of Object.entries(weights)){
+    roll -= w;
+    if(roll <= 0) return key;
+  }
+  return Object.keys(weights)[0];
+}
+
+function openMysteryBox(){
+  const weights = {
+    coins_small:   CONFIG.mb_coins_small,
+    coins_large:   CONFIG.mb_coins_large,
+    lucky_charm:   CONFIG.mb_lucky_charm,
+    xp_boost:      CONFIG.mb_xp_boost,
+    shield:        CONFIG.mb_shield,
+    coin_magnet:   CONFIG.mb_coin_magnet,
+    rob_insurance: CONFIG.mb_rob_insurance,
+  };
+  const result = weightedPick(weights);
+  if(result === "coins_small") return {type:"coins", coins:r(50,200)};
+  if(result === "coins_large") return {type:"coins", coins:r(200,500)};
+  return {type:"item", itemId:result};
+}
+
+function openItemMysteryBox(){
+  const weights = {
+    coins_tiny:    CONFIG.imb_coins_tiny,
+    coins_small:   CONFIG.imb_coins_small,
+    lucky_charm:   CONFIG.imb_lucky_charm,
+    xp_boost:      CONFIG.imb_xp_boost,
+    shield:        CONFIG.imb_shield,
+    coin_magnet:   CONFIG.imb_coin_magnet,
+    rob_insurance: CONFIG.imb_rob_insurance,
+  };
+  const result = weightedPick(weights);
+  if(result === "coins_tiny")  return {type:"coins", coins:5};
+  if(result === "coins_small") return {type:"coins", coins:r(20,80)};
+  return {type:"item", itemId:result};
+}
+
+// ── Patreon promo: small random chance shown after a command finishes ───────
+const PROMO_CHANCE   = 0.08;
+const PROMO_MESSAGE  = "Enjoying the commands? How about you get to be a part of the creative process? It is unfortunately paid, but please consider https://www.patreon.com/c/RoyalV_/membership";
+async function maybeSendPromo(interaction) {
+  try {
+    if (Math.random() >= PROMO_CHANCE) return;
+    if (!interaction.replied && !interaction.deferred) return;
+    await interaction.followUp({ content: PROMO_MESSAGE, ephemeral: true }).catch(() => {});
+  } catch {}
+}
+
+async function safeReply(interaction, payload) {
+  try {
+    const p = typeof payload==="string" ? {content:payload} : payload;
+    if (interaction.deferred) return await interaction.editReply(p).catch(()=>{});
+    if (interaction.replied)  return await interaction.followUp({...p, ephemeral:true}).catch(()=>{});
+    return await interaction.reply(p);
+  } catch(e) {
+    if(e?.code !== 10062 && !e?.message?.includes("already been acknowledged")){
+      console.error("[safeReply error]", e?.message);
+    }
+  }
+}
+async function btnAck(interaction) {
+  try { await interaction.deferUpdate(); return true; } catch { return false; }
+}
+async function btnEphemeral(interaction, text) {
+  try {
+    if (!interaction.replied && !interaction.deferred)
+      await interaction.reply({content:text, ephemeral:true});
+    else
+      await interaction.followUp({content:text, ephemeral:true}).catch(()=>{});
+  } catch {}
+}
+async function safeSend(channel, payload) {
+  try { return await channel.send(typeof payload==="string"?{content:payload}:payload); } catch {}
+}
+
+function getTargetChannel(interaction) {
+  if (!interaction.guildId) return interaction.channel;
+  const saved = guildChannels.get(interaction.guildId);
+  if (saved) { const ch=interaction.guild.channels.cache.get(saved); if(ch) return ch; guildChannels.delete(interaction.guildId); }
+  return interaction.channel;
+}
+function getGuildChannel(guild) {
+  const saved=guildChannels.get(guild.id);
+  if(saved){ const ch=guild.channels.cache.get(saved); if(ch) return ch; guildChannels.delete(guild.id); }
+  const c=guild.channels.cache.filter(ch=>ch.type==="GUILD_TEXT"&&guild.members.me&&ch.permissionsFor(guild.members.me).has("SEND_MESSAGES")&&ch.permissionsFor(guild.roles.everyone)?.has("VIEW_CHANNEL"));
+  if(!c.size) return null;
+  return c.first();
+}
+function getBestChannel(guild) {
+  return guild.channels.cache.find(c=>c.type==="GUILD_TEXT"&&guild.members.me&&c.permissionsFor(guild.members.me).has("SEND_MESSAGES"))||null;
+}
+async function ownerSend(guild, payload) {
+  if (disabledOwnerMsg.has(guild.id)) return false;
+  const ch = getGuildChannel(guild); if(!ch) return false;
+  await safeSend(ch, payload); return true;
+}
+
+// ── Game renderers ────────────────────────────────────────────────────────────
+function renderTTT(board){const s=v=>v==="X"?"❌":v==="O"?"⭕":"⬜";return[0,1,2].map(row=>board.slice(row*3,row*3+3).map(s).join("")).join("\n");}
+function checkTTTWin(b){for(const[a,c,d]of[[0,1,2],[3,4,5],[6,7,8],[0,3,6],[1,4,7],[2,5,8],[0,4,8],[2,4,6]])if(b[a]&&b[a]===b[c]&&b[a]===b[d])return b[a];return b.includes(null)?null:"draw";}
+function makeTTTButtons(board,disabled=false){const rows=[];for(let row=0;row<3;row++){const ar=new MessageActionRow();for(let col=0;col<3;col++){const idx=row*3+col,val=board[idx];ar.addComponents(new MessageButton().setCustomId(`ttt_${idx}`).setLabel(val||String(idx+1)).setStyle(val==="X"?"DANGER":val==="O"?"PRIMARY":"SECONDARY").setDisabled(disabled||!!val));}rows.push(ar);}return rows;}
+
+function renderC4(board){const e=v=>v===1?"🔴":v===2?"🔵":"⚫";let out="1️⃣2️⃣3️⃣4️⃣5️⃣6️⃣7️⃣\n";for(let row=0;row<6;row++)out+=board.slice(row*7,row*7+7).map(e).join("")+"\n";return out;}
+function dropC4(board,col,player){for(let row=5;row>=0;row--){if(!board[row*7+col]){board[row*7+col]=player;return row;}}return -1;}
+function checkC4Win(board,player){const chk=(row,col,dr,dc)=>{for(let i=0;i<4;i++){const nr=row+dr*i,nc=col+dc*i;if(nr<0||nr>=6||nc<0||nc>=7||board[nr*7+nc]!==player)return false;}return true;};for(let row=0;row<6;row++)for(let col=0;col<7;col++)if(chk(row,col,0,1)||chk(row,col,1,0)||chk(row,col,1,1)||chk(row,col,1,-1))return true;return false;}
+function makeC4Buttons(disabled=false){return[new MessageActionRow().addComponents(...[1,2,3,4,5,6,7].map(i=>new MessageButton().setCustomId(`c4_${i-1}`).setLabel(`${i}`).setStyle("SECONDARY").setDisabled(disabled)))];}
+
+function renderHangman(word,guessed){const display=word.split("").map(l=>guessed.has(l)?l:"_").join(" ");const wrong=[...guessed].filter(l=>!word.includes(l));const stages=["```\n  +---+\n  |   |\n      |\n      |\n      |\n      |\n=========```","```\n  +---+\n  |   |\n  O   |\n      |\n      |\n      |\n=========```","```\n  +---+\n  |   |\n  O   |\n  |   |\n      |\n      |\n=========```","```\n  +---+\n  |   |\n  O   |\n /|   |\n      |\n      |\n=========```","```\n  +---+\n  |   |\n  O   |\n /|\\  |\n      |\n      |\n=========```","```\n  +---+\n  |   |\n  O   |\n /|\\  |\n /    |\n      |\n=========```","```\n  +---+\n  |   |\n  O   |\n /|\\  |\n / \\  |\n      |\n=========```"];return`${stages[Math.min(wrong.length,6)]}\n**Word:** ${display}\n**Wrong (${wrong.length}/6):** ${wrong.join(", ")||"none"}`;}
+function makeHangmanButtons(word,guessed,disabled=false){const rows=[];const alpha="abcdefghijklmnopqrstuvwxyz".split("");for(let i=0;i<4;i++){const ar=new MessageActionRow();alpha.slice(i*7,i*7+7).forEach(l=>ar.addComponents(new MessageButton().setCustomId(`hm_${l}`).setLabel(l.toUpperCase()).setStyle(guessed.has(l)?(word.includes(l)?"SUCCESS":"DANGER"):"SECONDARY").setDisabled(disabled||guessed.has(l))));if(ar.components.length)rows.push(ar);}return rows;}
+
+function renderSnake(game){const grid=Array(game.size*game.size).fill("⬜");game.snake.forEach((s,i)=>grid[s.y*game.size+s.x]=i===0?"🟢":"🟩");grid[game.food.y*game.size+game.food.x]="🍎";let out="";for(let row=0;row<game.size;row++)out+=grid.slice(row*game.size,(row+1)*game.size).join("")+"\n";return out+`**Score:** ${game.score}`;}
+function makeSnakeButtons(disabled=false){const blank=()=>new MessageButton().setCustomId("snake_noop").setLabel("​").setStyle("SECONDARY").setDisabled(true);const btn=(id,label)=>new MessageButton().setCustomId(id).setLabel(label).setStyle("PRIMARY").setDisabled(disabled);return[new MessageActionRow().addComponents(blank(),btn("snake_up","⬆️"),blank()),new MessageActionRow().addComponents(btn("snake_left","⬅️"),btn("snake_down","⬇️"),btn("snake_right","➡️"))];}
+function moveSnake(game,dir){const head={...game.snake[0]};if(dir==="up")head.y--;else if(dir==="down")head.y++;else if(dir==="left")head.x--;else head.x++;if(head.x<0||head.x>=game.size||head.y<0||head.y>=game.size)return"wall";if(game.snake.some(s=>s.x===head.x&&s.y===head.y))return"self";game.snake.unshift(head);if(head.x===game.food.x&&head.y===game.food.y){game.score++;let fx,fy;do{fx=Math.floor(Math.random()*game.size);fy=Math.floor(Math.random()*game.size);}while(game.snake.some(s=>s.x===fx&&s.y===fy));game.food={x:fx,y:fy};}else game.snake.pop();return"ok";}
+
+function initMinesweeper(mines){
+  const rows=5,cols=5,total=25;
+  return{rows,cols,mineCount:mines,mines:null,adj:null,revealed:Array(total).fill(false),firstClick:true};
+}
+
+function placeMinesAvoiding(game,safeRow,safeCol){
+  const{rows,cols}=game;
+  const total=rows*cols;
+  const safeSet=new Set();
+  for(let dr=-1;dr<=1;dr++) for(let dc=-1;dc<=1;dc++){
+    const nr=safeRow+dr,nc=safeCol+dc;
+    if(nr>=0&&nr<rows&&nc>=0&&nc<cols) safeSet.add(nr*cols+nc);
+  }
+  const mineSet=new Set();
+  const candidates=[...Array(total).keys()].filter(i=>!safeSet.has(i));
+  const pool=candidates.length>=game.mineCount?candidates:[...Array(total).keys()].filter(i=>!safeSet.has(i)||candidates.length<game.mineCount);
+  while(mineSet.size<game.mineCount&&mineSet.size<pool.length){
+    mineSet.add(pool[Math.floor(Math.random()*pool.length)]);
+  }
+  const mineArr=Array(total).fill(false);
+  mineSet.forEach(i=>mineArr[i]=true);
+  const adj=Array(total).fill(0);
+  for(let row=0;row<rows;row++) for(let col=0;col<cols;col++){
+    if(mineArr[row*cols+col]) continue;
+    let ct=0;
+    for(let dr=-1;dr<=1;dr++) for(let dc=-1;dc<=1;dc++){
+      const nr=row+dr,nc=col+dc;
+      if(nr>=0&&nr<rows&&nc>=0&&nc<cols&&mineArr[nr*cols+nc]) ct++;
+    }
+    adj[row*cols+col]=ct;
+  }
+  game.mines=mineArr;
+  game.adj=adj;
+  game.firstClick=false;
+}
+function revealMS(game,row,col){
+  const idx=row*game.cols+col;
+  if(game.revealed[idx]) return;
+  game.revealed[idx]=true;
+  if(game.adj[idx]===0&&!game.mines[idx])
+    for(let dr=-1;dr<=1;dr++) for(let dc=-1;dc<=1;dc++){
+      const nr=row+dr,nc=col+dc;
+      if(nr>=0&&nr<game.rows&&nc>=0&&nc<game.cols) revealMS(game,nr,nc);
+    }
+}
+function makeMSButtons(game,disabled=false){
+  const numLabels=["1","2","3","4","5","6","7","8"];
+  const rows=[];
+  for(let row=0;row<5;row++){
+    const ar=new MessageActionRow();
+    for(let col=0;col<5;col++){
+      const idx=row*5+col;
+      const rev=game.revealed[idx];
+      let label,style;
+      if(rev&&game.mines&&game.adj){
+        if(game.mines[idx]){label="💣";style="DANGER";}
+        else if(game.adj[idx]>0){label=numLabels[game.adj[idx]-1];style="SUCCESS";}
+        else{label="·";style="SUCCESS";}
+      } else {
+        label="?"; style="SECONDARY";
+      }
+      ar.addComponents(new MessageButton()
+        .setCustomId(`ms_${row}_${col}`)
+        .setLabel(label).setStyle(style)
+        .setDisabled(disabled||rev));
+    }
+    rows.push(ar);
+  }
+  return rows;
+}
+
+function newDeck(){const suits=["♠","♥","♦","♣"],faces=["A","2","3","4","5","6","7","8","9","10","J","Q","K"];const deck=[];for(const s of suits)for(const f of faces)deck.push(f+s);for(let i=deck.length-1;i>0;i--){const j=Math.floor(Math.random()*(i+1));[deck[i],deck[j]]=[deck[j],deck[i]];}return deck;}
+function cardVal(card){const f=card.slice(0,-1);if(f==="A")return 11;if(["J","Q","K"].includes(f))return 10;return parseInt(f);}
+function handVal(hand){let t=hand.reduce((s,c)=>s+cardVal(c),0),a=hand.filter(c=>c.startsWith("A")).length;while(t>21&&a>0){t-=10;a--;}return t;}
+function renderHand(hand,hide=false){return hide?`${hand[0]} 🂠`:hand.join(" ");}
+function makeBJButtons(disabled=false){return[new MessageActionRow().addComponents(new MessageButton().setCustomId("bj_hit").setLabel("Hit 🃏").setStyle("SUCCESS").setDisabled(disabled),new MessageButton().setCustomId("bj_stand").setLabel("Stand ✋").setStyle("DANGER").setDisabled(disabled))];}
+function spinSlots(){return[pick(SLOT_SYMBOLS),pick(SLOT_SYMBOLS),pick(SLOT_SYMBOLS)];}
+function slotPayout(reels){
+  if(reels[0]===reels[1]&&reels[1]===reels[2]){
+    if(reels[0]==="💎")return{mult:CONFIG.slots_jackpot_mult/100,label:"💎 JACKPOT 💎"};
+    if(reels[0]==="⭐")return{mult:CONFIG.slots_bigwin_mult/100,label:"⭐ BIG WIN ⭐"};
+    return{mult:CONFIG.slots_triple_mult/100,label:"🎰 THREE OF A KIND!"};
+  }
+  if(reels[0]===reels[1]||reels[1]===reels[2]||reels[0]===reels[2])return{mult:CONFIG.slots_pair_mult/100,label:"Two of a kind"};
+  return{mult:0,label:"No match"};
+}
+
+async function fetchJson(url){return new Promise((resolve,reject)=>{https.get(url,{headers:{"Accept":"application/json"}},res=>{let body="";res.on("data",d=>body+=d);res.on("end",()=>{try{resolve(JSON.parse(body));}catch{reject();}});}).on("error",reject);});}
+async function getCatGif(){try{const d=await fetchJson("https://api.thecatapi.com/v1/images/search?mime_types=gif&limit=1");return d[0]?.url||null;}catch{return null;}}
+async function getDogImage(){try{const d=await fetchJson("https://dog.ceo/api/breeds/image/random");return d?.message||null;}catch{return null;}}
+async function getFoxImage(){try{const d=await fetchJson("https://randomfox.ca/floof/");return d?.image||null;}catch{return null;}}
+async function getPandaImage(){try{const d=await fetchJson("https://some-random-api.com/img/panda");return d?.link||null;}catch{return null;}}
+async function getDuckImage(){try{const d=await fetchJson("https://random-d.uk/api/random");return d?.url||null;}catch{return null;}}
+async function getBunnyImage(){try{const d=await fetchJson("https://api.bunnies.io/v2/loop/random/?media=gif,png");return d?.media?.gif||d?.media?.png||null;}catch{return null;}}
+async function getKoalaImage(){try{const d=await fetchJson("https://some-random-api.com/img/koala");return d?.link||null;}catch{return null;}}
+async function getRaccoonImage(){try{const d=await fetchJson("https://some-random-api.com/img/raccoon");return d?.link||null;}catch{return null;}}
+async function getMeme(){try{const d=await fetchJson("https://meme-api.com/gimme");return d?.url||null;}catch{return null;}}
+async function getQuote(){try{const d=await fetchJson("https://zenquotes.io/api/random");return d?.[0]?`"${d[0].q}" - ${d[0].a}`:null;}catch{return null;}}
+async function getJoke(){try{const d=await fetchJson("https://official-joke-api.appspot.com/random_joke");return d?`${d.setup}\n\n||${d.punchline}||`:null;}catch{return null;}}
+async function getTrivia(){try{const d=await fetchJson("https://opentdb.com/api.php?amount=1&type=multiple");const q=d?.results?.[0];if(!q)return null;const answers=[...q.incorrect_answers,q.correct_answer].sort(()=>Math.random()-0.5);return{question:q.question.replace(/&quot;/g,'"').replace(/&#039;/g,"'").replace(/&amp;/g,"&"),answers,correct:q.correct_answer};}catch{return null;}}
+async function getUserAppInstalls(){return new Promise(resolve=>{const req=https.request({hostname:"discord.com",port:443,path:`/api/v10/applications/${CLIENT_ID}`,method:"GET",headers:{Authorization:`Bot ${TOKEN}`}},res=>{let body="";res.on("data",c=>body+=c);res.on("end",()=>{try{const j=JSON.parse(body);resolve(j.approximate_user_install_count??"N/A");}catch{resolve("N/A");}});});req.on("error",()=>resolve("N/A"));req.end();});}
+
+http.createServer((req,res)=>{res.writeHead(200);res.end("OK");}).listen(3000);
+setInterval(()=>{http.get("http://localhost:3000",()=>{}).on("error",()=>{});},4*60*1000);
+
+setInterval(async()=>{
+  const now=Date.now();
+  for(let i=reminders.length-1;i>=0;i--){
+    const rem=reminders[i];
+    if(now>=rem.time){
+      try{const ch=await client.channels.fetch(rem.channelId);await safeSend(ch,`⏰ <@${rem.userId}> Reminder: **${rem.message}**`);}catch{}
+      reminders.splice(i,1);
+    }
+  }
+},30000);
+
+// ── /messageschedule helpers ─────────────────────────────────────────────────
+const SCHEDULE_UNIT_MS    = { minutes:60000, hours:3_600_000, days:86_400_000, weeks:604_800_000, months:2_592_000_000 };
+const SCHEDULE_UNIT_LABEL = { minutes:"minute", hours:"hour", days:"day", weeks:"week", months:"month" };
+function parseScheduleTime(str){
+  const m = String(str||"").trim().toLowerCase().match(/^(\d+)\s*(min(?:ute)?s?|hrs?|hours?|days?|weeks?|wks?|months?|mos?)$/);
+  if(!m) return null;
+  const amount = parseInt(m[1], 10);
+  if(!amount || amount < 1) return null;
+  const raw = m[2];
+  let unit;
+  if(/^min/.test(raw))            unit = "minutes";
+  else if(/^h(r|our)/.test(raw))  unit = "hours";
+  else if(/^day/.test(raw))       unit = "days";
+  else if(/^w(k|eek)/.test(raw))  unit = "weeks";
+  else if(/^mo/.test(raw))        unit = "months";
+  if(!unit) return null;
+  return { amount, unit, ms: amount*SCHEDULE_UNIT_MS[unit] };
+}
+function genScheduleId(){
+  let id;
+  do { id = Math.random().toString(36).slice(2,8); } while(scheduledMessages.has(id));
+  return id;
+}
+function fmtScheduleUnit(amount, unit){
+  const label = SCHEDULE_UNIT_LABEL[unit] || unit;
+  return `${amount} ${label}${amount===1?"":"s"}`;
+}
+async function fireScheduledMessage(sm){
+  try{
+    const channel = await client.channels.fetch(sm.channelId).catch(()=>null);
+    if(!channel){ return; }
+    const user = await client.users.fetch(sm.userId).catch(()=>null);
+    const displayName = user ? (user.globalName || user.username) : "Unknown User";
+    const avatarURL    = user ? user.displayAvatarURL({ size:256, dynamic:true }) : undefined;
+
+    const webhooks = await channel.fetchWebhooks().catch(()=>null);
+    let webhook = webhooks?.find(w => w.owner?.id === CLIENT_ID && w.name === "RoyalBot Scheduler");
+    if(!webhook) webhook = await channel.createWebhook("RoyalBot Scheduler", { avatar: avatarURL }).catch(()=>null);
+    if(!webhook){
+      if(user) await user.send(`⚠️ Your scheduled message for <#${sm.channelId}> couldn't be sent: I no longer have permission to manage webhooks there.\n\n**Message:** ${sm.content||"*(no text)*"}`).catch(()=>{});
+      return;
+    }
+
+    const sendOpts = { username: displayName, avatarURL, allowedMentions: { parse: [] } };
+    if(sm.content) sendOpts.content = sm.content;
+    if(sm.imageURL) sendOpts.files = [{ attachment: sm.imageURL, name: sm.imageName || "image.png" }];
+    if(!sendOpts.content && !sendOpts.files) sendOpts.content = "\u200b";
+
+    await webhook.send(sendOpts).catch(async e=>{
+      console.error("scheduled message webhook send error:", e.message);
+      if(user) await user.send(`⚠️ Your scheduled message for <#${sm.channelId}> failed to send: ${e.message}\n\n**Message:** ${sm.content||"*(no text)*"}`).catch(()=>{});
+    });
+  }catch(e){ console.error("fireScheduledMessage error:", e.message); }
+}
+
+setInterval(async()=>{
+  const now=Date.now();
+  for(const [id, sm] of [...scheduledMessages.entries()]){
+    if(now>=sm.sendAt){
+      scheduledMessages.delete(id);
+      saveData();
+      await fireScheduledMessage(sm);
+    }
+  }
+},30000);
+
+// ── Premiere helpers ──────────────────────────────────────────────────────────
+function buildPremiereBar(endsAt, startedAt) {
+  const total  = endsAt - startedAt;
+  const elapsed= Date.now() - startedAt;
+  const pct    = Math.min(1, Math.max(0, elapsed / total));
+  const W      = 20;
+  const filled = Math.round(pct * W);
+  const bar    = "█".repeat(filled) + "░".repeat(W - filled);
+  return { bar, pct };
+}
+
+function buildPremiereEmbed(p) {
+  const now       = Date.now();
+  const remaining = Math.max(0, p.endsAt - now);
+  const hrs       = Math.floor(remaining / 3600000);
+  const mins      = Math.floor((remaining % 3600000) / 60000);
+  const { bar, pct } = buildPremiereBar(p.endsAt, p.startedAt);
+  const pctLabel  = Math.round(pct * 100);
+  const endTs     = Math.floor(p.endsAt / 1000);
+  const done      = remaining === 0;
+
+  return {
+    embeds: [{
+      title: done ? `🎬 ${p.title}: It's time!` : `🎬 ${p.title}`,
+      description: done
+        ? `<@${p.userId}> Your video is ready to upload! 🚀`
+        : [
+            `**Progress:** \`[${bar}]\` ${pctLabel}%`,
+            ``,
+            `⏳ **${hrs}h ${mins}m** remaining`,
+            `📅 Drops <t:${endTs}:R> (<t:${endTs}:f>)`,
+            ``,
+            `*Updates every 30 minutes*`,
+          ].join("\n"),
+      color: done ? 0x00FF00 : 0xFF4500,
+      footer: { text: done ? "Upload time! 🎉" : "Premiere countdown" },
+      timestamp: new Date().toISOString(),
+    }],
+  };
+}
+
+setInterval(async () => {
+  const now = Date.now();
+  for (const [id, p] of premieres) {
+    try {
+      const ch  = await client.channels.fetch(p.channelId).catch(() => null);
+      if (!ch) continue;
+      const msg = await ch.messages.fetch(p.messageId).catch(() => null);
+      if (!msg) continue;
+
+      if (now >= p.endsAt) {
+        await msg.edit(buildPremiereEmbed(p)).catch(() => {});
+        await safeSend(ch, `🎬 <@${p.userId}> **${p.title}**: time to upload! 🚀`);
+        premieres.delete(id);
+        saveData();
+      } else {
+        await msg.edit(buildPremiereEmbed(p)).catch(() => {});
+      }
+    } catch(e) { console.error("Premiere tick error:", e.message); }
+  }
+}, 30 * 60 * 1000);
+
+async function snapshotInvites(guild){
+  try{
+    const invites=await guild.invites.fetch();
+    const map=new Map();
+    invites.forEach(inv=>map.set(inv.code,inv.uses||0));
+    inviteCache.set(guild.id,map);
+    return map;
+  }catch{return new Map();}
+}
+
+async function runInviteOlympicsInGuild(guild, event, channelOverride) {
+  if (disabledOwnerMsg.has(guild.id)) return;
+  const channel = channelOverride || getGuildChannel(guild);
+  if (!channel) return;
+
+  const durationMs = event.duration * 60 * 1000;
+  const endsAt     = Date.now() + durationMs;
+  const endTs      = Math.floor(endsAt / 1000);
+
+  let baseline;
+  try {
+    const invites = await guild.invites.fetch();
+    baseline = new Map();
+    invites.forEach(inv => baseline.set(inv.code, { uses: inv.uses || 0, inviterId: inv.inviter?.id, inviterName: inv.inviter?.username }));
+  } catch(e) {
+    await safeSend(channel, "❌ Could not fetch invite data. The bot needs **Manage Guild** permission.");
+    return;
+  }
+
+  const durationLabel = event.duration >= 1440
+    ? `${Math.round(event.duration / 1440)} day(s)`
+    : event.duration >= 60
+    ? `${Math.round(event.duration / 60)} hour(s)`
+    : `${event.duration} minute(s)`;
+
+  await safeSend(channel,
+    `📨 **BOT OLYMPICS: ${event.name}**\n\n${event.description}\n\n⏳ Duration: **${durationLabel}**\n🔚 Ends: <t:${endTs}:R> (<t:${endTs}:f>)\n\nInvite people to this server using your personal invite links! The top 3 inviters win coins.\n🥇 1st: **500 coins** | 🥈 2nd: **250 coins** | 🥉 3rd: **100 coins**`
+  );
+
+  async function calcGains() {
+    let current;
+    try { current = await guild.invites.fetch(); } catch { return new Map(); }
+    const gained = new Map();
+    current.forEach(inv => {
+      if (!inv.inviter) return;
+      const base = baseline.get(inv.code);
+      const baseUses = base ? base.uses : 0;
+      const diff = (inv.uses || 0) - baseUses;
+      if (diff <= 0) return;
+      const id = inv.inviter.id;
+      if (!gained.has(id)) gained.set(id, { username: inv.inviter.username, count: 0 });
+      gained.get(id).count += diff;
+    });
+    return gained;
+  }
+
+  const updateInterval = event.duration >= 1440 ? 30 * 60 * 1000 : 5 * 60 * 1000;
+  const intervalId = setInterval(async () => {
+    const gained = await calcGains();
+    if (!gained.size) return;
+    const sorted = [...gained.entries()].sort((a, b) => b[1].count - a[1].count).slice(0, 3);
+    const medals = ["🥇","🥈","🥉"];
+    const lines = sorted.map(([id, d], i) => `${medals[i]} <@${id}>: **${d.count}** invite${d.count !== 1 ? "s" : ""}`);
+    const timeLeft = Math.round((endsAt - Date.now()) / 60000);
+    const timeLeftLabel = timeLeft >= 60 ? `${Math.round(timeLeft/60)}h ${timeLeft%60}m` : `${timeLeft}m`;
+    await safeSend(channel, `📊 **Live Standings** (${timeLeftLabel} remaining)\n\n${lines.join("\n")}`);
+  }, updateInterval);
+
+  await new Promise(res => setTimeout(res, durationMs));
+  clearInterval(intervalId);
+
+  const finalGains = await calcGains();
+  if (!finalGains.size) {
+    await safeSend(channel, `📨 **${event.name}: Results**\n\nNo new invites were tracked during the competition. Better luck next time!`);
+    return;
+  }
+
+  const sorted = [...finalGains.entries()].sort((a, b) => b[1].count - a[1].count);
+  const medals  = ["🥇","🥈","🥉"];
+  const rewards = [CONFIG.invite_comp_1st, CONFIG.invite_comp_2nd, CONFIG.invite_comp_3rd];
+  const top3    = sorted.slice(0, 3);
+  const lines = top3.map(([id, d], i) => `${medals[i]} <@${id}>: **${d.count}** invite${d.count !== 1 ? "s" : ""} (+${rewards[i]} coins)`);
+  top3.forEach(([id, d], i) => { getScore(id, d.username).coins += rewards[i]; });
+  sorted.forEach(([id, d]) => {
+    if (!top3.find(([tid]) => tid === id)) { getScore(id, d.username).coins += d.count * CONFIG.invite_comp_per_invite; }
+  });
+  saveData();
+  await safeSend(channel,
+    `🏆 **${event.name}: Final Results!**\n\n${lines.join("\n")}\n\n` +
+    (sorted.length > 3 ? `Everyone else who invited at least 1 person earned **${CONFIG.invite_comp_per_invite} coins per invite**.\n\n` : "") +
+    `Total participants: **${sorted.length}** | Total new invites: **${sorted.reduce((s,[,d])=>s+d.count,0)}**`
+  );
+}
+
+async function runOlympicsInGuild(guild,event){
+  if(disabledOwnerMsg.has(guild.id))return;
+  const channel=getGuildChannel(guild);if(!channel)return;
+  try{
+    if(event.instantWin){
+      await channel.send(`🏅 **BOT OLYMPICS: ${event.name}**\n${event.description}`);
+      if(event.answer){try{const col=await channel.awaitMessages({filter:m=>!m.author.bot&&m.content.trim().toLowerCase()===event.answer.toLowerCase(),max:1,time:60000,errors:["time"]});const w=col.first().author;recordWin(w.id,w.username,CONFIG.olympics_win_coins);saveData();await channel.send(`🥇 **${w.username} wins!** 🎉 (+${CONFIG.olympics_win_coins} coins)`);}catch{await channel.send(`⏰ Nobody won **${event.name}**.`);}}
+      else{const rm=await channel.send(`⚡ **GO!** First to react with ⚡ wins!`);await rm.react("⚡");try{const col=await rm.awaitReactions({filter:(re,u)=>re.emoji.name==="⚡"&&!u.bot,max:1,time:30000,errors:["time"]});const w=col.first().users.cache.filter(u=>!u.bot).first();if(w){recordWin(w.id,w.username,CONFIG.olympics_win_coins);saveData();await channel.send(`🥇 **${w.username} wins!** 🎉 (+${CONFIG.olympics_win_coins} coins)`);}else await channel.send(`⏰ Nobody reacted.`);}catch{await channel.send(`⏰ Nobody reacted.`);}}
+    }else if(event.randomWinner){
+      await channel.send(`🏅 **BOT OLYMPICS: ${event.name}**\n${event.description}\n⏳ **${event.duration} minute(s)**!`);
+      await new Promise(res=>setTimeout(res,event.duration*60*1000));
+      const msgs=await channel.messages.fetch({limit:100}).catch(()=>null);
+      const parts=msgs?[...new Set([...msgs.filter(m=>!m.author.bot).values()].map(m=>m.author))]:[];
+      if(parts.length){const w=pick(parts);recordWin(w.id,w.username,CONFIG.olympics_win_coins);saveData();await channel.send(`🥇 **${w.username} wins!** 🎉 (+${CONFIG.olympics_win_coins} coins)`);}
+      else await channel.send(`⏰ Nobody participated.`);
+    }else if(event.trackLive){
+      await channel.send(`🏅 **BOT OLYMPICS: ${event.name}**\n${event.description}\n⏳ **${event.duration} minute(s)**! Go!`);
+      const sc=new Map();
+      const col=channel.createMessageCollector({filter:m=>!m.author.bot,time:event.duration*60*1000});
+      col.on("collect",m=>{const uid=m.author.id;if(!sc.has(uid))sc.set(uid,{user:m.author,score:0});const e=sc.get(uid);if(event.unit==="messages")e.score++;else if(event.unit==="word length"){const w=Math.max(...m.content.split(/\s+/).map(w=>w.length));if(w>e.score)e.score=w;}else if(event.unit==="unique emojis"){const u=new Set((m.content.match(/\p{Emoji}/gu)||[])).size;if(u>e.score)e.score=u;}else if(event.unit==="number game"){const n=parseInt(m.content.trim());if(!isNaN(n)&&n<=100&&(e.score===0||Math.abs(n-100)<Math.abs(e.score-100)))e.score=n;}sc.set(uid,e);});
+      col.on("end",async()=>{if(!sc.size){await channel.send(`⏰ Nobody participated.`);return;}let winner=null,best=-Infinity;for(const[,e]of sc){if(e.score>best){best=e.score;winner=e.user;}}if(winner){recordWin(winner.id,winner.username,CONFIG.olympics_win_coins);saveData();await channel.send(`⏰ 🥇 **${winner.username} wins with ${best}!** 🎉 (+${CONFIG.olympics_win_coins} coins)`);}});
+    }
+  }catch(err){console.error(`Olympics error in ${guild.name}:`,err);}
+}
+
+async function sendCrisisToOwner(dmChannel){for(let i=0;i<CRISIS_MESSAGES.length;i++){await new Promise(res=>setTimeout(res,i===0?0:8000));try{await dmChannel.send(CRISIS_MESSAGES[i]);}catch{break;}}}
+
+function isTicketAdmin(interaction) {
+  try {
+    if (!interaction.guildId) return false;
+    if (OWNER_IDS.includes(interaction.user.id)) return true;
+    return !!interaction.member?.permissions?.has?.("MANAGE_GUILD");
+  } catch (e) {
+    console.error("[isTicketAdmin]", e?.message);
+    return false;
+  }
+}
+
+// ── Ticket transcript helper ─────────────────────────────────────────────────
+async function sendTicketTranscript(channel, ticket, cfg, closedBy) {
+  const transcriptChId = cfg?.transcriptChannelId;
+  if (!transcriptChId) return;
+  const transcriptCh = channel.guild.channels.cache.get(transcriptChId);
+  if (!transcriptCh) return;
+  try {
+    let allMessages = [];
+    let before = null;
+    for (let i = 0; i < 5; i++) {
+      const opts = { limit: 100 };
+      if (before) opts.before = before;
+      const batch = await channel.messages.fetch(opts);
+      if (!batch.size) break;
+      allMessages = allMessages.concat([...batch.values()]);
+      before = batch.last().id;
+      if (batch.size < 100) break;
+    }
+    allMessages.sort((a, b) => a.createdTimestamp - b.createdTimestamp);
+    const openerUser = await channel.client.users.fetch(ticket.userId).catch(() => null);
+    const lines = [
+      `═══════════════════════════════════════`,
+      `  TICKET #${ticket.ticketId} TRANSCRIPT`,
+      `═══════════════════════════════════════`,
+      `Opened by  : ${openerUser ? openerUser.tag : ticket.userId}`,
+      `Opened at  : ${new Date(ticket.openedAt||Date.now()).toUTCString()}`,
+      `Closed by  : ${closedBy}`,
+      `Closed at  : ${new Date().toUTCString()}`,
+      `Messages   : ${allMessages.length}`,
+      `═══════════════════════════════════════`,
+      "",
+    ];
+    for (const m of allMessages) {
+      const ts = new Date(m.createdTimestamp).toISOString().replace("T"," ").slice(0,19);
+      const tag = `${m.author.username}`;
+      if (m.content) lines.push(`[${ts}] ${tag}: ${m.content}`);
+      if (m.attachments.size) for (const att of m.attachments.values()) lines.push(`[${ts}] ${tag}: [Attachment: ${att.name} - ${att.url}]`);
+      if (m.stickers.size) for (const s of m.stickers.values()) lines.push(`[${ts}] ${tag}: [Sticker: ${s.name}]`);
+    }
+    lines.push("", `═══════════════════════════════════════`, `  END OF TRANSCRIPT`, `═══════════════════════════════════════`);
+    const transcript = lines.join("\n");
+    if (transcript.length <= 1900) {
+      await safeSend(transcriptCh, { content: `📜 **Ticket #${ticket.ticketId} Transcript**\nOpened by <@${ticket.userId}> • Closed by ${closedBy}\n${transcript.slice(0,1900)}` });
+    } else {
+      const buf = Buffer.from(transcript, "utf-8");
+      await transcriptCh.send({ content: `📜 **Ticket #${ticket.ticketId} Transcript**\nOpened by <@${ticket.userId}> • Closed by ${closedBy} • ${allMessages.length} messages`, files: [{ attachment: buf, name: `ticket-${ticket.ticketId}-transcript.txt` }] });
+    }
+  } catch(e) { console.error("Transcript error:", e.message); }
+}
+
+// ── Ticket setup wizard helpers ──────────────────────────────────────────────
+const TICKET_PICKER_MAX_MENUS = 4;
+
+function chunkArray(arr, size) {
+  const out = [];
+  for (let i = 0; i < arr.length; i += size) out.push(arr.slice(i, i + size));
+  return out;
+}
+
+function getEligibleTicketRoles(guild) {
+  return [...guild.roles.cache.filter(r => !r.managed && r.id !== guild.id).values()];
+}
+
+function isTicketStaff(cfg, member) {
+  try {
+    if (!member) return false;
+    if (OWNER_IDS.includes(member.id)) return true;
+    const roleIds = (cfg?.supportRoleIds || [cfg?.supportRoleId]).filter(Boolean);
+    if (roleIds.some(rid => member.roles?.cache?.has(rid))) return true;
+    return !!member.permissions?.has?.("MANAGE_CHANNELS");
+  } catch (e) {
+    console.error("[isTicketStaff]", e?.message);
+    return false;
+  }
+}
+
+function buildTicketActiveRow() {
+  return new MessageActionRow().addComponents(
+    new MessageButton().setCustomId("ticket_close").setLabel("Close Ticket 🔒").setStyle("DANGER"),
+    new MessageButton().setCustomId("ticket_claim").setLabel("Claim 🙋").setStyle("SUCCESS"),
+  );
+}
+function buildTicketStaffRow() {
+  return new MessageActionRow().addComponents(
+    new MessageButton().setCustomId("ticket_reopen").setLabel("Reopen 🔓").setStyle("SUCCESS"),
+    new MessageButton().setCustomId("ticket_delete").setLabel("Delete Ticket 🗑️").setStyle("DANGER"),
+  );
+}
+
+function buildTicketPickerRows({ items, idPrefix, selectedIds = [], mode = "single", placeholder }) {
+  const capped = items.slice(0, TICKET_PICKER_MAX_MENUS * 25);
+  const truncated = items.length > capped.length;
+  const chunks = chunkArray(capped, 25);
+  const rows = chunks.map((chunk, i) => {
+    const opts = chunk.map(it => ({
+      label: String(it.label).slice(0, 100),
+      value: it.value,
+      emoji: it.emoji,
+      default: selectedIds.includes(it.value),
+    }));
+    const menu = new MessageSelectMenu()
+      .setCustomId(`${idPrefix}_${i}`)
+      .setPlaceholder(chunks.length > 1 ? `${placeholder} (${i + 1}/${chunks.length})` : placeholder)
+      .setOptions(opts)
+      .setDisabled(opts.length === 1 && opts[0].value === "none");
+    if (mode === "multi") menu.setMinValues(0).setMaxValues(opts.length);
+    return new MessageActionRow().addComponents(menu);
+  });
+  return { rows, truncated, chunks };
+}
+
+function mergeChunkedSelection(previousIds, chunkItems, newValues) {
+  const chunkValueSet = new Set(chunkItems.map(it => it.value));
+  const kept = (previousIds || []).filter(id => !chunkValueSet.has(id));
+  return [...kept, ...newValues.filter(v => v !== "none" && v !== "__none__")];
+}
+
+function getSotdSetupStep(cfg){
+  if(!cfg.postChannelId) return 1;
+  if(cfg.hour === undefined || cfg.hour === null) return 2;
+  if(cfg.pingRoleId === undefined) return 3;
+  return 4;
+}
+function buildSotdSetupStep(guild, guildId, stepOverride){
+  try{ return buildSotdSetupStepInner(guild, guildId, stepOverride); }
+  catch(e){ console.error("[buildSotdSetupStep]", e?.stack || e?.message); return { content:`❌ SOTD setup hit an internal error: \`${e?.message || e}\``, embeds:[], components:[] }; }
+}
+function buildSotdSetupStepInner(guild, guildId, stepOverride){
+  const cfg = sotdConfig.get(guildId) || {};
+  const step = stepOverride ?? getSotdSetupStep(cfg);
+  const postCh = cfg.postChannelId ? guild.channels.cache.get(cfg.postChannelId) : null;
+  const pingRole = cfg.pingRoleId ? guild.roles.cache.get(cfg.pingRoleId) : null;
+
+  const STEP_NAMES = ["Post Channel","Time","Ping Role","Review"];
+  const progress = STEP_NAMES.map((name,i) => { const n=i+1; return n<step?`✅ ${name}`:n===step?`▶️ **${name}**`:`⬜ ${name}`; }).join("   ");
+
+  const fields = [];
+  if(step > 1) fields.push({ name:"📢 Post Channel", value: postCh ? `<#${postCh.id}>` : "None", inline:true });
+  if(step > 2) fields.push({ name:"🕒 Time", value: cfg.hour !== undefined && cfg.hour !== null ? `${String(cfg.hour).padStart(2,"0")}:00 UTC` : "None", inline:true });
+  if(step > 3) fields.push({ name:"📣 Ping Role", value: pingRole ? `<@&${pingRole.id}>` : "None", inline:true });
+
+  const embed = { color: step === 4 ? 0x57F287 : 0x5865F2, title: `🎵 SOTD Setup: Step ${step} of 4: ${STEP_NAMES[step-1]}`, fields };
+  let components = [];
+
+  if(step === 1){
+    const txts = [...guild.channels.cache.filter(ch => ch.type === "GUILD_TEXT").values()];
+    embed.description = `${progress}\n\nWhich channel should the daily song post go in?`;
+    const { rows, truncated } = buildTicketPickerRows({
+      items: txts.length ? txts.map(ch => ({ label:`#${ch.name}`, value:ch.id, emoji:{name:"📢"} })) : [{ label:"No text channels found", value:"none" }],
+      idPrefix:"sotd_sel_channel", mode:"single", placeholder:"Select a channel…",
+    });
+    if(truncated) embed.footer = { text:"Showing the first channels." };
+    components = rows;
+  } else if(step === 2){
+    const hours = Array.from({length:24}, (_,h) => ({ label:`${String(h).padStart(2,"0")}:00 UTC`, value:String(h), emoji:{name:"🕒"} }));
+    embed.description = `${progress}\n\nWhat UTC hour should it post at?`;
+    const { rows } = buildTicketPickerRows({ items: hours, idPrefix:"sotd_sel_hour", selectedIds: cfg.hour!==undefined?[String(cfg.hour)]:[], mode:"single", placeholder:"Select an hour…" });
+    components = [...rows, new MessageActionRow().addComponents(new MessageButton().setCustomId("sotd_back").setLabel("← Back").setStyle("SECONDARY"))];
+  } else if(step === 3){
+    const roles = getEligibleTicketRoles(guild);
+    embed.description = `${progress}\n\nShould a role be pinged every time SOTD posts? *(optional)*`;
+    const { rows, truncated } = buildTicketPickerRows({
+      items: roles.length ? roles.map(r => ({ label:r.name, value:r.id, emoji:{name:"📣"} })) : [{ label:"No roles found", value:"none" }],
+      idPrefix:"sotd_sel_role", selectedIds: cfg.pingRoleId?[cfg.pingRoleId]:[], mode:"single", placeholder:"Select a role to ping…",
+    });
+    if(truncated) embed.footer = { text:"Showing the first roles." };
+    const current = cfg.pingRoleId;
+    const skipClearBtn = current
+      ? new MessageButton().setCustomId("sotd_clear_role").setLabel("Clear ❌").setStyle("SECONDARY")
+      : new MessageButton().setCustomId("sotd_skip_role").setLabel("Skip ⏭️").setStyle("SECONDARY");
+    components = [...rows, new MessageActionRow().addComponents(new MessageButton().setCustomId("sotd_back").setLabel("← Back").setStyle("SECONDARY"), skipClearBtn)];
+  } else {
+    const genreRoles = detectGenreRoles(guild);
+    fields.push({ name:"🎧 Detected Genre Roles", value: genreRoles.length ? genreRoles.map(r=>r.name).join(", ") : "None found. Genre name matches in the embed will just show no match.", inline:false });
+    const playlistCount = (cfg.playlists || []).length;
+    const trackCount = (cfg.playlists || []).reduce((n,p) => n + (p.entries?.length || 0), 0);
+    fields.push({ name:"📻 Playlists", value: playlistCount ? `${playlistCount} playlist(s), ${trackCount} track(s) total. Manage with \`/sotd-playlist\`.` : "None yet. Add one with `/sotd-playlist`.", inline:false });
+    const activeGenre = cfg.genreMode && Date.now() <= cfg.genreMode.expiresAt ? cfg.genreMode : null;
+    if(activeGenre) fields.push({ name:"🎯 Genre Week", value: `**${activeGenre.genre}**, ends <t:${Math.floor(activeGenre.expiresAt/1000)}:R>`, inline:false });
+    embed.description = `${progress}\n\nAll set. You can post a test now, or come back any time with \`/sotd\`.`;
+    components = [
+      new MessageActionRow().addComponents(
+        new MessageButton().setCustomId("sotd_postnow").setLabel("Post Now ▶️").setStyle("PRIMARY").setDisabled(!playlistCount),
+        new MessageButton().setCustomId("sotd_back").setLabel("← Edit Settings").setStyle("SECONDARY"),
+      ),
+      new MessageActionRow().addComponents(
+        ...(activeGenre
+          ? [new MessageButton().setCustomId("sotd_genre_open").setLabel("🎯 Change Genre Week").setStyle("SECONDARY"),
+             new MessageButton().setCustomId("sotd_genre_clear").setLabel("End Genre Week").setStyle("SECONDARY")]
+          : [new MessageButton().setCustomId("sotd_genre_open").setLabel("🎯 Start Genre Week").setStyle("SECONDARY")]),
+      ),
+    ];
+  }
+  return { embeds:[embed], components, ephemeral:true };
+}
+
+function buildSotdGenrePicker(guildId){
+  const cfg = sotdConfig.get(guildId) || {};
+  const menu = new MessageSelectMenu().setCustomId("sotd_genre_sel").setPlaceholder("Pick a genre for the next 7 days…")
+    .setOptions(SOTD_GENRE_CHOICES.map(g => ({ label:g, value:g, default: cfg.genreMode?.genre === g })));
+  const embed = {
+    color: 0x5865F2,
+    title: "🎯 Genre Week",
+    description: "Pick a genre and, for the next 7 days, SOTD will only pull songs that match it. After that it goes back to picking from everything, automatically.",
+  };
+  return { embeds:[embed], components:[new MessageActionRow().addComponents(menu), new MessageActionRow().addComponents(new MessageButton().setCustomId("sotd_genre_back").setLabel("← Back").setStyle("SECONDARY"))], ephemeral:true };
+}
+
+function buildSotdPlaylistPanel(guild, guildId){
+  const cfg = sotdConfig.get(guildId) || {};
+  const playlists = cfg.playlists || [];
+  const embed = {
+    color: 0x5865F2,
+    title: "📻 SOTD Playlists",
+    description: playlists.length
+      ? playlists.map((p,i) => `**${i+1}. ${p.label}**: ${p.entries?.length || 0} track(s)\n${p.url}`).join("\n\n")
+      : "No playlists added yet. Every track across every playlist here feeds the daily pick.",
+  };
+  const row1 = new MessageActionRow().addComponents(
+    new MessageButton().setCustomId("sp_add").setLabel("➕ Add Playlist").setStyle("SUCCESS"),
+    new MessageButton().setCustomId("sp_remove").setLabel("🗑️ Remove Playlist").setStyle("DANGER").setDisabled(!playlists.length),
+    new MessageButton().setCustomId("sp_refresh").setLabel("🔄 Refresh All").setStyle("SECONDARY").setDisabled(!playlists.length),
+  );
+  return { embeds:[embed], components:[row1], ephemeral:true };
+}
+
+
+function getTicketSetupStep(cfg) {
+  if (!cfg.categoryId)                    return 1;
+  if (!cfg.supportRoleIds?.length)        return 2;
+  if (cfg.logChannelId === undefined)     return 3;
+  if (cfg.transcriptChannelId === undefined) return 4;
+  if (cfg.panelChannelId === undefined)   return 5;
+  return 6;
+}
+
+function buildTicketSetupStep(guild, guildId, stepOverride) {
+  try {
+    return buildTicketSetupStepInner(guild, guildId, stepOverride);
+  } catch (e) {
+    console.error("[buildTicketSetupStep]", e?.stack || e?.message);
+    return { content: `❌ Ticket setup hit an internal error: \`${e?.message || e}\``, embeds: [], components: [], ephemeral: true };
+  }
+}
+
+function buildTicketSetupStepInner(guild, guildId, stepOverride) {
+  const cfg = ticketConfigs.get(guildId) || {};
+  const step = stepOverride ?? getTicketSetupStep(cfg);
+  const catCh   = cfg.categoryId ? guild.channels.cache.get(cfg.categoryId) : null;
+  const roleList = (cfg.supportRoleIds || []).map(id => `<@&${id}>`).join(", ") || null;
+  const logCh   = cfg.logChannelId ? guild.channels.cache.get(cfg.logChannelId) : null;
+  const txCh    = cfg.transcriptChannelId ? guild.channels.cache.get(cfg.transcriptChannelId) : null;
+  const panelCh = cfg.panelChannelId ? guild.channels.cache.get(cfg.panelChannelId) : null;
+
+  const STEP_NAMES = ["Category", "Roles", "Log", "Transcript", "Panel"];
+  const progress = STEP_NAMES.map((name, i) => {
+    const n = i + 1;
+    return n < step ? `✅ ${name}` : n === step ? `▶️ **${name}**` : `⬜ ${name}`;
+  }).join("   ");
+
+  const fields = [];
+  if (step > 1) fields.push({ name: "📁 Category",         value: catCh ? catCh.name : "None", inline: true });
+  if (step > 2) fields.push({ name: "🛡️ Support Roles",    value: roleList || "None", inline: true });
+  if (step > 3) fields.push({ name: "📋 Log Channel",       value: logCh ? `<#${logCh.id}>` : "None", inline: true });
+  if (step > 4) fields.push({ name: "📜 Transcript Channel", value: txCh ? `<#${txCh.id}>` : "None", inline: true });
+  if (step > 5) fields.push({ name: "📢 Panel Channel",      value: panelCh ? `<#${panelCh.id}>` : "None", inline: true });
+
+  const embed = {
+    color: step > 5 ? 0x57F287 : 0x5865F2,
+    title: step > 5 ? "🎫 Ticket Setup: Complete!" : `🎫 Ticket Setup: Step ${step} of 5: ${STEP_NAMES[step - 1]}`,
+    fields,
+  };
+
+  let components = [];
+
+  if (step === 1) {
+    const cats = [...guild.channels.cache.filter(ch => ch.type === "GUILD_CATEGORY").values()];
+    embed.description = `${progress}\n\nWhich **category** should new ticket channels be created inside?`;
+    const { rows, truncated } = buildTicketPickerRows({
+      items: cats.length ? cats.map(ch => ({ label: ch.name, value: ch.id, emoji: { name: "📁" } })) : [{ label: "No categories found: create one first", value: "none" }],
+      idPrefix: "ts_sel_channel", mode: "single", placeholder: "Select a category…",
+    });
+    if (truncated) embed.footer = { text: `Showing the first ${TICKET_PICKER_MAX_MENUS * 25} categories.` };
+    components = rows;
+  } else if (step === 2) {
+    const rls = getEligibleTicketRoles(guild);
+    embed.description = `${progress}\n\nWhich **roles** can view and manage all tickets?`;
+    const { rows, truncated } = buildTicketPickerRows({
+      items: rls.length ? rls.map(r => ({ label: r.name, value: r.id, emoji: { name: "🛡️" } })) : [{ label: "No roles found", value: "none" }],
+      idPrefix: "ts_sel_roles", selectedIds: cfg.supportRoleIds || [], mode: "multi", placeholder: "Select support role(s)…",
+    });
+    if (truncated) embed.footer = { text: `Showing the first ${TICKET_PICKER_MAX_MENUS * 25} roles.` };
+    components = [...rows, new MessageActionRow().addComponents(new MessageButton().setCustomId("ts_back").setLabel("← Back").setStyle("SECONDARY"))];
+  } else if (step === 3 || step === 4) {
+    const isLog = step === 3;
+    const allTxts = [...guild.channels.cache.filter(ch => ch.type === "GUILD_TEXT").values()];
+    embed.description = isLog
+      ? `${progress}\n\nWhich channel should ticket open/close events be **logged** to? *(optional)*`
+      : `${progress}\n\nWhich channel should **full ticket transcripts** be posted to? *(optional)*`;
+    const { rows, truncated } = buildTicketPickerRows({
+      items: allTxts.length ? allTxts.map(ch => ({ label: `#${ch.name}`, value: ch.id, emoji: { name: isLog ? "📋" : "📜" } })) : [{ label: "No text channels found", value: "none" }],
+      idPrefix: isLog ? "ts_sel_log" : "ts_sel_transcript", mode: "single", placeholder: isLog ? "Select a log channel…" : "Select a transcript channel…",
+    });
+    if (truncated) embed.footer = { text: `Showing the first ${TICKET_PICKER_MAX_MENUS * 25} channels.` };
+    const currentlySet = isLog ? cfg.logChannelId : cfg.transcriptChannelId;
+    const skipClearBtn = currentlySet
+      ? new MessageButton().setCustomId(isLog ? "ts_clear_log" : "ts_clear_transcript").setLabel("Clear ❌").setStyle("SECONDARY")
+      : new MessageButton().setCustomId(isLog ? "ts_skip_log" : "ts_skip_transcript").setLabel("Skip ⏭️").setStyle("SECONDARY");
+    components = [...rows, new MessageActionRow().addComponents(new MessageButton().setCustomId("ts_back").setLabel("← Back").setStyle("SECONDARY"), skipClearBtn)];
+  } else if (step === 5) {
+    const allTxts = [...guild.channels.cache.filter(ch => ch.type === "GUILD_TEXT").values()];
+    embed.description = `${progress}\n\nWhich channel should the **ticket open button** be posted in?`;
+    const { rows, truncated } = buildTicketPickerRows({
+      items: allTxts.length ? allTxts.map(ch => ({ label: `#${ch.name}`, value: ch.id, emoji: { name: "📢" } })) : [{ label: "No text channels found", value: "none" }],
+      idPrefix: "ts_sel_panel_ch", mode: "single", placeholder: "Select where to post the panel…",
+    });
+    if (truncated) embed.footer = { text: `Showing the first ${TICKET_PICKER_MAX_MENUS * 25} channels.` };
+    components = [...rows, new MessageActionRow().addComponents(new MessageButton().setCustomId("ts_back").setLabel("← Back").setStyle("SECONDARY"))];
+  } else {
+    const pv = cfg.panelMessage || "🎫 **Support Tickets**: Click below to open a ticket.";
+    embed.description = `${progress}\n\nClick **Post Panel** to publish.`;
+    fields.push({ name: "✉️ Panel Message", value: cfg.panelMessage ? pv.slice(0, 200) : "*(default)*" });
+    fields.push({ name: "🎫 Status", value: cfg.panelMessageId ? `✅ Live in <#${cfg.panelChannelId}>` : "❌ Not posted yet" });
+    components = [new MessageActionRow().addComponents(
+      new MessageButton().setCustomId("ts_post_panel").setLabel("Post Ticket Panel 🎫").setStyle("PRIMARY"),
+      new MessageButton().setCustomId("ts_set_msg").setLabel("Customize Message ✏️").setStyle("SECONDARY"),
+      new MessageButton().setCustomId("ts_back").setLabel("← Edit Settings").setStyle("SECONDARY"),
+      new MessageButton().setCustomId("ts_reset").setLabel("Start Over 🗑️").setStyle("DANGER"),
+    )];
+  }
+
+  return { embeds: [embed], components, ephemeral: true };
+}
+
+// ── YouTube helpers ───────────────────────────────────────────────────────────
+
+async function resolveYouTubeChannelId(input, apiKey) {
+  if (!apiKey) return null;
+  const clean = input.trim();
+
+  if (/^UC[\w-]{20,}$/.test(clean)) return clean;
+
+  const urlMatch = clean.match(/youtube\.com\/(?:channel\/(UC[\w-]+)|(?:c\/|@|user\/)?([\w@.-]+))/i);
+  let handle = null;
+  if (urlMatch) {
+    if (urlMatch[1]) return urlMatch[1];
+    handle = urlMatch[2];
+  } else if (clean.startsWith("@")) {
+    handle = clean.slice(1);
+  } else {
+    handle = clean;
+  }
+
+  try {
+    const data = await fetchJson(`https://www.googleapis.com/youtube/v3/channels?part=id,snippet&forHandle=${encodeURIComponent(handle)}&key=${apiKey}`);
+    if (data?.items?.[0]?.id) return data.items[0].id;
+  } catch {}
+
+  try {
+    const data = await fetchJson(`https://www.googleapis.com/youtube/v3/search?part=snippet&type=channel&q=${encodeURIComponent(handle)}&maxResults=1&key=${apiKey}`);
+    return data?.items?.[0]?.snippet?.channelId || null;
+  } catch { return null; }
+}
+
+async function getYouTubeStats(ytChannelId, apiKey) {
+  if (!apiKey) return null;
+  try {
+    const data = await fetchJson(`https://www.googleapis.com/youtube/v3/channels?part=statistics,snippet&id=${ytChannelId}&key=${apiKey}`);
+    const ch = data?.items?.[0];
+    if (!ch) return null;
+    return {
+      subs:   parseInt(ch.statistics?.subscriberCount || "0"),
+      title:  ch.snippet?.title || ytChannelId,
+      hidden: ch.statistics?.hiddenSubscriberCount === true,
+    };
+  } catch { return null; }
+}
+
+function buildBar(current, goal, width=20) {
+  const pct = Math.min(1, current / goal);
+  const filled = Math.round(pct * width);
+  return `${"█".repeat(filled)}${"░".repeat(width - filled)}`;
+}
+
+function fmtSubs(n) {
+  if (n >= 1_000_000) return (n / 1_000_000).toFixed(n >= 10_000_000 ? 1 : 2).replace(/\.?0+$/, "") + "M";
+  if (n >= 1_000)     return (n / 1_000).toFixed(n >= 10_000 ? 1 : 2).replace(/\.?0+$/, "") + "K";
+  return String(n);
+}
+
+// ── /fakequote: "Make it a Quote" style image card ───────────────────────────
+const QUOTE_CARD_W = 1200, QUOTE_CARD_H = 630, QUOTE_CARD_LEFT_W = 600;
+const QUOTE_FONT_FAMILY = "'M PLUS Rounded 1c', Poppins, sans serif";
+
+function escapeSvgText(s) {
+  return String(s)
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&apos;");
+}
+
+// ── Custom emoji tokenizing for quote text ───────────────────────────────────
+const CUSTOM_EMOJI_RE = /<a?:(\w+):(\d+)>/g;
+function tokenizeWordForEmoji(word) {
+  const tokens = [];
+  let last = 0, m;
+  CUSTOM_EMOJI_RE.lastIndex = 0;
+  while ((m = CUSTOM_EMOJI_RE.exec(word))) {
+    if (m.index > last) tokens.push({ type: "text", value: word.slice(last, m.index) });
+    tokens.push({ type: "emoji", name: m[1], id: m[2], animated: word[m.index + 1] === "a" });
+    last = m.index + m[0].length;
+  }
+  if (last < word.length) tokens.push({ type: "text", value: word.slice(last) });
+  return tokens;
+}
+
+function measureSubtokensWidth(subtokens, approxCharW, emojiSize) {
+  let w = 0;
+  for (const t of subtokens) w += t.type === "emoji" ? emojiSize : t.value.length * approxCharW;
+  return w;
+}
+
+function wrapQuoteTokens(text, maxWidthPx, approxCharW, emojiSize) {
+  const spaceWidth = approxCharW;
+  const words = text.split(/\s+/).filter(Boolean);
+  const lines = [];
+  let curTokens = [];
+  let curWidth = 0;
+  for (const word of words) {
+    const subtokens = tokenizeWordForEmoji(word);
+    const wordWidth = measureSubtokensWidth(subtokens, approxCharW, emojiSize);
+    if (curTokens.length && curWidth + spaceWidth + wordWidth > maxWidthPx) {
+      lines.push({ tokens: curTokens, width: curWidth });
+      curTokens = subtokens;
+      curWidth = wordWidth;
+    } else {
+      if (curTokens.length) { curTokens.push({ type: "text", value: " " }); curWidth += spaceWidth; }
+      curTokens.push(...subtokens);
+      curWidth += wordWidth;
+    }
+  }
+  if (curTokens.length) lines.push({ tokens: curTokens, width: curWidth });
+  return lines;
+}
+
+async function fetchEmojiDataUri(id) {
+  try {
+    const res = await fetch(`https://cdn.discordapp.com/emojis/${id}.png?size=96`);
+    if (!res.ok) return null;
+    const buf = Buffer.from(await res.arrayBuffer());
+    return `data:image/png;base64,${buf.toString("base64")}`;
+  } catch { return null; }
+}
+
+async function buildFakeQuoteCard({ avatarBuffer, quoteText, displayName, username }) {
+  const avatarPanel = await sharp(avatarBuffer)
+    .resize(QUOTE_CARD_LEFT_W, QUOTE_CARD_H, { fit: "cover", position: "centre" })
+    .grayscale()
+    .toBuffer();
+
+  const fadeMaskSvg = `
+    <svg width="${QUOTE_CARD_LEFT_W}" height="${QUOTE_CARD_H}" xmlns="http://www.w3.org/2000/svg">
+      <defs>
+        <linearGradient id="fade" x1="0" y1="0" x2="428.32" y2="-87.02" gradientUnits="userSpaceOnUse">
+          <stop offset="0%"  stop-color="white" stop-opacity="1"/>
+          <stop offset="47%" stop-color="white" stop-opacity="1"/>
+          <stop offset="100%" stop-color="white" stop-opacity="0"/>
+        </linearGradient>
+      </defs>
+      <rect width="100%" height="100%" fill="url(#fade)"/>
+    </svg>`;
+  const fadeMask = await sharp(Buffer.from(fadeMaskSvg)).png().toBuffer();
+  const avatarFaded = await sharp(avatarPanel)
+    .ensureAlpha()
+    .composite([{ input: fadeMask, blend: "dest-in" }])
+    .png()
+    .toBuffer();
+
+  const rightX = QUOTE_CARD_LEFT_W;
+  const rightW = QUOTE_CARD_W - QUOTE_CARD_LEFT_W;
+  const pad = 60;
+  const textAreaW = rightW - pad * 2;
+  const textCenterX = rightX + rightW / 2 - 43;
+
+  const BASE_QUOTE_FONT = 57, BASE_NAME_FONT = 26, BASE_USER_FONT = 17;
+  const BASE_QUOTE_TO_NAME_GAP = 54, BASE_NAME_TO_USER_GAP = 32;
+  const BASE_QUOTE_BASELINE = 311;
+
+  const fontSize = quoteText.length > 220 ? 26 : quoteText.length > 140 ? 32 : quoteText.length > 60 ? 40 : BASE_QUOTE_FONT;
+  const approxCharW = fontSize * 0.46;
+  const emojiSize = fontSize * 1.15;
+  const lines = wrapQuoteTokens(quoteText, textAreaW, approxCharW, emojiSize).slice(0, 10);
+  const lineHeight = fontSize * 1.25;
+
+  const scale = fontSize / BASE_QUOTE_FONT;
+  const nameFont = Math.round(BASE_NAME_FONT * scale);
+  const userFont = Math.round(BASE_USER_FONT * scale);
+  const quoteToNameGap = BASE_QUOTE_TO_NAME_GAP * scale;
+  const nameToUserGap = BASE_NAME_TO_USER_GAP * scale;
+
+  const firstLineBaseline = BASE_QUOTE_BASELINE - (lines.length - 1) * (lineHeight / 2);
+
+  const emojiIds = [...new Set(
+    lines.flatMap(l => l.tokens.filter(t => t.type === "emoji").map(t => t.id))
+  )];
+  const emojiDataUriById = new Map(
+    await Promise.all(emojiIds.map(async id => [id, await fetchEmojiDataUri(id)]))
+  );
+
+  const quoteLinesSvg = lines.map((line, lineIdx) => {
+    const y = firstLineBaseline + lineIdx * lineHeight;
+    let x = textCenterX - line.width / 2;
+    const parts = [];
+    let textBuf = "";
+    const flushText = () => {
+      if (!textBuf) return;
+      parts.push(`<text x="${x}" y="${y}" font-family="${QUOTE_FONT_FAMILY}" font-size="${fontSize}" fill="white" text-anchor="start">${escapeSvgText(textBuf)}</text>`);
+      x += textBuf.length * approxCharW;
+      textBuf = "";
+    };
+    for (const t of line.tokens) {
+      if (t.type === "text") { textBuf += t.value; continue; }
+      flushText();
+      const dataUri = emojiDataUriById.get(t.id);
+      if (dataUri) {
+        const imgY = y - emojiSize * 0.82;
+        parts.push(`<image x="${x}" y="${imgY}" width="${emojiSize}" height="${emojiSize}" href="${dataUri}" xlink:href="${dataUri}"/>`);
+        x += emojiSize;
+      } else {
+        const fallback = `:${t.name}:`;
+        parts.push(`<text x="${x}" y="${y}" font-family="${QUOTE_FONT_FAMILY}" font-size="${fontSize}" fill="white" text-anchor="start">${escapeSvgText(fallback)}</text>`);
+        x += fallback.length * approxCharW;
+      }
+    }
+    flushText();
+    return parts.join("\n");
+  }).join("\n");
+
+  const lastLineBaseline = firstLineBaseline + (lines.length - 1) * lineHeight;
+  const nameY     = lastLineBaseline + quoteToNameGap;
+  const usernameY = nameY + nameToUserGap;
+
+  const tagLabel = "Make it a Quote#6660";
+  const tagY = QUOTE_CARD_H - 14;
+  const tagX = QUOTE_CARD_W - 12;
+
+  const cardSvg = `
+  <svg width="${QUOTE_CARD_W}" height="${QUOTE_CARD_H}" xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink">
+    ${quoteLinesSvg}
+    <text x="${textCenterX}" y="${nameY}" font-family="${QUOTE_FONT_FAMILY}" font-style="italic" font-size="${nameFont}" fill="white" text-anchor="middle">- ${escapeSvgText(displayName)}</text>
+    <text x="${textCenterX}" y="${usernameY}" font-family="${QUOTE_FONT_FAMILY}" font-size="${userFont}" fill="#999999" text-anchor="middle">@${escapeSvgText(username)}</text>
+    <text x="${tagX}" y="${tagY}" font-family="${QUOTE_FONT_FAMILY}" font-size="18" fill="#888888" text-anchor="end">${escapeSvgText(tagLabel)}</text>
+  </svg>`;
+  const cardLayer = await sharp(Buffer.from(cardSvg)).png().toBuffer();
+
+  return sharp({
+    create: { width: QUOTE_CARD_W, height: QUOTE_CARD_H, channels: 4, background: { r: 0, g: 0, b: 0, alpha: 1 } }
+  })
+    .composite([
+      { input: avatarFaded, left: 0, top: 0 },
+      { input: cardLayer, left: 0, top: 0 },
+    ])
+    .png()
+    .toBuffer();
+}
+
+// ── Tomato GIF builder ────────────────────────────────────────────────────────
+async function buildTomatoGif(msgContent, authorTag, tomatoCount, speedMin = 50, speedMax = 100, avatarURL = null, usernameColor = "#FFFFFF") {
+  let GifReader, GifWriter;
+  try {
+    const omggif = require("omggif");
+    GifReader = omggif.GifReader;
+    GifWriter  = omggif.GifWriter;
+  } catch(e) {
+    throw new Error("omggif not installed: run: npm install omggif");
+  }
+
+  // ── 1. Build Discord style message card PNG ───────────────────────────────
+  const CARD_W      = 700;
+  const PAD_H       = 16;
+  const PAD_V       = 12;
+  const AVATAR_SIZE = 40;
+  const TEXT_LEFT   = PAD_H + AVATAR_SIZE + 12;
+  const TEXT_W      = CARD_W - TEXT_LEFT - PAD_H;
+  const FONT_SIZE   = 16;
+  const LINE_H      = 22;
+  const FONT_FAMILY = "'gg sans','Noto Sans',Arial,sans serif";
+
+  const CHARS_PER_LINE = Math.floor(TEXT_W / (FONT_SIZE * 0.55));
+  const rawLines = (msgContent || "(no message content)").split("\n");
+  const wrappedLines = [];
+  for(const line of rawLines){
+    if(!line){ wrappedLines.push(""); continue; }
+    if(line.length <= CHARS_PER_LINE){ wrappedLines.push(line); continue; }
+    let rem = line;
+    while(rem.length > CHARS_PER_LINE){ wrappedLines.push(rem.slice(0, CHARS_PER_LINE)); rem = rem.slice(CHARS_PER_LINE); }
+    if(rem.length) wrappedLines.push(rem);
+  }
+  const displayLines = wrappedLines.slice(0, 8);
+  if(wrappedLines.length > 8) displayLines[7] = displayLines[7].slice(0, -1) + "…";
+
+  const now   = new Date();
+  const h12   = ((now.getHours() % 12) || 12);
+  const mins  = now.getMinutes().toString().padStart(2, "0");
+  const ampm  = now.getHours() >= 12 ? "PM" : "AM";
+  const tsStr = `Today at ${h12}:${mins} ${ampm}`;
+
+  const authorW  = authorTag.length * 9.6;
+  const TS_X     = TEXT_LEFT + authorW + 8;
+  const CONTENT_Y_BASE = PAD_V + FONT_SIZE + 6;
+
+  const CARD_H = Math.max(
+    PAD_V + AVATAR_SIZE + PAD_V,
+    CONTENT_Y_BASE + displayLines.length * LINE_H + PAD_V
+  );
+
+  function esc(s){ return String(s).replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;").replace(/"/g,"&quot;"); }
+
+  const contentSvgRows = displayLines.map((l, i) =>
+    `<text x="${TEXT_LEFT}" y="${CONTENT_Y_BASE + (i + 1) * LINE_H}" font-family="${FONT_FAMILY}" font-size="${FONT_SIZE}" fill="#dcddde">${esc(l)}</text>`
+  ).join("");
+
+  const cardSvg = `<svg width="${CARD_W}" height="${CARD_H}" xmlns="http://www.w3.org/2000/svg">
+    <rect width="${CARD_W}" height="${CARD_H}" fill="#313338"/>
+    <text x="${TEXT_LEFT}" y="${PAD_V + FONT_SIZE}" font-family="${FONT_FAMILY}" font-size="${FONT_SIZE}" font-weight="bold" fill="${esc(usernameColor)}">${esc(authorTag)}</text>
+    <text x="${TS_X}" y="${PAD_V + FONT_SIZE}" font-family="${FONT_FAMILY}" font-size="12" fill="#949ba4">${esc(tsStr)}</text>
+    ${contentSvgRows}
+  </svg>`;
+
+  let cardPng = await sharp(Buffer.from(cardSvg)).png().toBuffer();
+
+  // ── Composite circular avatar ─────────────────────────────────────────────
+  const circleMaskSvg = `<svg width="${AVATAR_SIZE}" height="${AVATAR_SIZE}"><circle cx="${AVATAR_SIZE/2}" cy="${AVATAR_SIZE/2}" r="${AVATAR_SIZE/2}" fill="white"/></svg>`;
+  let avatarComposite;
+  if(avatarURL){
+    try {
+      const aRes = await fetch(avatarURL);
+      if(aRes.ok){
+        const aBuf = Buffer.from(await aRes.arrayBuffer());
+        avatarComposite = await sharp(aBuf)
+          .resize(AVATAR_SIZE, AVATAR_SIZE)
+          .composite([{ input: Buffer.from(circleMaskSvg), blend: "dest-in" }])
+          .png()
+          .toBuffer();
+      }
+    } catch(e){ console.error("[tomato] avatar fetch:", e.message); }
+  }
+  if(!avatarComposite){
+    const initials = esc((authorTag[0] || "?").toUpperCase());
+    const fallbackSvg = `<svg width="${AVATAR_SIZE}" height="${AVATAR_SIZE}" xmlns="http://www.w3.org/2000/svg"><circle cx="${AVATAR_SIZE/2}" cy="${AVATAR_SIZE/2}" r="${AVATAR_SIZE/2}" fill="#5865f2"/><text x="${AVATAR_SIZE/2}" y="${AVATAR_SIZE/2 + 6}" font-family="${FONT_FAMILY}" font-size="20" font-weight="bold" fill="white" text-anchor="middle">${initials}</text></svg>`;
+    avatarComposite = await sharp(Buffer.from(fallbackSvg)).png().toBuffer();
+  }
+  cardPng = await sharp(cardPng)
+    .composite([{ input: avatarComposite, left: PAD_H, top: PAD_V, blend: "over" }])
+    .png()
+    .toBuffer();
+
+  // ── 2. Fetch tomato splat.gif ─────────────────────────────────────────────
+  const tomatoUrl = `https://raw.githubusercontent.com/${GH_REPO}/main/tomato-splat.gif`;
+  const tRes = await fetch(tomatoUrl);
+  if(!tRes.ok) throw new Error(`Could not fetch tomato splat.gif (HTTP ${tRes.status})`);
+  const tomatoGifBuf = Buffer.from(await tRes.arrayBuffer());
+
+  // ── 3. Decode tomato GIF frames ────────────────────────────────────────────
+  const reader = new GifReader(new Uint8Array(tomatoGifBuf));
+  const gifW = reader.width, gifH = reader.height;
+  const numFrames = reader.numFrames();
+  const frames = [];
+  for(let f = 0; f < numFrames; f++){
+    const info = reader.frameInfo(f);
+    const pixels = new Uint8ClampedArray(gifW * gifH * 4);
+    reader.decodeAndBlitFrameRGBA(f, pixels);
+    frames.push({ pixels, delayMs: info.delay * 10 });
+  }
+
+  // ── 4. Pre scale tomato frames ─────────────────────────────────────────────
+  const scaledW = Math.min(gifW, Math.floor(CARD_W * 0.35));
+  const scaledH = Math.round(gifH * (scaledW / gifW));
+  const scaledFrameCache = new Array(numFrames);
+  for(let f = 0; f < numFrames; f++){
+    const rawBuf = Buffer.from(frames[f].pixels);
+    scaledFrameCache[f] = await sharp(rawBuf, { raw: { width: gifW, height: gifH, channels: 4 } })
+      .resize(scaledW, scaledH)
+      .png()
+      .toBuffer();
+  }
+
+  // ── 5. Tomato placements + speeds ─────────────────────────────────────────
+  const maxTomatoX = Math.max(1, CARD_W - scaledW);
+  const maxTomatoY = Math.max(1, CARD_H - scaledH);
+  const tomatos = [];
+  for(let t = 0; t < tomatoCount; t++){
+    const pctRange = speedMax - speedMin;
+    const speedPct = (speedMin + (pctRange > 0 ? Math.random() * pctRange : 0)) / 100;
+    tomatos.push({ x: Math.floor(Math.random() * maxTomatoX), y: Math.floor(Math.random() * maxTomatoY), speedPct: Math.max(0.001, speedPct), accum: 0 });
+  }
+
+  // ── 6. Build output frames ─────────────────────────────────────────────────
+  const BASE_DELAY_CS = Math.max(2, Math.round(frames[0].delayMs / 10));
+  const outputW = CARD_W, outputH = CARD_H;
+  const rawFrames = [];
+  for(let outF = 0; outF < numFrames; outF++){
+    const composites = [];
+    for(const tomato of tomatos){
+      tomato.accum += tomato.speedPct;
+      const frameIdx = Math.floor(tomato.accum) % numFrames;
+      composites.push({ input: scaledFrameCache[frameIdx], left: tomato.x, top: tomato.y, blend: "over" });
+    }
+    const { data } = await sharp(cardPng).composite(composites).raw().toBuffer({ resolveWithObject: true });
+    rawFrames.push(data);
+  }
+
+  // ── 7. Shared palette + GIF encode (see comment in buildSharedPalette) ─────
+  const { palette: globalPalette, colorMap: sharedColorMap } = buildSharedPalette(rawFrames, outputW, outputH);
+  const outBufArr = rawFrames.map(data => ({
+    indexed: indexFrameToPalette(data, outputW, outputH, globalPalette, sharedColorMap),
+    delay:   BASE_DELAY_CS,
+  }));
+  const packedPalette = globalPalette.map(([r, g, b]) => (r << 16) | (g << 8) | b);
+  const outBuf = Buffer.alloc(outputW * outputH * numFrames * 4 + 1024 * 64);
+  const writer = new GifWriter(outBuf, outputW, outputH, { palette: packedPalette, loop: 0 });
+  for(const frame of outBufArr){
+    writer.addFrame(0, 0, outputW, outputH, frame.indexed, { delay: frame.delay, disposal: 2 });
+  }
+  return Buffer.from(outBuf.buffer, 0, writer.end());
+}
+
+function buildSharedPalette(rgbaBuffers, width, height) {
+  const PALETTE_SIZE = 256;
+  const totalPx = width * height;
+
+  // ── Frequency count using 5 bit RGB (R5G5B5): 32 768 possible buckets ────
+  const freq = new Map();
+  for(const rgbaData of rgbaBuffers){
+    for(let i = 0; i < totalPx; i++){
+      const a = rgbaData[i*4+3];
+      if(a < 32) continue;
+      const r = rgbaData[i*4]   >> 3;
+      const g = rgbaData[i*4+1] >> 3;
+      const b = rgbaData[i*4+2] >> 3;
+      const key = (r << 10) | (g << 5) | b;
+      freq.set(key, (freq.get(key) || 0) + 1);
+    }
+  }
+
+  // ── Pick top (PALETTE_SIZE: 1) colours by frequency ──────────────────────
+  const sorted = [...freq.entries()].sort((a, b) => b[1] - a[1]).slice(0, PALETTE_SIZE - 1);
+
+  const palette = new Array(PALETTE_SIZE);
+  palette[0] = [0x36, 0x39, 0x3f];
+
+  const colorMap = new Map();
+  for(let i = 0; i < sorted.length; i++){
+    const key = sorted[i][0];
+    const r5 = (key >> 10) & 31;
+    const g5 = (key >>  5) & 31;
+    const b5 =  key        & 31;
+    const r8 = (r5 << 3) | (r5 >> 2);
+    const g8 = (g5 << 3) | (g5 >> 2);
+    const b8 = (b5 << 3) | (b5 >> 2);
+    palette[i + 1] = [r8, g8, b8];
+    colorMap.set(key, i + 1);
+  }
+  for(let i = sorted.length + 1; i < PALETTE_SIZE; i++) palette[i] = palette[0];
+
+  return { palette, colorMap };
+}
+
+function indexFrameToPalette(rgbaData, width, height, palette, colorMap) {
+  const totalPx = width * height;
+  const pixels = new Uint8Array(totalPx);
+  const nearestCache = new Map();
+
+  for(let i = 0; i < totalPx; i++){
+    const a = rgbaData[i*4+3];
+    if(a < 32){ pixels[i] = 0; continue; }
+
+    const r = rgbaData[i*4], g = rgbaData[i*4+1], b = rgbaData[i*4+2];
+    const key = ((r >> 3) << 10) | ((g >> 3) << 5) | (b >> 3);
+
+    let idx = colorMap.get(key);
+    if(idx === undefined){
+      if(nearestCache.has(key)){
+        idx = nearestCache.get(key);
+      } else {
+        let best = 0, bestDist = Infinity;
+        for(let p = 1; p < palette.length; p++){
+          const [pr, pg, pb] = palette[p];
+          const dr = pr - r, dg = pg - g, db = pb - b;
+          const dist = dr*dr + dg*dg + db*db;
+          if(dist < bestDist){ bestDist = dist; best = p; }
+        }
+        idx = best;
+        nearestCache.set(key, idx);
+      }
+    }
+    pixels[i] = idx;
+  }
+
+  return pixels;
+}
+
+// ── /pixeltxt - RLE + palette compressed pixel <-> image codec ───────────────
+const PIXELTXT_MAX_PIXELS = 4_000_000;
+
+function pixeltxtHex2(n){ return n.toString(16).padStart(2,"0"); }
+
+function pixeltxtEncode(raw, W, H) {
+  const total = W * H;
+  const palMap = new Map();
+  const palArr = [];
+
+  const keyAt = (i) => {
+    const idx = i * 4;
+    return raw[idx]*16777216 + raw[idx+1]*65536 + raw[idx+2]*256 + raw[idx+3];
+  };
+
+  for(let i = 0; i < total; i++){
+    const key = keyAt(i);
+    if(!palMap.has(key)){ palMap.set(key, palArr.length); palArr.push(key); }
+  }
+
+  const lines = [`PIXELTXT v2`, `SIZE ${W}x${H}`, `PALETTE ${palArr.length}`];
+  for(const key of palArr){
+    const r = Math.floor(key / 16777216) & 0xff;
+    const g = Math.floor(key / 65536)    & 0xff;
+    const b = Math.floor(key / 256)      & 0xff;
+    const a = key & 0xff;
+    lines.push("#" + pixeltxtHex2(r) + pixeltxtHex2(g) + pixeltxtHex2(b) + (a < 255 ? pixeltxtHex2(a) : ""));
+  }
+  lines.push("DATA");
+
+  let totalRuns = 0;
+  for(let y = 0; y < H; y++){
+    const rowStart = y * W;
+    const rowParts = [];
+    let runLen = 1;
+    let runKey = keyAt(rowStart);
+    for(let x = 1; x < W; x++){
+      const key = keyAt(rowStart + x);
+      if(key === runKey){ runLen++; }
+      else { rowParts.push(runLen + ":" + palMap.get(runKey)); totalRuns++; runLen = 1; runKey = key; }
+    }
+    rowParts.push(runLen + ":" + palMap.get(runKey)); totalRuns++;
+    lines.push(rowParts.join(","));
+  }
+  lines.push("END");
+
+  return { text: lines.join("\n") + "\n", paletteSize: palArr.length, totalRuns };
+}
+
+function pixeltxtDecodeV2(text) {
+  const lines = text.split("\n");
+  let li = 1;
+
+  const sizeLine = (lines[li++]||"").trim();
+  if(!sizeLine.startsWith("SIZE ")) throw new Error("Missing SIZE line");
+  const [W, H] = sizeLine.slice(5).split("x").map(Number);
+  if(!W || !H) throw new Error("Bad SIZE line");
+  if(W*H > PIXELTXT_MAX_PIXELS) throw new Error(`Image is too large (${W}×${H} - max ${PIXELTXT_MAX_PIXELS.toLocaleString()} px)`);
+
+  const palLine = (lines[li++]||"").trim();
+  if(!palLine.startsWith("PALETTE ")) throw new Error("Missing PALETTE line");
+  const palSize = parseInt(palLine.slice(8), 10);
+  if(!Number.isFinite(palSize) || palSize < 0) throw new Error("Bad PALETTE line");
+
+  const palette = new Array(palSize);
+  for(let i = 0; i < palSize; i++){
+    const s = (lines[li++]||"").trim();
+    if(!s.startsWith("#") || s.length < 7) throw new Error(`Bad palette entry at index ${i}`);
+    const r = parseInt(s.slice(1,3), 16), g = parseInt(s.slice(3,5), 16), b = parseInt(s.slice(5,7), 16);
+    const a = s.length >= 9 ? parseInt(s.slice(7,9), 16) : 255;
+    if([r,g,b,a].some(Number.isNaN)) throw new Error(`Bad palette colour at index ${i}`);
+    palette[i] = [r,g,b,a];
+  }
+
+  if((lines[li++]||"").trim() !== "DATA") throw new Error("Missing DATA line");
+
+  const pixels = Buffer.alloc(W*H*4);
+  let pixPos = 0;
+  for(let row = 0; row < H; row++){
+    const line = lines[li++];
+    if(line === undefined || line.trim() === "END") break;
+    let ci = 0;
+    const ll = line.length;
+    while(ci < ll){
+      let count = 0;
+      while(ci < ll && line.charCodeAt(ci) >= 48 && line.charCodeAt(ci) <= 57){ count = count*10 + (line.charCodeAt(ci)-48); ci++; }
+      if(line.charCodeAt(ci) !== 58){ ci++; continue; }
+      ci++;
+      let idx = 0;
+      while(ci < ll && line.charCodeAt(ci) >= 48 && line.charCodeAt(ci) <= 57){ idx = idx*10 + (line.charCodeAt(ci)-48); ci++; }
+      if(line.charCodeAt(ci) === 44) ci++;
+      const col = palette[idx];
+      if(!col) throw new Error(`Palette index ${idx} out of range on row ${row}`);
+      const [r,g,b,a] = col;
+      const end = Math.min(pixPos + count, W*H);
+      for(let p = pixPos; p < end; p++){ const o=p*4; pixels[o]=r; pixels[o+1]=g; pixels[o+2]=b; pixels[o+3]=a; }
+      pixPos = end;
+    }
+  }
+  return { W, H, pixels };
+}
+
+function pixeltxtDecodeLegacy(text) {
+  const lineRe = /^\s*\((\d+)\s*,\s*(\d+)\)\s*:\s*#([0-9a-fA-F]{6}(?:[0-9a-fA-F]{2})?)\s*$/;
+  const lines = text.split("\n");
+  let maxX = 0, maxY = 0;
+  const parsed = [];
+  for(const line of lines){
+    const m = lineRe.exec(line);
+    if(!m) continue;
+    const x = parseInt(m[1],10), y = parseInt(m[2],10);
+    const hex = m[3];
+    const r = parseInt(hex.slice(0,2),16), g = parseInt(hex.slice(2,4),16), b = parseInt(hex.slice(4,6),16);
+    const a = hex.length === 8 ? parseInt(hex.slice(6,8),16) : 255;
+    parsed.push({x,y,r,g,b,a});
+    if(x > maxX) maxX = x;
+    if(y > maxY) maxY = y;
+  }
+  if(!parsed.length) throw new Error("No valid pixel entries found (expected \"(x,y): #hex\" lines or a PIXELTXT v2 header)");
+  const W = maxX+1, H = maxY+1;
+  if(W*H > PIXELTXT_MAX_PIXELS) throw new Error(`Image is too large (${W}×${H} - max ${PIXELTXT_MAX_PIXELS.toLocaleString()} px)`);
+  const pixels = Buffer.alloc(W*H*4);
+  for(const {x,y,r,g,b,a} of parsed){ const o=(y*W+x)*4; pixels[o]=r; pixels[o+1]=g; pixels[o+2]=b; pixels[o+3]=a; }
+  return { W, H, pixels };
+}
+
+function pixeltxtDecode(text) {
+  return text.trimStart().startsWith("PIXELTXT v2") ? pixeltxtDecodeV2(text) : pixeltxtDecodeLegacy(text);
+}
+
+// ── YouTube polling tick (runs every 5 minutes) ───────────────────────────────
+setInterval(async () => {
+  for (const [guildId, cfg] of ytConfig.entries()) {
+    if (!cfg.ytChannelId || !cfg.apiKey) continue;
+    const stats = await getYouTubeStats(cfg.ytChannelId, cfg.apiKey);
+    if (!stats || stats.hidden) continue;
+    const now = Date.now();
+    const prev = cfg.lastSubs ?? stats.subs;
+    cfg.lastSubs = stats.subs;
+    cfg.lastSubsTimestamp = now;
+    if (!cfg.history) cfg.history = [];
+    cfg.history.push({ ts: now, subs: stats.subs });
+    if (cfg.history.length > 1000) cfg.history = cfg.history.slice(-1000);
+    saveData();
+
+    const guild = client.guilds.cache.get(guildId);
+    if (!guild) continue;
+
+    // ── Live sub count message edit ─────────────────────────────────────────
+    if (cfg.subcountDiscordId && cfg.subcountMessageId) {
+      try {
+        const ch = guild.channels.cache.get(cfg.subcountDiscordId);
+        if (ch) {
+          const msg = await ch.messages.fetch(cfg.subcountMessageId).catch(() => null);
+          if (msg) {
+            const threshold = cfg.subcountThreshold || 1000;
+            const rounded = Math.floor(stats.subs / threshold) * threshold;
+            const diff = stats.subs - prev;
+            const diffStr = diff > 0 ? ` (+${fmtSubs(diff)})` : diff < 0 ? ` (${fmtSubs(diff)})` : "";
+            await msg.edit({
+              embeds: [{
+                title: `📊 ${stats.title}: Live Sub Count`,
+                description: `## ${fmtSubs(stats.subs)}\n*~${fmtSubs(rounded)} (rounded to nearest ${fmtSubs(threshold)})*${diffStr}`,
+                color: 0xFF0000,
+                footer: { text: `Updated` },
+                timestamp: new Date().toISOString(),
+              }]
+            }).catch(() => {});
+          }
+        }
+      } catch {}
+    }
+
+    // ── Sub goal progress ───────────────────────────────────────────────────
+    if (cfg.goal && !cfg.goalReached) {
+      const pct = Math.min(100, Math.round(stats.subs / cfg.goal * 100));
+      if (cfg.goalDiscordId) {
+        const ch = guild.channels.cache.get(cfg.goalDiscordId);
+        if (ch && cfg.goalMessageId) {
+          const msg = await ch.messages.fetch(cfg.goalMessageId).catch(() => null);
+          if (msg) {
+            await msg.edit({
+              embeds: [{
+                title: `🎯 ${stats.title}: Sub Goal`,
+                description: `**${fmtSubs(stats.subs)}** / **${fmtSubs(cfg.goal)}**\n\`[${buildBar(stats.subs, cfg.goal)}]\` **${pct}%**`,
+                color: pct >= 100 ? 0x00FF00 : 0xFF0000,
+                footer: { text: "Updated" },
+                timestamp: new Date().toISOString(),
+              }]
+            }).catch(() => {});
+          }
+        }
+      }
+      if (stats.subs >= cfg.goal) {
+        cfg.goalReached = true;
+        saveData();
+        if (cfg.goalDiscordId) {
+          const ch = guild.channels.cache.get(cfg.goalDiscordId);
+          if (ch) {
+            const msg = cfg.goalMessage || `🎉 **${stats.title}** just hit the sub goal of **${fmtSubs(cfg.goal)}** subscribers! 🎊`;
+            await safeSend(ch, msg);
+          }
+        }
+      }
+    }
+
+    // ── Milestones ──────────────────────────────────────────────────────────
+    if (cfg.milestones?.length && cfg.milestoneDiscordId) {
+      const ch = guild.channels.cache.get(cfg.milestoneDiscordId);
+      if (ch) {
+        for (const m of cfg.milestones) {
+          if (!m.reached && stats.subs >= m.subs) {
+            m.reached = true;
+            saveData();
+            const txt = m.message || `🏆 **${stats.title}** just reached **${fmtSubs(m.subs)} subscribers**! 🎉`;
+            await safeSend(ch, txt);
+          }
+        }
+      }
+    }
+  }
+}, 5 * 60 * 1000);
+
+// ── Server Stats autorefresh ────────────────────────────────────────────────
+setInterval(async () => {
+  for (const [guildId, cfg] of serverStatsConfig.entries()) {
+    if (!cfg.channels?.length) continue;
+    const guild = client.guilds.cache.get(guildId);
+    if (!guild) continue;
+    await ssUpdateGuildChannels(guild, cfg).catch(e => console.error("[serverstats interval]", e.message));
+  }
+}, 5 * 60 * 1000);
+
+// ── Discord client ─────────────────────────────────────────────────────────────
+const client=new Client({
+  intents:[Intents.FLAGS.GUILDS,Intents.FLAGS.GUILD_MEMBERS,Intents.FLAGS.GUILD_INVITES,
+           Intents.FLAGS.DIRECT_MESSAGES,Intents.FLAGS.GUILD_MESSAGES,
+           Intents.FLAGS.GUILD_MESSAGE_REACTIONS,Intents.FLAGS.GUILD_BANS],
+  partials:["CHANNEL","MESSAGE","USER","REACTION"]
+});
+
+// ── Command list ──────────────────────────────────────────────────────────────
+// ── Owner only command names: registered globally so they don't count toward the
+const OWNER_ONLY_CMDS = new Set([
+  "servers","dmconfig","leaveserver","restart",
+  "botstats","setstatus","adminconfig",
+  "thecount","send",
+  "tempowner","blacklist","theremnant","jarvisenhance",
+  "requester","deleter","emojisteal","announcementsync",
+  "Reaction Bomb","Clank This","Expose","Steal Emojis",
+]);
+
+function buildCommands(){
+  const uReq=(req=true)=>[{name:"user",description:"User",type:6,required:req}];
+  return[
+    {name:"ping",        description:"Check latency 🏓"},
+    {name:"avatar",      description:"Get a user's avatar",options:uReq()},
+    {name:"marry",         description:"Propose to or accept a proposal from someone 💍",options:[{name:"user",description:"User to propose to / accept from",type:6,required:true}]},
+    {name:"divorce",       description:"Divorce your current partner 💔"},
+    {name:"partner",       description:"Check who you (or someone else) are married to 💑",options:[{name:"user",description:"User to check (default: you)",type:6,required:false}]},
+    {name:"forcemarry",    description:"[Server Owner] Force marry two users 💍",options:[{name:"user1",description:"First user",type:6,required:true},{name:"user2",description:"Second user",type:6,required:true}]},
+    {name:"forcedivorce",  description:"[Server Owner] Force divorce a user 💔",options:[{name:"user",description:"User to divorce",type:6,required:true}]},
+    {name:"quote",     description:"Get a random quote image (ignores ratings) ✨"},
+    {name:"goodquote", description:"Get a top rated quote image ⭐"},
+    {name:"badquote",  description:"Get a bottom rated quote image 💀"},
+    {name:"echo",           description:"[Server Owner] Make the bot say something 📢",options:[
+  {name:"message",     description:"The text to send",                          type:3, required:false},
+  {name:"embed",       description:"Turn the message into a rich embed",         type:5, required:false},
+  {name:"image",       description:"Attach an image file",                       type:11,required:false},
+  {name:"title",       description:"Embed title (only used when embed is on)",   type:3, required:false},
+  {name:"color",       description:"Embed colour as hex e.g. #ff0000",           type:3, required:false},
+  {name:"replyto",     description:"Message ID to reply to in this channel",     type:3, required:false},
+]},
+    {name:"remind",         description:"Set a reminder ⏰",options:[{name:"time",description:"Time in minutes",type:4,required:true},{name:"message",description:"Reminder message",type:3,required:true}]},
+    {name:"premiere",       description:"Start a countdown to your video upload 🎬",options:[
+      {name:"hours",    description:"How many hours until the video releases",        type:10,required:true},
+      {name:"channel",  description:"Channel to post the countdown in",               type:7, required:true},
+      {name:"title",    description:"Video title (optional, shown in the countdown)", type:3, required:false},
+    ]},
+    {name:"messageschedule", description:"Schedule a message to be sent later as you, via webhook 📨",options:[
+      {name:"time",    description:"When to send it: e.g. 5 hours, 2 days, 1 month, 1 week", type:3, required:true},
+      {name:"message", description:"The message to send later",                              type:3, required:true},
+    ]},
+    {name:"serverinfo",     description:"Server information 🏠"},
+    {name:"botinfo",        description:"Bot information 🤖"},
+    {name:"help",           description:"Show all commands and how to use the bot 📖"},
+    {name:"xp",           description:"Check XP and level 📈",options:uReq(false)},
+    {name:"xpleaderboard",description:"XP leaderboard 🏆",options:[{name:"scope",description:"global or server",type:3,required:false,choices:[{name:"Global",value:"global"},{name:"Server",value:"server"}]}]},
+    {name:"score",            description:"Check game stats 🏆",options:uReq(false)},
+    {name:"leaderboard",      description:"Global leaderboard 🌍",options:[{name:"type",description:"Type",type:3,required:false,choices:[{name:"Wins",value:"wins"},{name:"Coins",value:"coins"},{name:"Streak",value:"streak"},{name:"Best Streak",value:"beststreak"},{name:"Games Played",value:"games"},{name:"Win Rate",value:"winrate"},{name:"Images Uploaded",value:"images"}]}]},
+    {name:"serverleaderboard",description:"Server leaderboard 🏠",options:[{name:"type",description:"Type",type:3,required:false,choices:[{name:"Wins",value:"wins"},{name:"Coins",value:"coins"},{name:"Streak",value:"streak"},{name:"Best Streak",value:"beststreak"},{name:"Games Played",value:"games"},{name:"Win Rate",value:"winrate"},{name:"Images Uploaded",value:"images"}]}]},
+    {name:"channelpicker",   description:"Set bot announcement channel (Manage Server)",options:[{name:"channel",description:"Channel",type:7,required:true},{name:"levelup",description:"Enable level up notifications? (default: true)",type:5,required:false}]},
+    {name:"counting",        description:"Set or remove a permanent counting channel (Manage Server)",options:[
+      {name:"action",        description:"What to do",type:3,required:true,choices:[{name:"Set this channel as a counting channel",value:"set"},{name:"Remove counting from this channel",value:"remove"},{name:"Check current count",value:"status"}]},
+    ]},
+    {name:"xpconfig",        description:"Configure level up notifications for this server (Manage Server)",options:[
+      {name:"setting",description:"What to configure",type:3,required:true,choices:[
+        {name:"View current config",              value:"show"},
+        {name:"Enable level up messages",         value:"enable"},
+        {name:"Disable level up messages",        value:"disable"},
+        {name:"Enable @mention ping on level up", value:"ping_on"},
+        {name:"Disable @mention ping on level up",value:"ping_off"},
+        {name:"Set level up message channel",     value:"set_channel"},
+        {name:"Reset to default channel",         value:"reset_channel"},
+      ]},
+      {name:"channel",description:"Channel to send level up messages to (only used with set_channel)",type:7,required:false},
+    ]},
+    {name:"setwelcome",      description:"Set welcome message (Manage Server)",options:[{name:"channel",description:"Channel",type:7,required:true},{name:"message",description:"Use {user} {server} {count}",type:3,required:false}]},
+    {name:"setleave",        description:"Set leave message (Manage Server)",options:[{name:"channel",description:"Channel",type:7,required:true},{name:"message",description:"Use {user} {server}",type:3,required:false}]},
+    {name:"disableownermsg", description:"Toggle bot owner broadcasts in this server (Manage Server)",options:[{name:"enabled",description:"Enable?",type:5,required:true}]},
+    {name:"serverconfig",    description:"View this server's current bot config (Manage Server)"},
+    {name:"autorole",        description:"Auto assign a role when someone joins (Manage Server)",options:[{name:"role",description:"Role to give (leave blank to disable)",type:8,required:false}]},
+    {name:"reactionrole",     description:"Manage reaction roles (Manage Server)",options:[{name:"action",description:"What to do",type:3,required:true,choices:[{name:"Add",value:"add"},{name:"Remove",value:"remove"},{name:"List",value:"list"},{name:"Auto Detect from Message",value:"auto"},{name:"Manual Builder",value:"manual"}]},{name:"messageid",description:"Message ID (for add/remove/auto/manual)",type:3,required:false},{name:"emoji",description:"Emoji (for add/remove)",type:3,required:false},{name:"role",description:"Role to give (for add)",type:8,required:false}]},
+    {name:"dropdownroles",   description:"Interactive dropdown-menu role builder, an upgrade to reaction roles (Manage Server)",options:[{name:"action",description:"What to do",type:3,required:true,choices:[{name:"Build",value:"build"},{name:"List",value:"list"},{name:"Delete a posted set",value:"delete"}]},{name:"setid",description:"Dropdown set ID (for delete, shown by List)",type:3,required:false}]},
+    {name:"setboostmsg",     description:"Set a server boost announcement message (Manage Server)",options:[{name:"channel",description:"Channel",type:7,required:true},{name:"message",description:"Use {user} {server}",type:3,required:false}]},
+    {name:"invitecomp",      description:"Start an invite competition (Manage Server)",options:[{name:"hours",description:"Duration in hours (1 to 720)",type:4,required:true}]},
+    {name:"purge",           description:"Delete messages in bulk (Manage Messages)",options:[
+      {name:"amount",      description:"Number of messages to scan (1 to 100)",  type:4,required:true},
+      {name:"filter",      description:"Only delete certain messages",         type:3,required:false,choices:[
+        {name:"Humans only",  value:"humans"},
+        {name:"Bots only",    value:"bots"},
+      ]},
+      {name:"contains",    description:"Only delete messages containing this word/phrase", type:3,required:false},
+    ]},
+    {name:"ticketsetup",     description:"Open the ticket system setup dashboard (Manage Server)"},
+    {name:"serverstats",     description:"Set up and manage live server stat channels 📊 (Manage Server)"},
+    {name:"closeticket",     description:"Close this ticket"},
+    {name:"addtoticket",     description:"Add a user to this ticket",options:[{name:"user",description:"User to add",type:6,required:true}]},
+    {name:"removefromticket",description:"Remove a user from this ticket",options:[{name:"user",description:"User to remove",type:6,required:true}]},
+    {name:"ytsetup",         description:"Connect a YouTube channel to this server (Manage Server)",options:[
+      {name:"channel",       description:"YouTube handle (@name), channel URL, or channel ID (UC…)", type:3,required:true},
+      {name:"discord_channel",description:"Discord channel to post YouTube updates in",              type:7,required:true},
+      {name:"apikey",        description:"Your YouTube Data API v3 key (stored securely in botdata)", type:3,required:false},
+    ]},
+    {name:"subgoal",         description:"Set a subscriber goal with a live progress bar (Manage Server)",options:[
+      {name:"goal",          description:"Target subscriber count (e.g. 10000)",                  type:4,required:true},
+      {name:"message",       description:"Custom message when goal is reached (optional)",         type:3,required:false},
+    ]},
+    {name:"subcount",        description:"Post a live sub count display that autoupdates (Manage Server)",options:[
+      {name:"threshold",     description:"Round display to nearest amount",                        type:3,required:true,choices:[{name:"Every 1K subs",value:"1000"},{name:"Every 10K subs",value:"10000"}]},
+    ]},
+    {name:"milestones",      description:"Manage subscriber milestone announcements (Manage Server)",options:[
+      {name:"action",        description:"What to do",                                             type:3,required:true,choices:[{name:"Add milestone",value:"add"},{name:"Remove milestone",value:"remove"},{name:"List milestones",value:"list"}]},
+      {name:"subs",          description:"Subscriber count for this milestone (for add/remove)",   type:4,required:false},
+      {name:"message",       description:"Custom announcement message (for add, optional)",        type:3,required:false},
+    ]},
+    {name:"servers",        description:"[Owner] List servers"},
+    {name:"fakemessage",    description:"[Server Owner] Send a message as another user via webhook",options:[{name:"user",description:"User to impersonate",type:6,required:true},{name:"message",description:"Message text to send",type:3,required:false},{name:"file",description:"File to send",type:11,required:false},{name:"mode",description:"Clankerify mode to apply to the message",type:3,required:false,choices:[{name:"No mode (plain)",value:"none"},{name:"Evil",value:"evil"},{name:"Freaky",value:"freaky"},{name:"American",value:"american"},{name:"British",value:"british"},{name:"Stupid",value:"stupid"},{name:"Boomer",value:"boomer"},{name:"Conspiracy",value:"conspiracy"},{name:"NPC",value:"npc"},{name:"Sigma",value:"sigma"},{name:"Medieval",value:"medieval"},{name:"Ghost",value:"ghost"},{name:"Pirate",value:"pirate"},{name:"RespawnRaccoon Propaganda",value:"rr_propaganda"},{name:"French",value:"french"},{name:"UWU / LOLCAT",value:"uwu"},{name:"Random",value:"random"}]}]},
+    {name:"fakequote",      description:"[Server Owner] Generate a 'Make it a Quote' style image card for a user",options:[
+      {name:"user",         description:"User to feature (pulls their avatar, username & display name)",type:6,required:true},
+      {name:"text",         description:"The quote text to display",type:3,required:true},
+      {name:"displayname",  description:"Override the displayed name (default: their server display name)",type:3,required:false},
+      {name:"username",     description:"Override the @username shown below the name (default: their actual username)",type:3,required:false},
+    ]},
+    {name:"paranoia",       description:"[Server Owner] Watch a user and reply to their messages with paranoia lines (run again to disarm)",options:[
+      {name:"user",         description:"Target user to haunt (run again on same user to disarm)",type:6,required:true},
+      {name:"chance",       description:"% chance each message triggers a reply (1 to 100, default 100)",type:4,required:false},
+    ]},
+    {name:"dmconfig",         description:"[Owner] Set up the DM relay server, or open a relay channel for a user",options:[
+      {name:"server",       description:"Server ID to use as the DM relay hub (run this once)",type:3,required:false},
+      {name:"user",         description:"Open (or jump back to) that user's relay channel",type:6,required:false},
+    ]},
+    {name:"leaveserver",    description:"[Owner] Leave a server",options:[{name:"server",description:"Server ID",type:3,required:true}]},
+    {name:"restart",        description:"[Owner] Restart"},
+    {name:"refreshcmds",    description:"[Server Owner] Force reregister slash commands in this guild"},
+    {name:"botstats",       description:"[Owner] Bot stats"},
+    {name:"setstatus",      description:"[Owner] Set status",options:[{name:"text",description:"Text",type:3,required:true},{name:"type",description:"Type",type:3,required:false,choices:[{name:"Playing",value:"PLAYING"},{name:"Watching",value:"WATCHING"},{name:"Listening",value:"LISTENING"},{name:"Competing",value:"COMPETING"}]}]},
+    {name:"adminconfig",      description:"[Owner] View/edit global config values",options:[{name:"key",description:"Config key (leave blank to list all)",type:3,required:false},{name:"value",description:"New integer value",type:4,required:false}]},
+    {name:"staffrole",        description:"Manage RA and LOA roles for a member",options:[
+      {name:"type",           description:"Which role",type:3,required:true,choices:[{name:"Reduced Activity",value:"ra"},{name:"Leave of Absence",value:"loa"}]},
+      {name:"user",           description:"Member",type:6,required:true},
+      {name:"action",         description:"Give or remove",type:3,required:true,choices:[{name:"Give",value:"give"},{name:"Remove",value:"remove"}]},
+      {name:"duration",       description:"Hours (optional: permanent if omitted)",type:4,required:false},
+    ]},
+    {name:"rolespingfix", description:"List roles that can @everyone and fix them (Manage Server)"},
+    {name:"shadowdelete", description:"[Server Owner] Randomly delete a % of a user's messages", options:[
+      {name:"user", description:"Target user", type:6, required:true},
+      {name:"percentage", description:"Delete chance % (0 to disable)", type:4, required:true},
+    ]},
+    {name:"clankerify", description:"[Server Owner] Resend a user's messages as a webhook impersonating them (this server only)", options:[
+      {name:"user",     description:"Target user",                                             type:6, required:true},
+      {name:"duration", description:"Duration in minutes (omit or 0 to disable)",              type:4, required:false},
+    ]},
+    {name:"impersonation", description:"[Server Owner] Resend a user's messages via webhook as someone/something else (this server only)", options:[
+      {name:"user",     description:"Target user whose messages get intercepted",                 type:6, required:true},
+      {name:"as_user",  description:"Impersonate as this user's name/avatar (can't combine with pfp/name)", type:6, required:false},
+      {name:"pfp",      description:"Custom profile picture for the webhook (can't combine with as_user)",  type:11, required:false},
+      {name:"name",     description:"Custom display name for the webhook (can't combine with as_user)",     type:3, required:false},
+      {name:"mode",     description:"Clankerify mode to apply to messages",type:3,required:false,choices:[{name:"No mode (plain)",value:"none"},{name:"Evil",value:"evil"},{name:"Freaky",value:"freaky"},{name:"American",value:"american"},{name:"British",value:"british"},{name:"Stupid",value:"stupid"},{name:"Boomer",value:"boomer"},{name:"Conspiracy",value:"conspiracy"},{name:"NPC",value:"npc"},{name:"Sigma",value:"sigma"},{name:"Medieval",value:"medieval"},{name:"Ghost",value:"ghost"},{name:"Pirate",value:"pirate"},{name:"RespawnRaccoon Propaganda",value:"rr_propaganda"},{name:"French",value:"french"},{name:"UWU / LOLCAT",value:"uwu"}]},
+      {name:"duration", description:"Duration in minutes (omit for permanent, 0 to disable)",  type:4, required:false},
+    ]},
+    {name:"thecount", description:"[Owner] Open (or reuse) a queue channel for a user: nothing sent there reaches them until /send", default_member_permissions:"0", options:[
+      {name:"user", description:"User to open a queue channel for", type:6, required:true},
+    ]},
+    {name:"send", description:"[Owner] Deliver every queued message across all /thecount channels to their respective users", default_member_permissions:"0", options:[]},
+    {name:"selfclank",  description:"Self clankerify yourself for 1–5 minutes (0 to cancel, 2 people per server at a time)",options:[
+      {name:"duration", description:"Duration in minutes (1–5), or 0 to cancel early",type:4,required:true},
+    ]},
+    {name:"upload",            description:"Upload an image, audio, or video file to quotes2",options:[
+      {name:"source",          description:"[Memers only] Upload a file directly from your device (image/audio/video)",type:11,required:false},
+      {name:"link",            description:"[Memers only] Submit a file via URL link (image/audio/video)",type:3,required:false},
+    ]},
+    {name:"requester", description:"[Owner] Set the global quote review channel (where /requestupload submissions go)",options:[
+      {name:"channel", description:"Text channel to receive quote submissions", type:7, required:true},
+    ]},
+    {name:"deleter", description:"[Owner] Set the global quote deleter channel (where flagged quotes go for review)",options:[
+      {name:"channel", description:"Text channel to receive flagged quotes", type:7, required:true},
+    ]},
+    {name:"emojisteal", description:"[Owner] Copy custom emojis to a destination server",options:[
+      {name:"server", description:"Server ID to set as the destination for copied emojis/stickers", type:3, required:false},
+      {name:"emojis", description:"Paste the custom emojis to copy to the destination server", type:3, required:false},
+    ]},
+    {name:"sotd", description:"[Server Owner] Set up the daily Song of the Day post"},
+    {name:"sotd-playlist", description:"[Server Owner] Manage the YouTube playlists SOTD pulls songs from"},
+    {name:"gifquality", description:"Convert a video or GIF to a GIF, picking quality and FPS",options:[
+      {name:"file", description:"An mp4 or a gif", type:11, required:true},
+    ]},
+    {name:"bansync", description:"[Server Owner] Keep bans in sync with another server (both owners link)",options:[
+      {name:"action", description:"What to do", type:3, required:true, choices:[
+        {name:"Link", value:"link"}, {name:"Unlink", value:"unlink"}, {name:"Sync Now", value:"sync"}, {name:"Status", value:"status"},
+      ]},
+      {name:"server_id", description:"The other server's ID (not needed for Status)", type:3, required:false},
+    ]},
+    {name:"announcementsync", description:"[Owner] Sync channels and roles between servers",options:[
+      {type:1, name:"channels", description:"Sync a channel here with a channel in another server", options:[
+        {name:"channel", description:"A channel in this server", type:7, required:true, channel_types:[0,5]},
+        {name:"other_channel_id", description:"The channel ID in the other server", type:3, required:true},
+      ]},
+      {type:1, name:"roles", description:"Sync a role here with a role in another server", options:[
+        {name:"role", description:"A role in this server", type:8, required:true},
+        {name:"other_role_id", description:"The role ID in the other server", type:3, required:true},
+      ]},
+      {type:1, name:"remove", description:"Remove a synced channel or role", options:[
+        {name:"channel", description:"A synced channel in this server", type:7, required:false, channel_types:[0,5]},
+        {name:"role", description:"A synced role in this server", type:8, required:false},
+      ]},
+      {type:1, name:"status", description:"Show everything that is synced"},
+    ]},
+    {name:"limitedrole", description:"[Manage Server] Cap how many people can hold a role at once",options:[
+      {name:"role", description:"The role to limit", type:8, required:true},
+      {name:"amount", description:"How many people can have it at once", type:4, required:true, min_value:1},
+    ]},
+    {name:"pass", description:"Pass a limited role you hold to someone else",options:[
+      {name:"user", description:"Who to pass it to", type:6, required:true},
+      {name:"role", description:"Which limited role, if you hold more than one", type:8, required:false},
+    ]},
+    {name:"extrachannels", description:"lazied out and decided to do it like ts",options:[
+      {name:"member_role", description:"The member role that normally sees channels", type:8, required:false},
+      {name:"extra_role", description:"The Extra channels role that gets access", type:8, required:false},
+    ]},
+    {name:"deactivatetoggle", description:"[Server Owner] Toggle a repeating 24h lockdown (blocks DMs, pauses invites)"},
+    {name:"quotesetup", description:"[Server Owner] Choose whether this server uses global quotes or its own quotes"},
+    {name:"requestedquotes", description:"[Server Owner] Set this server's quote request channel",options:[
+      {name:"channel", description:"Text channel for quote requests", type:7, required:true, channel_types:[0]},
+    ]},
+    {name:"deletedquotes", description:"[Server Owner] Set this server's flagged quote channel",options:[
+      {name:"channel", description:"Text channel for flagged quotes", type:7, required:true, channel_types:[0]},
+    ]},
+    {name:"globaltoggle", description:"[Server Owner] Switch this server between its own quotes and global quotes"},
+    {name:"quotemoderator", description:"[Server Owner] Give or remove quote moderator access in this server",options:[
+      {name:"user", description:"User to add or remove", type:6, required:true},
+    ]},
+    {name:"managememers",      description:"[Owner] Add or remove users from the upload allowlist",options:[
+      {name:"action",          description:"Add or remove",type:3,required:true,choices:[
+        {name:"Add",value:"add"},
+        {name:"Remove",value:"remove"},
+        {name:"List",value:"list"},
+      ]},
+      {name:"user",            description:"User to add or remove (not needed for list)",type:6,required:false},
+    ]},
+    {name:"quotemanage",       description:"[Owner] Manage quotes folder and settings",options:[
+      {name:"library",         description:"Browse, list, or delete quote images",type:1,options:[
+        {name:"action",        description:"What to do",type:3,required:true,choices:[
+          {name:"List all images",      value:"list"},
+          {name:"Delete an image",      value:"delete"},
+          {name:"Browse with preview",  value:"browse"},
+        ]},
+        {name:"filename",      description:"Exact filename (for delete)",type:3,required:false},
+        {name:"index",         description:"Start at image number (for browse, default: 1)",type:4,required:false},
+      ]},
+      {name:"trash-threshold", description:"Set how many 🗑️ reactions trigger a flag (default: 3)",type:1,options:[
+        {name:"amount",        description:"Number of reactions required (1–25)",type:4,required:true},
+      ]},
+      {name:"set-review-channel", description:"Set the channel where quote submissions are sent for review",type:1,options:[
+        {name:"channel",       description:"Channel to receive submissions",type:7,required:true},
+      ]},
+      {name:"set-delete-channel", description:"Set the channel where trashcan flagged quotes are sent for review",type:1,options:[
+        {name:"channel",       description:"Channel to receive flagged quotes",type:7,required:true},
+      ]},
+    ]},
+    {name:"dailyquote",        description:"Set up a daily quote post in a channel (Manage Server)",options:[
+      {name:"action",          description:"What to do",type:3,required:true,choices:[
+        {name:"Set channel",   value:"set"},
+        {name:"Disable",       value:"disable"},
+        {name:"Status",        value:"status"},
+      ]},
+      {name:"channel",         description:"Channel to post daily quotes in (required for set)",type:7,required:false},
+      {name:"hour",            description:"UTC hour to post (0–23, default: 9)",type:4,required:false},
+    ]},
+    {name:"library",           description:"Browse images a user has uploaded to the quotes folder",options:[
+      {name:"user",            description:"User whose uploads to browse",type:6,required:true},
+      {name:"page",            description:"Image number to jump to (default: 1)",type:4,required:false},
+    ]},
+    {name:"activity-check",   description:"Send an activity check (Manage Server)",options:[
+      {name:"channel",         description:"Channel to send the activity check in",type:7,required:true},
+      {name:"deadline",        description:"Hours until check closes (default: 24)",type:4,required:false},
+      {name:"message",         description:"Custom message text (optional)",type:3,required:false},
+      {name:"ping",            description:"Ping the required roles in the message? (default: true)",type:5,required:false},
+      {name:"schedule",        description:"Send automatically at this time every week (e.g. Monday 09:00)",type:3,required:false},
+    ]},
+    {name:"raconfig",         description:"Set up RA and LOA roles for this server (Manage Server)",options:[
+      {name:"action",          description:"What to do",type:3,required:true,choices:[
+        {name:"Create roles automatically",value:"create"},
+        {name:"Set existing RA role",value:"set_ra"},
+        {name:"Set existing LOA role",value:"set_loa"},
+        {name:"View current config",value:"view"},
+      ]},
+      {name:"role",            description:"Existing role to use (for set_ra / set_loa)",type:8,required:false},
+    ]},
+    { name:"Reaction Bomb",   type:3, default_member_permissions:"0" },
+    { name:"Clank This",      type:3, default_member_permissions:"0" },
+    { name:"Expose",          type:3, default_member_permissions:"0" },
+    { name:"Tomato This",     type:3 },
+    { name:"Vibe Check",      type:3 },
+    { name:"Uwu-ify",         type:3 },
+    { name:"Quote This",      type:3 },
+    { name:"Make it a quote", type:3 },
+    { name:"Fetch Emoji",     type:3 },
+    { name:"Steal Emojis",     type:3, default_member_permissions:"0" },
+    {name:"requestupload",   description:"Submit an image, audio, or video file to be reviewed for quotes2",options:[
+      {name:"source",description:"File to submit (image/audio/video)",type:11,required:true},
+    ]},
+    {name:"jarvisdatabase", description:"Upload an image, gif, or video straight to the Jarvis trigger folder",options:[
+      {name:"source",description:"File to upload (image/gif/video)",type:11,required:true},
+      {name:"name",  description:"Trigger word / filename to save it as: no extension needed",type:3,required:true},
+    ]},
+    {name:"pixeltxt", description:"Convert an image to a compressed PIXELTXT file, or turn one back into an image",options:[
+      {name:"action", description:"Structure an image into text, or destructure text back into an image", type:3, required:true, choices:[
+        {name:"Structure (image → text)", value:"structure"},
+        {name:"Destructure (text → image)", value:"destructure"},
+      ]},
+      {name:"file", description:"Image to structure, or a PIXELTXT .txt file to destructure", type:11, required:true},
+    ]},
+    {name:"clankerbuild", description:"Build or manage a custom clankerify personality mode",options:[
+      {name:"action",description:"What to do",type:3,required:true,choices:[
+        {name:"Create / Edit",value:"create"},
+        {name:"Delete",       value:"delete"},
+        {name:"List all",     value:"list"},
+      ]},
+    ]},
+    {name:"tempowner", description:"[Owner] Grant a user temporary or permanent owner access via an interactive picker",options:[
+      {name:"user",       description:"User to grant access to (leave blank to just view current grants)",type:6,required:false},
+    ]},
+    {name:"blacklist", description:"[Owner] Block a user from specific commands/features via an interactive picker",options:[
+      {name:"user",description:"User to configure (leave blank to just view current blacklist)",type:6,required:false},
+    ]},
+    {name:"theremnant", description:"[Owner] Send a mysterious dimensional transmission to this channel",options:[
+      {name:"message",description:"The text to transmit",type:3,required:true,max_length:1000},
+    ]},
+    {name:"jarvisenhance", description:"[Owner] Build a custom Jarvis trigger word that chains any bot action, in order",options:[
+      {name:"action",description:"What to do",type:3,required:true,choices:[
+        {name:"Create",       value:"create"},
+        {name:"Edit",         value:"edit"},
+        {name:"List all",     value:"list"},
+        {name:"Delete",       value:"delete"},
+      ]},
+      {name:"name",description:"Profile ID (required for create/edit/delete)",type:3,required:false},
+    ]},
+    {name:"jarvislist", description:"Show every image in the Jarvis folder: filename + preview, paginated"},
+    {name:"userprofile", description:"[Patreon] View your supporter profile, marriage, roles, quote stats, favorites etc"},
+    {name:"download", description:"Download a YouTube video as MP4 or MP3",options:[
+      {name:"url",        description:"YouTube video URL",type:3,required:true},
+      {name:"format",     description:"File format (default: MP4)",type:3,required:false,choices:[
+        {name:"MP4 (video)", value:"mp4"},
+        {name:"MP3 (audio)", value:"mp3"},
+      ]},
+      {name:"resolution", description:"Max video resolution, ignored for MP3 (default: 1080p)",type:3,required:false,choices:[
+        {name:"1080p", value:"1080p"},
+        {name:"720p",  value:"720p"},
+        {name:"480p",  value:"480p"},
+        {name:"360p",  value:"360p"},
+        {name:"240p",  value:"240p"},
+        {name:"144p",  value:"144p"},
+      ]},
+    ]}
+  ];
+}
+
+function buildGuildCommands()  { return buildCommands().filter(c => !OWNER_ONLY_CMDS.has(c.name)); }
+function buildGlobalCommands() { return buildCommands().filter(c =>  OWNER_ONLY_CMDS.has(c.name)); }
+
+// ── Command registration ──────────────────────────────────────────────────────
+function discordRequest(method, path, body) {
+  return new Promise((resolve, reject) => {
+    const noBody = method === "GET" || method === "DELETE";
+    const data   = noBody ? null : (body !== null && body !== undefined ? JSON.stringify(body) : "[]");
+    const headers = { Authorization: `Bot ${TOKEN}`, "Content-Type": "application/json" };
+    if (!noBody) headers["Content-Length"] = Buffer.byteLength(data);
+    const opts = { hostname: "discord.com", port: 443, path, method, headers };
+    const req = https.request(opts, res => {
+      let b = ""; res.on("data", c => b += c);
+      res.on("end", () => resolve({ status: res.statusCode, body: b }));
+    });
+    req.on("error", reject);
+    if (!noBody) req.write(data);
+    req.end();
+  });
+}
+
+// ── Command fingerprinting: skip reregistration if nothing changed (prevents 30034 daily limit) ──
+const crypto = require("crypto");
+const GUILD_CMD_HASH_FILE  = "./guild_cmd_hash.json";
+const GLOBAL_CMD_HASH_FILE = "./global_cmd_hash.json";
+
+function cmdHash(cmds) {
+  return crypto.createHash("sha1").update(JSON.stringify(cmds)).digest("hex");
+}
+function loadHashFile(file) {
+  try { return JSON.parse(fs.readFileSync(file, "utf8")); } catch { return {}; }
+}
+function saveHashFile(file, data) {
+  try { fs.writeFileSync(file, JSON.stringify(data)); } catch {} 
+}
+
+// ── Guild commands: nonowner only (keeps counts under guild limits: 100 chat_input, 5 context_menu) ──
+async function registerGuildCommands(guildId, force = false) {
+  try {
+    const cmds  = buildGuildCommands();
+    const hash  = cmdHash(cmds);
+    const store = loadHashFile(GUILD_CMD_HASH_FILE);
+    if (!force && store[guildId] === hash) {
+      console.log(`✅ Guild [${guildId}]: commands unchanged, skipping registration`);
+      return;
+    }
+    const r = await discordRequest("PUT", `/api/v10/applications/${CLIENT_ID}/guilds/${guildId}/commands`, cmds);
+    if (r.status === 200) {
+      store[guildId] = hash;
+      saveHashFile(GUILD_CMD_HASH_FILE, store);
+      console.log(`✅ Guild [${guildId}]: ${JSON.parse(r.body).length} commands registered`);
+    } else if (r.status === 429) {
+      let retryAfter = 5;
+      try { retryAfter = JSON.parse(r.body).retry_after || 5; } catch {}
+      console.warn(`⚠️ Guild [${guildId}]: HTTP 429, retrying in ${Math.ceil(retryAfter)}s…`);
+      await new Promise(res => setTimeout(res, (retryAfter + 1) * 1000));
+      const r2 = await discordRequest("PUT", `/api/v10/applications/${CLIENT_ID}/guilds/${guildId}/commands`, cmds);
+      if (r2.status === 200) {
+        store[guildId] = hash;
+        saveHashFile(GUILD_CMD_HASH_FILE, store);
+        console.log(`✅ Guild [${guildId}] (retry): ${JSON.parse(r2.body).length} commands registered`);
+      } else {
+        console.warn(`⚠️ Guild [${guildId}] retry HTTP ${r2.status}: ${r2.body.slice(0,300)}`);
+      }
+    } else if (r.body && r.body.includes("30034")) {
+      console.error(`❌ Guild [${guildId}]: daily command create limit reached (30034). Will retry on next restart after midnight UTC.`);
+    } else {
+      console.warn(`⚠️ registerGuildCommands [${guildId}] HTTP ${r.status}: ${r.body.slice(0,300)}`);
+    }
+  } catch(e) { console.warn(`registerGuildCommands [${guildId}]:`, e.message); }
+}
+
+// ── Global commands: owner only (registered once; ~1hr propagation, but only need reregistering when changed) ──
+async function registerGlobalCommands(force = false) {
+  try {
+    const cmds  = buildGlobalCommands();
+    const hash  = cmdHash(cmds);
+    const store = loadHashFile(GLOBAL_CMD_HASH_FILE);
+    if (!force && store["global"] === hash) {
+      console.log("✅ Global commands unchanged, skipping registration");
+      return;
+    }
+    const r = await discordRequest("PUT", `/api/v10/applications/${CLIENT_ID}/commands`, cmds);
+    if (r.status === 200) {
+      store["global"] = hash;
+      saveHashFile(GLOBAL_CMD_HASH_FILE, store);
+      console.log(`✅ Global: ${JSON.parse(r.body).length} commands registered`);
+    } else if (r.body && r.body.includes("30034")) {
+      console.error("❌ Global commands: daily command create limit reached (30034). Will retry on next restart after midnight UTC.");
+    } else {
+      console.warn(`⚠️ registerGlobalCommands HTTP ${r.status}: ${r.body.slice(0,300)}`);
+    }
+  } catch(e) { console.warn("registerGlobalCommands:", e.message); }
+}
+
+const registerGuildOnlyCommands = registerGuildCommands;
+
+// ── Bot events ────────────────────────────────────────────────────────────────
+client.once("ready", async () => {
+  console.log(`Not even sure that this is real: ${client.user.tag} [${INSTANCE_ID}] in ${client.guilds.cache.size} servers`);
+  try { const owner = await client.users.fetch(OWNER_ID); await acquireInstanceLock(owner); }
+  catch(e) { console.error("Lock error:", e); instanceLocked = true; }
+
+  commitStatusToGitHub().catch(()=>{});
+
+  (async () => {
+    const startTs = Math.floor(BOT_START_TIME / 1000);
+    const resetTs = Math.floor(RESTART_AT_MS / 1000);
+    const statusMsg = `Bot has been online since <t:${startTs}:f> (<t:${startTs}:R>)\nNext bot reset will be at <t:${resetTs}:f> (<t:${resetTs}:R>)`;
+    if (restartMessageId) {
+      const ok = await editWebhookMessage(restartMessageId, statusMsg);
+      if (!ok) restartMessageId = await postWebhookMessage(statusMsg);
+    } else {
+      restartMessageId = await postWebhookMessage(statusMsg);
+    }
+  })().catch(()=>{});
+
+  if (botStatus && botStatus.text) {
+    try { client.user.setActivity(botStatus.text, { type: botStatus.type }); }
+    catch(e) { console.error("Failed to restore persistent status:", e.message); }
+  }
+
+  fetchAllQuoteFiles().catch(e => console.error("Quote folder warm up failed:", e.message));
+
+  refreshPatreonMembers();
+  setInterval(refreshPatreonMembers, 60*60*1000);
+
+  try {
+    const emojiRes = await fetch(`https://discord.com/api/v10/applications/${CLIENT_ID}/emojis`, {
+      headers: { Authorization: `Bot ${TOKEN}` }
+    });
+    if (emojiRes.ok) {
+      const emojiData = await emojiRes.json();
+      const list = emojiData.items ?? emojiData;
+      for (const e of list) appEmojiCache.set(e.name, e);
+      console.log(`[emojis] Loaded ${appEmojiCache.size} app emoji(s): ${[...appEmojiCache.keys()].join(", ")}`);
+    } else {
+      console.warn("[emojis] Failed to fetch app emojis:", emojiRes.status);
+    }
+  } catch(e) { console.warn("[emojis] App emoji fetch error:", e.message); }
+
+  if (!instanceLocked) return;
+
+  await registerGlobalCommands();
+
+  const guilds = [...client.guilds.cache.values()];
+  for (let i = 0; i < guilds.length; i++) {
+    if (i > 0) await new Promise(res => setTimeout(res, 500));
+    await registerGuildCommands(guilds[i].id);
+  }
+
+  for (const guild of guilds) {
+    snapshotInvites(guild).catch(() => {});
+  }
+});
+
+client.on("guildBanAdd", async ban => {
+  const key = `${ban.guild.id}:${ban.user.id}:ban`;
+  if(banSyncSuppress.delete(key)) return;
+  for(const otherId of getBanSyncPartners(ban.guild.id)){
+    const other = client.guilds.cache.get(otherId);
+    if(!other) continue;
+    banSyncSuppressKey(otherId, ban.user.id, "ban");
+    try{ await other.members.ban(ban.user.id, { reason:`Ban sync from ${ban.guild.name}` }); }
+    catch(e){ console.error(`[bansync] ban ${ban.user.id} in ${otherId} failed:`, e.message); }
+  }
+});
+client.on("guildBanRemove", async ban => {
+  const key = `${ban.guild.id}:${ban.user.id}:unban`;
+  if(banSyncSuppress.delete(key)) return;
+  for(const otherId of getBanSyncPartners(ban.guild.id)){
+    const other = client.guilds.cache.get(otherId);
+    if(!other) continue;
+    banSyncSuppressKey(otherId, ban.user.id, "unban");
+    try{ await other.members.unban(ban.user.id, `Ban sync from ${ban.guild.name}`); }
+    catch(e){ if(e.code !== 10026) console.error(`[bansync] unban ${ban.user.id} in ${otherId} failed:`, e.message); }
+  }
+});
+
+client.on("messageCreate", async msg => {
+  try{
+    if(!msg.guild || msg.system || msg.channel?.isThread?.()) return;
+    if(msg.type !== "DEFAULT" && msg.type !== "REPLY") return;
+    if(msg.webhookId && syncWebhookIds.has(msg.webhookId)) return;
+    if(msg.author?.id === client.user.id) return;
+    const partnerId = announcementSyncChannels.get(msg.channelId);
+    if(!partnerId) return;
+    const target = client.channels.cache.get(partnerId);
+    if(!target?.guild) return;
+
+    const { text, pingRoles } = translateSyncContent(msg, target.guild);
+    const limit = getUploadLimitBytes(target.guild);
+    const files = [], links = [];
+    for(const att of msg.attachments.values()){
+      if(att.size <= limit && files.length < 10) files.push({ attachment: att.url, name: att.name });
+      else links.push(att.url);
+    }
+    const embeds = msg.embeds.filter(e => e.type === "rich").slice(0, 10).map(e => e.toJSON());
+    if(!text && !links.length && !files.length && !embeds.length) return;
+
+    let replyCtx = null;
+    if(msg.reference?.messageId){
+      const origin = syncMirrors.get(msg.reference.messageId);
+      const originHere = origin && origin.guildId === target.guild.id;
+      replyCtx = await buildWebhookReplyContext(msg, originHere
+        ? { url: `https://discord.com/channels/${origin.guildId}/${origin.channelId}/${origin.messageId}`, pingUserId: origin.authorId !== msg.author.id ? origin.authorId : null }
+        : { url: null, pingUserId: null });
+    }
+    const base = {
+      username: syncDisplayName(msg),
+      avatarURL: (msg.member || msg.author).displayAvatarURL({ dynamic:true, size:256 }),
+      allowedMentions: { parse:[], roles: pingRoles },
+    };
+    const build = (extraLinks, withFiles) => {
+      const payload = {
+        ...base,
+        content: [text, ...extraLinks].filter(Boolean).join("\n").slice(0, 2000) || undefined,
+        embeds: embeds.length ? embeds : undefined,
+        files: withFiles && files.length ? files : undefined,
+      };
+      if(replyCtx) applyWebhookReplyContext(payload, replyCtx);
+      return payload;
+    };
+    try{ rememberSyncMirror(await postSyncMessage(target, build(links, true)), msg); }
+    catch(e){
+      if(!files.length){ console.error("[announcementsync] send failed:", e.message); return; }
+      try{ rememberSyncMirror(await postSyncMessage(target, build([...links, ...files.map(f => f.attachment)], false)), msg); }
+      catch(e2){ console.error("[announcementsync] send failed:", e2.message); }
+    }
+  }catch(e){ console.error("[announcementsync] handler error:", e.message); }
+});
+client.on("guildMemberUpdate", (oldMember, newMember) => {
+  const limits = limitedRoles.get(newMember.guild.id);
+  if(!limits || oldMember.partial) return;
+  for(const [roleId, max] of Object.entries(limits)){
+    if(!newMember.roles.cache.has(roleId) || oldMember.roles.cache.has(roleId)) continue;
+    if(limitedRoleSuppress.delete(`${newMember.guild.id}:${newMember.id}:${roleId}`)) continue;
+    limitedRoleQueue = limitedRoleQueue.then(async () => {
+      const members = await newMember.guild.members.fetch();
+      if(!members.get(newMember.id)?.roles.cache.has(roleId)) return;
+      const holders = members.filter(m => m.roles.cache.has(roleId)).size;
+      if(holders > max) await newMember.roles.remove(roleId, `Limited role is capped at ${max}`);
+    }).catch(e => console.error("[limitedrole] cap check failed:", e.message));
+  }
+});
+
+client.on("guildCreate", async g => {
+  console.log(`Joined: ${g.name} (${g.id})`);
+  await registerGuildOnlyCommands(g.id);
+  snapshotInvites(g).catch(() => {});
+});
+
+client.on("guildMemberAdd",async member=>{
+  if(inviteComps.has(member.guild.id)||inviteCache.has(member.guild.id))
+    snapshotInvites(member.guild).catch(()=>{});
+  const roleId=autoRoles.get(member.guild.id);
+  if(roleId){try{const role=member.guild.roles.cache.get(roleId);if(role)await member.roles.add(role);}catch{}}
+  const cfg=welcomeChannels.get(member.guild.id);if(!cfg)return;
+  const ch=member.guild.channels.cache.get(cfg.channelId);if(!ch)return;
+  const msg=(cfg.message||"Welcome to **{server}**, {user}! 🎉 You are member #{count}.").replace("{user}",`<@${member.user.id}>`).replace("{server}",member.guild.name).replace("{count}",member.guild.memberCount);
+  await safeSend(ch,msg);
+});
+client.on("guildMemberRemove",async member=>{
+  const cfg=leaveChannels.get(member.guild.id);if(!cfg)return;
+  const ch=member.guild.channels.cache.get(cfg.channelId);if(!ch)return;
+  const msg=(cfg.message||"**{user}** has left **{server}**. 👋").replace("{user}",member.user.username).replace("{server}",member.guild.name);
+  await safeSend(ch,msg);
+});
+client.on("guildMemberUpdate",async(oldMember,newMember)=>{
+  if(!oldMember.premiumSince&&newMember.premiumSince){
+    recordBoost(newMember.guild.id, newMember.id);
+    const cfg=boostChannels.get(newMember.guild.id);if(!cfg)return;
+    const ch=newMember.guild.channels.cache.get(cfg.channelId);if(!ch)return;
+    const msg=(cfg.message||"🚀 **{user}** just boosted **{server}**! Thank you! 💜").replace("{user}",`<@${newMember.user.id}>`).replace("{server}",newMember.guild.name);
+    await safeSend(ch,msg);
+  }
+});
+
+// ── Emoji helpers ─────────────────────────────────────────────────────────────
+function resolveEmoji(name, msg) {
+  const appEmoji = appEmojiCache.get(name);
+  if (appEmoji) return `${appEmoji.name}:${appEmoji.id}`;
+  const search = g => g.emojis.cache.find(e => e.name === name);
+  const fromGuild = msg.guild ? search(msg.guild) : null;
+  if (fromGuild) return fromGuild;
+  for (const g of client.guilds.cache.values()) {
+    const found = search(g);
+    if (found) return found;
+  }
+  return name;
+}
+
+// ── Quote vote buttons ────────────────────────────────────────────────────────
+function findQuoteUploader(filename) {
+  for (const [userId, s] of scores) {
+    if (Array.isArray(s.uploadedImages) && s.uploadedImages.includes(filename)) return userId;
+  }
+  return null;
+}
+
+const QUOTE_NEW_BUTTON = {
+  quote: { label: "New quote",      emoji: "✨" },
+  good:  { label: "New good quote", emoji: "⭐" },
+  bad:   { label: "New bad quote",  emoji: "💀" },
+};
+
+function makeQuoteVoteButtons(msgId, votes, trashData) {
+  const v      = votes || { up: 0, down: 0 };
+  const trash  = trashData?.voters?.size ?? 0;
+  const type   = trashData?.type || "quote";
+  const goodE  = appEmojiCache.get("goodquote");
+  const badE   = appEmojiCache.get("badquote");
+  const trashE = appEmojiCache.get("raccoontrashcan");
+  const newBtn = QUOTE_NEW_BUTTON[type] || QUOTE_NEW_BUTTON.quote;
+  return [
+    new MessageActionRow().addComponents(
+      new MessageButton()
+        .setCustomId(`qvote_up_${msgId}`)
+        .setLabel(String(v.up))
+        .setStyle("SUCCESS")
+        .setEmoji(goodE  ? { id: goodE.id,  name: goodE.name  } : { name: "👍" }),
+      new MessageButton()
+        .setCustomId(`qvote_down_${msgId}`)
+        .setLabel(String(v.down))
+        .setStyle("DANGER")
+        .setEmoji(badE   ? { id: badE.id,   name: badE.name   } : { name: "👎" }),
+      new MessageButton()
+        .setCustomId(`qvote_trash_${msgId}`)
+        .setLabel(String(trash))
+        .setStyle("SECONDARY")
+        .setEmoji(trashE ? { id: trashE.id, name: trashE.name } : { name: "🗑️" }),
+      new MessageButton()
+        .setCustomId(`qvote_who_${msgId}`)
+        .setLabel("Who?")
+        .setStyle("SECONDARY")
+        .setEmoji({ name: "👥" }),
+      new MessageButton()
+        .setCustomId(`qvote_uploader_${msgId}`)
+        .setLabel("Uploader")
+        .setStyle("SECONDARY")
+        .setEmoji({ name: "🖼️" }),
+    ),
+    new MessageActionRow().addComponents(
+      new MessageButton()
+        .setCustomId(`qnew_${type}`)
+        .setLabel(newBtn.label)
+        .setStyle("PRIMARY")
+        .setEmoji({ name: newBtn.emoji }),
+      new MessageButton()
+        .setCustomId(`qfav_${msgId}`)
+        .setLabel("Favorite")
+        .setStyle("SECONDARY")
+        .setEmoji({ name: "⭐" }),
+    ),
+  ];
+}
+
+// ── Library embed & components ────────────────────────────────────────────────
+async function buildLibraryEmbed(displayName, avatarUrl, fileName, idx, total) {
+  if (!quoteFileFolderCache.has(fileName)) await resolveQuoteGhPath(fileName).catch(()=>{});
+  return {
+    embeds: [{
+      author: { name: `${displayName}'s Library`, icon_url: avatarUrl || undefined },
+      title: fileName,
+      image: { url: quoteRawUrl(fileName) },
+      color: 0x5865F2,
+      footer: { text: `Image ${idx + 1} of ${total}` },
+    }],
+  };
+}
+function makeLibraryButtons(targetUserId, idx, total, flagged) {
+  const trashE = appEmojiCache.get("raccoontrashcan");
+  return [
+    new MessageActionRow().addComponents(
+      new MessageButton().setCustomId(`lib_prev_${targetUserId}_${idx}`).setLabel("◀ Prev").setStyle("SECONDARY").setDisabled(idx===0),
+      new MessageButton().setCustomId(`lib_goto_${targetUserId}_${idx}`).setLabel("🔢 Go to #").setStyle("PRIMARY"),
+      new MessageButton().setCustomId(`lib_next_${targetUserId}_${idx}`).setLabel("Next ▶").setStyle("SECONDARY").setDisabled(total<=1||idx>=total-1),
+    ),
+    new MessageActionRow().addComponents(
+      new MessageButton()
+        .setCustomId(`libflag_${targetUserId}_${idx}`)
+        .setLabel(flagged ? "Sent for Review" : "Flag for Review")
+        .setStyle(flagged ? "SECONDARY" : "DANGER")
+        .setEmoji(trashE ? { id: trashE.id, name: trashE.name } : { name: "🗑️" })
+        .setDisabled(!!flagged),
+      new MessageButton()
+        .setCustomId(`libfav_${targetUserId}`)
+        .setLabel("Favorites")
+        .setStyle("SECONDARY")
+        .setEmoji({ name:"⭐" }),
+    ),
+  ];
+}
+
+function buildFavoriteLibraryButtons(idx, total, backToUserId) {
+  return [
+    new MessageActionRow().addComponents(
+      new MessageButton().setCustomId(`flib_prev_${backToUserId}_${idx}`).setLabel("◀ Prev").setStyle("SECONDARY").setDisabled(idx===0),
+      new MessageButton().setCustomId(`flib_next_${backToUserId}_${idx}`).setLabel("Next ▶").setStyle("SECONDARY").setDisabled(total<=1||idx>=total-1),
+      new MessageButton().setCustomId(`flib_unfav_${backToUserId}_${idx}`).setLabel("Remove Favorite").setStyle("DANGER").setEmoji({ name:"⭐" }),
+      new MessageButton().setCustomId(`flib_back_${backToUserId}`).setLabel("◀ Back to Library").setStyle("PRIMARY"),
+    ),
+  ];
+}
+
+// ── Reaction roles ────────────────────────────────────────────────────────────
+function emojiKey(reaction){
+  if(reaction.emoji.id) return `${reaction.emoji.name}:${reaction.emoji.id}`;
+  return reaction.emoji.name||reaction.emoji.toString();
+}
+
+client.on("messageReactionAdd", async (reaction, user) => {
+  if(user.bot) return;
+
+  try {
+    if(reaction.partial) await reaction.fetch();
+  } catch(e) { console.error("[RR] reaction fetch failed:", e.message); return; }
+  try {
+    if(reaction.message.partial) await reaction.message.fetch();
+  } catch(e) { console.error("[RR] message fetch failed:", e.message); return; }
+
+  const guildId = reaction.message.guildId;
+  if(!guildId) return;
+
+  // ── Reaction roles ────────────────────────────────────────────────────────────
+  const eKey = emojiKey(reaction);
+  const key = `${guildId}:${reaction.message.id}:${eKey}`;
+  const roleId = reactionRoles.get(key);
+  if(!roleId) return;
+
+  console.log(`[RR] add: key=${key} roleId=${roleId} user=${user.id}`);
+  try {
+    const guild = client.guilds.cache.get(guildId);
+    if(!guild) { console.error("[RR] guild not in cache:", guildId); return; }
+    const member = await guild.members.fetch(user.id).catch(e => { console.error("[RR] member fetch failed:", e.message); return null; });
+    if(!member) return;
+    const role = guild.roles.cache.get(roleId) || await guild.roles.fetch(roleId).catch(()=>null);
+    if(!role) { console.error("[RR] role not found:", roleId); return; }
+    await member.roles.add(role);
+    console.log(`[RR] ✅ Added role ${role.name} to ${user.tag||user.id}`);
+    user.send({content:`Applied ${role.name}, if you apply a role and don't get this message, try again shortly.`}).catch(()=>{});
+  } catch(e) { console.error("[RR] reactionRoleAdd error:", e.message); }
+});
+
+client.on("messageReactionRemove", async (reaction, user) => {
+  if(user.bot) return;
+
+  try {
+    if(reaction.partial) await reaction.fetch();
+  } catch(e) { console.error("[RR] reaction fetch failed:", e.message); return; }
+  try {
+    if(reaction.message.partial) await reaction.message.fetch();
+  } catch(e) { console.error("[RR] message fetch failed:", e.message); return; }
+
+  const guildId = reaction.message.guildId;
+  if(!guildId) return;
+
+  // ── Reaction roles ────────────────────────────────────────────────────────────
+  const eKey = emojiKey(reaction);
+  const key = `${guildId}:${reaction.message.id}:${eKey}`;
+  const roleId = reactionRoles.get(key);
+  if(!roleId) return;
+
+  console.log(`[RR] remove: key=${key} roleId=${roleId} user=${user.id}`);
+  try {
+    const guild = client.guilds.cache.get(guildId);
+    if(!guild) { console.error("[RR] guild not in cache:", guildId); return; }
+    const member = await guild.members.fetch(user.id).catch(e => { console.error("[RR] member fetch failed:", e.message); return null; });
+    if(!member) return;
+    const role = guild.roles.cache.get(roleId) || await guild.roles.fetch(roleId).catch(()=>null);
+    if(!role) { console.error("[RR] role not found:", roleId); return; }
+    await member.roles.remove(role);
+    console.log(`[RR] ✅ Removed role ${role.name} from ${user.tag||user.id}`);
+  } catch(e) { console.error("[RR] reactionRoleRemove error:", e.message); }
+});
+
+// ── DM forwarding ──────────────────────────────────────────────────────────────
+client.on("messageCreate", async msg => {
+  if (msg.author.bot) return;
+  if (isFullyBlacklisted(msg.author.id)) return;
+  if (msg.guild) {
+  } else {
+    if (OWNER_IDS.includes(msg.author.id)) return;
+
+    // ── DM relay: forward to this user's relay channel, autocreating it on their first DM ──
+    try {
+      const relayChannel = await ensureDmRelayChannel(msg.author).catch(() => null);
+      if (relayChannel) {
+        const files = msg.attachments.size > 0 ? [...msg.attachments.values()].map(a => a.url) : undefined;
+        if (msg.content || files) await relayChannel.send({ content: msg.content || undefined, files });
+        if (msg.stickers.size > 0) {
+          await relayChannel.send(msg.stickers.map(s => `🎭 **Sticker:** ${s.name}`).join("\n")).catch(() => {});
+        }
+        return;
+      }
+    } catch(e) { console.error("dmRelay (DM→channel) forward error:", e.message); }
+
+    try {
+      const owner = await client.users.fetch(OWNER_ID);
+      const ownerDM = await owner.createDM();
+      const displayName = msg.member?.displayName || msg.author.displayName || msg.author.globalName || msg.author.username;
+      const header =
+        `📬 **DM received**\n` +
+        `👤 **Display name:** ${displayName}\n` +
+        `🔖 **Username:** @${msg.author.username}\n` +
+        `🆔 **User ID:** \`${msg.author.id}\`\n` +
+        `📅 <t:${Math.floor(msg.createdTimestamp / 1000)}:f>`;
+      await ownerDM.send({ content: header });
+      if (msg.content && msg.content.trim().length > 0) {
+        await ownerDM.send({ content: `💬 **Message:**\n${msg.content}` });
+      }
+      if (msg.attachments.size > 0) {
+        for (const att of msg.attachments.values()) {
+          await ownerDM.send({ content: `📎 **Attachment:** \`${att.name}\` (${att.contentType || "unknown type"})`, files: [att.url] })
+            .catch(async () => { await ownerDM.send({ content: `📎 **Attachment (link):** ${att.url}` }).catch(() => {}); });
+        }
+      }
+      if (msg.stickers.size > 0) {
+        const stickerList = msg.stickers.map(s => `🎭 **Sticker:** ${s.name}`).join("\n");
+        await ownerDM.send({ content: stickerList });
+      }
+      if (msg.embeds.length > 0) {
+        for (const embed of msg.embeds) {
+          const embedInfo = [embed.title?`**${embed.title}**`:null,embed.description,embed.url?embed.url:null].filter(Boolean).join("\n");
+          if (embedInfo.trim()) await ownerDM.send({ content: `🔗 **Embed:**\n${embedInfo.slice(0, 1900)}` }).catch(() => {});
+        }
+      }
+    } catch(e) { console.error("DM forwarding error:", e.message); }
+    return;
+  }
+});
+
+client.on("messageCreate",async msg=>{
+  if(msg.author.bot||!msg.guild)return;
+
+  // ── Blacklist: blocks all guild message based features ────────────────────
+  if(isFullyBlacklisted(msg.author.id)){
+    if(countingChannels.has(msg.channelId) && !isSilentBlacklisted(msg.author.id)){
+      await safeSend(msg.channel,`${msg.author} is blacklisted from RoyalBot and cannot count, ignore this message`);
+    }
+    return;
+  }
+
+  // ── DM relay: messages sent in a user's relay channel get DMed to them ─────
+  if(msg.guildId === dmRelayGuildId){
+    const relayUserId = dmRelayChannelsByChannel.get(msg.channelId);
+    if(relayUserId){
+      if(isFullyBlacklisted(relayUserId)){
+        if(!isSilentBlacklisted(relayUserId)) await msg.react("🚫").catch(() => {});
+        return;
+      }
+      try{
+        const files = msg.attachments.size > 0 ? [...msg.attachments.values()].map(a => a.url) : undefined;
+        if(msg.content || files){
+          const user = await client.users.fetch(relayUserId);
+          await user.send({ content: msg.content || undefined, files });
+          await msg.react("✅").catch(() => {});
+        }
+      }catch(e){
+        console.error("dmRelay (channel→DM) forward error:", e.message);
+        await msg.react("❌").catch(() => {});
+      }
+      return;
+    }
+  }
+
+  const shadowPct=shadowDelete.get(scopedKey(msg.guild.id, msg.author.id));
+  if(shadowPct&&Math.random()*100<shadowPct){
+    msg.delete().then(()=>sendDeleteFlavorLine(msg.channel)).catch(()=>{});
+  }
+
+  // ── Clankerify: delete message and resend via webhook as the user ───────────
+  const clankKey = scopedKey(msg.guild.id, msg.author.id);
+  const clankEntry = clankerify.get(clankKey);
+  if(clankEntry){
+    const now = Date.now();
+    if(clankEntry.expiresAt !== null && clankEntry.expiresAt <= now){
+      clankerify.delete(clankKey);
+      saveData();
+    } else {
+      try {
+        const content       = msg.content || null;
+        const attachEntries = [...msg.attachments.values()];
+        const stickers      = [...msg.stickers.values()].map(s => s.name);
+
+        const attachFiles = [];
+        for (const att of attachEntries) {
+          try {
+            const res = await fetch(att.url);
+            if (res.ok) {
+              const buf = Buffer.from(await res.arrayBuffer());
+              attachFiles.push({ attachment: buf, name: att.name || "file" });
+            }
+          } catch(e) { console.error("[clank attach download]", e.message); }
+        }
+
+        await msg.delete().catch(()=>{});
+
+        const member = await msg.guild.members.fetch(msg.author.id).catch(()=>null);
+        const originalName = member?.displayName || msg.author.displayName || msg.author.globalName || msg.author.username;
+        const originalAvatarURL = msg.author.displayAvatarURL({ size: 256, dynamic: true });
+
+        // ── Persona override (set by /impersonation: plain /clankerify and /selfclank never set these) ──
+        let displayName, avatarURL;
+        if(clankEntry.impersonateAsUserId){
+          const asUser   = await client.users.fetch(clankEntry.impersonateAsUserId).catch(()=>null);
+          const asMember = asUser ? await msg.guild.members.fetch(asUser.id).catch(()=>null) : null;
+          displayName = asMember?.displayName || asUser?.displayName || asUser?.globalName || asUser?.username || originalName;
+          avatarURL   = asUser?.displayAvatarURL({ size: 256, dynamic: true }) || originalAvatarURL;
+        } else {
+          displayName = clankEntry.impersonateName || originalName;
+          avatarURL   = clankEntry.impersonateAvatarURL || originalAvatarURL;
+        }
+        let sendContent = content;
+
+        // ── Mode transforms ────────────────────────────────────────────────────
+        const mode = clankEntry.mode ?? null;
+
+        if(mode === "evil"){
+          displayName = `Evil ${displayName}`;
+          if(sendContent) sendContent = sendContent + " I'M SO EVIL THOOO";
+        }
+
+        if(mode === "freaky"){
+          displayName = `𝓕𝓻𝓮𝓪𝓴𝔂 ${displayName}`;
+          if(sendContent) sendContent = `𝓕𝓻𝓮𝓪𝓴𝔂 ${sendContent}`;
+        }
+
+        if(mode === "american"){
+          displayName = `American ${displayName}`;
+          if(sendContent){
+            sendContent = sendContent.toUpperCase() +
+              " LAWD BLESS MERICA 🦅🦅🦅🔥🔥🔥🇺🇸🇺🇸🇺🇸";
+          }
+        }
+
+        if(mode === "british"){
+          displayName = `${displayName} innit`;
+          if(sendContent){
+            const britishSwaps = [
+              [/\btrash\b/gi,"rubbish"],[/\bgarbage\b/gi,"rubbish"],[/\bjunk\b/gi,"rubbish"],
+              [/\belevator\b/gi,"lift"],[/\bapartment\b/gi,"flat"],[/\bcondo\b/gi,"flat"],
+              [/\bcookies\b/gi,"biscuits"],[/\bcandy\b/gi,"sweets"],[/\bchocolate bar\b/gi,"chocolate bar"],
+              [/\bchips\b/gi,"crisps"],[/\bfries\b/gi,"chips"],[/\bfrench fries\b/gi,"chips"],
+              [/\bcell phone\b/gi,"mobile"],[/\bphone\b/gi,"mobile"],[/\bsidewalk\b/gi,"pavement"],
+              [/\bgas\b/gi,"petrol"],[/\btrunk\b/gi,"boot"],[/\bhood\b/gi,"bonnet"],
+              [/\bdiaper\b/gi,"nappy"],[/\bvacation\b/gi,"holiday"],[/\bmath\b/gi,"maths"],
+              [/\bfreeway\b/gi,"motorway"],[/\bhighway\b/gi,"motorway"],[/\bsoccer\b/gi,"football"],
+              [/\bstore\b/gi,"shop"],[/\bsupermarket\b/gi,"Tesco"],[/\bgrocery store\b/gi,"Tesco"],
+              [/\bsneakers\b/gi,"trainers"],[/\btennis shoes\b/gi,"trainers"],[/\bshoes\b/gi,"trainers"],
+              [/\bpants\b/gi,"trousers"],[/\bunderwear\b/gi,"pants"],[/\bboxers\b/gi,"pants"],
+              [/\bjacket\b/gi,"jumper"],[/\bsweater\b/gi,"jumper"],[/\bhoodie\b/gi,"hoodie"],
+              [/\bsub\b/gi,"sarnie"],[/\bsandwich\b/gi,"sarnie"],[/\bwrap\b/gi,"sarnie"],
+              [/\bfries\b/gi,"chips"],[/\bketchup\b/gi,"tomato sauce"],[/\bbeer\b/gi,"lager"],
+              [/\bdrunk\b/gi,"bladdered"],[/\bwasted\b/gi,"absolutely munted"],[/\btipsy\b/gi,"squiffy"],
+              [/\bbar\b/gi,"pub"],[/\bclub\b/gi,"nightclub"],[/\bparty\b/gi,"do"],
+              [/\brestaurant\b/gi,"restaurant"],[/\btakeout\b/gi,"takeaway"],[/\btakeaway\b/gi,"takeaway"],
+              [/\bpizza\b/gi,"pizza"],[/\bmeal\b/gi,"tea"],[/\bdinner\b/gi,"tea"],[/\blunch\b/gi,"dinner"],
+              [/\bbreakfast\b/gi,"brekkie"],[/\bcoffee\b/gi,"cuppa"],[/\btea\b/gi,"cuppa"],
+              [/\bdumb\b/gi,"daft"],[/\bstupid\b/gi,"daft"],[/\bidiot\b/gi,"muppet"],
+              [/\bcrazy\b/gi,"mental"],[/\binsane\b/gi,"absolutely mental"],[/\bwild\b/gi,"mental"],
+              [/\bcool\b/gi,"brilliant"],[/\bawesome\b/gi,"dead brilliant"],[/\bamazing\b/gi,"well good"],
+              [/\bgreat\b/gi,"proper"],[/\bgood\b/gi,"sound"],[/\bfine\b/gi,"alright"],
+              [/\bbad\b/gi,"rubbish"],[/\bterrible\b/gi,"absolute mince"],[/\bawful\b/gi,"dreadful"],
+              [/\bgross\b/gi,"minging"],[/\bdisgusting\b/gi,"absolutely minging"],[/\bsick\b/gi,"well dodgy"],
+              [/\bweird\b/gi,"well dodgy"],[/\bsketchy\b/gi,"dodgy"],[/\bshady\b/gi,"well dodgy"],
+              [/\btired\b/gi,"knackered"],[/\bexhausted\b/gi,"absolutely knackered"],[/\bbored\b/gi,"bored off me head"],
+              [/\bangry\b/gi,"well narked"],[/\bfurious\b/gi,"absolutely livid"],[/\bupset\b/gi,"proper gutted"],
+              [/\bhappy\b/gi,"chuffed"],[/\bexcited\b/gi,"dead chuffed"],[/\bproud\b/gi,"well chuffed"],
+              [/\bscared\b/gi,"bricking it"],[/\bterrified\b/gi,"absolutely bricking it"],[/\bnervous\b/gi,"proper bricking it"],
+              [/\bconfused\b/gi,"proper muddled"],[/\blost\b/gi,"all at sea"],[/\bstuck\b/gi,"proper stuck"],
+              [/\bbig\b/gi,"massive"],[/\bhuge\b/gi,"absolutely massive"],[/\btiny\b/gi,"wee"],
+              [/\bsmall\b/gi,"wee"],[/\ba lot\b/gi,"loads"],[/\bmany\b/gi,"loads of"],
+              [/\bvery\b/gi,"dead"],[/\breally\b/gi,"proper"],[/\bso\b/gi,"well"],
+              [/\bactually\b/gi,"to be fair"],[/\bhonestly\b/gi,"hand on heart"],[/\bbasically\b/gi,"right so"],
+              [/\bguy\b/gi,"bloke"],[/\bdude\b/gi,"geezer"],[/\bman\b/gi,"lad"],
+              [/\bfriend\b/gi,"mate"],[/\bbuddy\b/gi,"mate"],[/\bpal\b/gi,"mate"],
+              [/\bgirl\b/gi,"lass"],[/\bwoman\b/gi,"bird"],[/\bwife\b/gi,"missus"],
+              [/\bgirlfriend\b/gi,"missus"],[/\bboyfriend\b/gi,"fella"],[/\bhusband\b/gi,"fella"],
+              [/\bboss\b/gi,"gaffer"],[/\bkid\b/gi,"nipper"],[/\bchild\b/gi,"nipper"],
+              [/\bbaby\b/gi,"bairn"],[/\bgrandma\b/gi,"nan"],[/\bgrandpa\b/gi,"grandad"],
+              [/\bmom\b/gi,"mum"],[/\bdad\b/gi,"dad"],[/\bbrother\b/gi,"bruv"],[/\bsis\b/gi,"sis"],
+              [/\bokay\b/gi,"alright"],[/\bok\b/gi,"alright"],[/\byes\b/gi,"aye"],[/\byeah\b/gi,"aye"],
+              [/\bno\b/gi,"nah"],[/\bnope\b/gi,"nah mate"],[/\bsure\b/gi,"go on then"],
+              [/\bwhat\b/gi,"pardon"],[/\bhuh\b/gi,"eh"],[/\bwhy\b/gi,"how come"],
+              [/\bseriously\b/gi,"blimey"],[/\bwow\b/gi,"cor blimey"],[/\bomg\b/gi,"bloody hell"],
+              [/\bwtf\b/gi,"what in the bloody hell"],[/\blol\b/gi,"ha"],[/\blmao\b/gi,"hahahaha"],
+              [/\bbye\b/gi,"cheerio"],[/\bgoodbye\b/gi,"cheerio"],[/\bsee ya\b/gi,"ta-ra"],
+              [/\bhello\b/gi,"alright"],[/\bhi\b/gi,"alright"],[/\bhey\b/gi,"oi oi"],
+              [/\bsorry\b/gi,"sorry mate"],[/\bthanks\b/gi,"cheers"],[/\bthank you\b/gi,"cheers"],
+              [/\bplease\b/gi,"go on"],[/\bhelp\b/gi,"sort out"],[/\bfix\b/gi,"sort out"],
+              [/\bgo\b/gi,"crack on"],[/\bstart\b/gi,"crack on"],[/\bstop\b/gi,"pack it in"],
+              [/\bshut up\b/gi,"do one"],[/\bget out\b/gi,"do one"],[/\bleave\b/gi,"do one"],
+              [/\bmess up\b/gi,"cock up"],[/\bscrew up\b/gi,"cock up"],[/\bfailed\b/gi,"cocked it up"],
+              [/\bsleep\b/gi,"kip"],[/\bnap\b/gi,"kip"],[/\bwork\b/gi,"graft"],[/\bjob\b/gi,"graft"],
+              [/\bsteal\b/gi,"nick"],[/\btook\b/gi,"nicked"],[/\btook it\b/gi,"nicked it"],
+              [/\bhit\b/gi,"lamp"],[/\bpunch\b/gi,"lamp"],[/\bfight\b/gi,"ruck"],
+              [/\bnot sure\b/gi,"dunno"],[/\bI don't know\b/gi,"dunno"],[/\bidk\b/gi,"dunno"],
+              [/\bthat's right\b/gi,"innit"],[/\bexactly\b/gi,"innit"],[/\bfor sure\b/gi,"dead right"],
+              [/\bI think\b/gi,"reckon"],[/\bI believe\b/gi,"reckon"],[/\bmaybe\b/gi,"might do"],
+              [/\bcan't\b/gi,"can't be arsed"],[/\bwon't\b/gi,"ain't gonna"],[/\bdon't\b/gi,"ain't"],
+              [/\bI am\b/gi,"I'm"],[/\bI'm going\b/gi,"I'm off"],[/\bI'm leaving\b/gi,"I'm off"],
+              [/\bneed to\b/gi,"need to sort"],[/\bhave to\b/gi,"gotta"],
+              [/\bwait\b/gi,"hang on"],[/\bhold on\b/gi,"hang on a sec"],
+              [/\bcome on\b/gi,"get a move on"],[/\bhurry\b/gi,"get a shift on"],
+              [/\bnonsense\b/gi,"bollocks"],[/\bBS\b/g,"bollocks"],[/\blies\b/gi,"absolute bollocks"],
+              [/\bproblem\b/gi,"faff"],[/\bissue\b/gi,"faff"],[/\bmess\b/gi,"shambles"],
+              [/\bhe's\b/gi,"he's"],[/\bshe's\b/gi,"she's"],[/\bthey're\b/gi,"they're"],
+              [/\bI've\b/gi,"I've"],[/\bwe've\b/gi,"we've"],[/\byou've\b/gi,"you've"],
+            ];
+            let t = sendContent;
+            for(const [from, to] of britishSwaps) t = t.replace(from, to);
+            const signoffs = [" innit bruv"," cheers mate"," bloody hell"];
+            sendContent = t + signoffs[Math.floor(Math.random() * signoffs.length)];
+          }
+        }
+
+        if(mode === "stupid"){
+          displayName = `${displayName}`;
+          if(sendContent){
+            const slurMap = [
+              [/th/gi,"d"],[/ing\b/gi,"in"],[/tion\b/gi,"shun"],
+              [/er\b/gi,"ah"],[/or\b/gi,"ur"],[/are\b/gi,"r"],
+              [/you\b/gi,"u"],[/your\b/gi,"ur"],[/the\b/gi,"da"],
+              [/that\b/gi,"dat"],[/this\b/gi,"dis"],[/what\b/gi,"wut"],
+              [/because\b/gi,"cuz"],[/with\b/gi,"wif"],[/s\b/gi,"z"],
+              [/for\b/gi,"fer"],[/is\b/gi,"iz"],[/of\b/gi,"ov"],
+              [/my\b/gi,"mah"],[/me\b/gi,"meh"],[/I\b/g,"i"],
+            ];
+            let t = sendContent;
+            for(const [from, to] of slurMap) t = t.replace(from, to);
+            t = t.split("").map(ch => {
+              if(/[a-zA-Z]/.test(ch) && Math.random() < 0.12){
+                const near = {a:"qs",b:"vn",c:"xv",d:"sf",e:"wr",f:"gd",g:"fh",h:"gj",i:"uo",j:"hk",k:"jl",l:"ko",m:"n",n:"mb",o:"ip",p:"ol",q:"wa",r:"et",s:"ad",t:"ry",u:"yi",v:"bc",w:"qe",x:"zc",y:"tu",z:"xa"};
+                const opts = near[ch.toLowerCase()] || "e";
+                return opts[Math.floor(Math.random() * opts.length)];
+              }
+              return ch;
+            }).join("");
+            t = t.replace(/[bcdfgklmnprstvwyz]/gi, ch => Math.random() < 0.08 ? ch+ch : ch);
+            sendContent = t;
+          }
+        }
+
+        if(mode === "boomer"){
+          displayName = `${displayName} (Bob's dad)`;
+          if(sendContent){
+            const boomerSwaps = [
+              [/lol\b/gi,"LOL (laugh out loud)"],[/omg\b/gi,"OH MY GOD"],
+              [/btw\b/gi,"by the way"],[/idk\b/gi,"I don't know"],
+              [/ngl\b/gi,"not gonna lie"],[/imo\b/gi,"in my opinion"],
+              [/tbh\b/gi,"to be honest"],[/smh\b/gi,"shaking my head"],
+              [/fr\b/gi,"for real"],[/npc\b/gi,"robot person"],
+              [/based\b/gi,"sensible"],[/cringe\b/gi,"embarrassing"],
+              [/slay\b/gi,"good job"],[/lowkey\b/gi,"secretly"],
+              [/vibe\b/gi,"feeling"],[/sus\b/gi,"suspicious"],
+              [/no cap\b/gi,"and I mean that"],[/cap\b/gi,"lie"],
+            ];
+            let t = sendContent;
+            for(const [from, to] of boomerSwaps) t = t.replace(from, to);
+            const outros = [
+              " Anyway, have you tried turning it off and on again? 📧",
+              " I'll have to ask my grandson about this. 🖥️",
+              " Back in MY day we didn't have this nonsense. 📰",
+              " I'm going to need you to explain this like I'm 5. 🤷",
+              " This is why I prefer a phone call. ☎️",
+              " Make sure to LIKE and SUBSCRIBE!! 👍",
+              " Is this the Reddit? 🖱️",
+              " Forwarding this to the group chat. 📲",
+              " I don't understand why young people today... 😤",
+            ];
+            sendContent = t + outros[Math.floor(Math.random() * outros.length)];
+          }
+        }
+        if(mode === "conspiracy"){
+          displayName = `🔺 ${displayName} [AWAKE]`;
+          if(sendContent){
+            const theories = [
+              " (the government doesn't want you to know this)",
+              ": wake up sheeple 🐑",
+              " and THAT'S why they took down the old internet",
+              ": do your own research before they delete this",
+              " (they're putting something in the water btw)",
+              ": the moon isn't real btw just saying",
+              ": big pharma is shaking rn",
+              " and the lizard people are FURIOUS about it",
+            ];
+            const prefixes = [
+              "okay so nobody is talking about this but ",
+              "THEY don't want you to know: ",
+              "i've been doing research and ",
+              "follow the money: ",
+              "connect the dots people: ",
+              "sources won't say this but trust me: ",
+            ];
+            sendContent = prefixes[Math.floor(Math.random()*prefixes.length)] + sendContent + theories[Math.floor(Math.random()*theories.length)];
+          }
+        }
+
+        if(mode === "npc"){
+          displayName = `${displayName} [NPC #${Math.floor(Math.random()*9999)+1}]`;
+          if(sendContent){
+            const npcPrefixes = [
+              "Ah, a traveler! Anyway: ",
+              "Quest updated: ",
+              "I used to be an adventurer like you, but then: ",
+              "Strange things have been happening. Also, ",
+              "You didn't hear this from me, but ",
+              "My knee hurts when it rains. Anyway, ",
+              "The crops have been struggling, but ",
+              "I heard there's trouble at the old mill. Still: ",
+              "Can't stop now. Same places as yesterday. But: ",
+              "These are dark times, traveler. But anyway, ",
+            ];
+            const npcSuffixes = [
+              " Have you tried the items at the general store?",
+              " Talk to the village elder when you get a chance.",
+              " I don't want any trouble.",
+              " ...I need to get back to sweeping.",
+              " Good luck out there, traveler.",
+              " [NPC wanders off]",
+            ];
+            sendContent = npcPrefixes[Math.floor(Math.random()*npcPrefixes.length)] + sendContent + npcSuffixes[Math.floor(Math.random()*npcSuffixes.length)];
+          } else {
+            const idle = ["...", "*stares into the distance*", "*sweeping noises*", "*coughs*", "*wanders off*"];
+            sendContent = idle[Math.floor(Math.random()*idle.length)];
+          }
+        }
+
+        if(mode === "sigma"){
+          displayName = `Σ ${displayName}`;
+          if(sendContent){
+            const sigmaSwaps = [
+              [/\bi\b/gi,"the sigma"], [/\bme\b/gi,"the sigma"],
+              [/\bmy\b/gi,"the sigma's"], [/\bwe\b/gi,"the pack"],
+              [/\byou\b/gi,"fellow grindset individual"],
+              [/\bfriend\b/gi,"business associate"],
+              [/\blove\b/gi,"strategically value"],
+              [/\bsleep\b/gi,"recharge my grindset"],
+              [/\beat\b/gi,"fuel the sigma body"],
+              [/\bwork\b/gi,"the grindset"],
+              [/\bgame\b/gi,"the hustle"],
+              [/\bhelp\b/gi,"provide value to"],
+              [/\bfun\b/gi,"optimal recreation"],
+              [/\bmoney\b/gi,"resources"],
+            ];
+            let t = sendContent;
+            for(const [from, to] of sigmaSwaps) t = t.replace(from, to);
+            const outros = [
+              ": no cap, stay sigma.",
+              ": the grindset never stops.",
+              ": lions don't lose sleep over sheep.",
+              ": emotionless. strategic. inevitable.",
+              ": your mindset is your weapon. sharpen it.",
+              ": hustle in silence. let the results speak.",
+            ];
+            sendContent = t + outros[Math.floor(Math.random()*outros.length)];
+          }
+        }
+
+        if(mode === "medieval"){
+          displayName = `Sir ${displayName} of the Realm`;
+          if(sendContent){
+            const medievalSwaps = [
+              [/\byou\b/gi,"thee"],[/\byour\b/gi,"thy"],[/\bthe\b/gi,"ye"],
+              [/\bare\b/gi,"art"],[/\bis\b/gi,"ist"],[/\bhave\b/gi,"hast"],
+              [/\bdo\b/gi,"dost"],[/\bwill\b/gi,"shalt"],[/\bcan\b/gi,"canst"],
+              [/\bwhat\b/gi,"what manner of"],[/\bwhy\b/gi,"for what reason dost"],
+              [/\byes\b/gi,"verily"],[/\bno\b/gi,"nay"],[/\bhi\b/gi,"hail"],
+              [/\bhello\b/gi,"good morrow"],[/\bokay\b/gi,"very well, m'lord"],
+              [/\bsorry\b/gi,"I beseech thy forgiveness"],[/\bgood\b/gi,"most virtuous"],
+              [/\bbad\b/gi,"most foul"],[/\bcool\b/gi,"most gallant"],
+              [/\bfriend\b/gi,"loyal companion"],[/\benemy\b/gi,"most wretched knave"],
+              [/\bgo\b/gi,"make haste"],[/\bcome\b/gi,"approach"],
+              [/\bhelp\b/gi,"render aid unto"],[/\bpls\b/gi,"I prithee"],
+              [/\bplease\b/gi,"prithee"],[/\bomg\b/gi,"by the saints"],
+              [/\blol\b/gi,"*hearty laughter doth fill the great hall*"],
+            ];
+            let t = sendContent;
+            for(const [from, to] of medievalSwaps) t = t.replace(from, to);
+            const closings = [
+              ": so it is written, so it shall be done. ⚔️",
+              ": hear ye, hear ye! 📯",
+              ": upon mine honour. 🛡️",
+              ": God save the king! 👑",
+              ": fare thee well, traveler. 🏰",
+            ];
+            sendContent = t + closings[Math.floor(Math.random()*closings.length)];
+          }
+        }
+
+        if(mode === "ghost"){
+          displayName = `👻 ${displayName}'s Ghost`;
+          if(sendContent){
+            const hauntings = [
+              "...you won't believe what happened to me. I died. anyway: ",
+              "speaking from beyond the grave: ",
+              "the living still don't know but: ",
+              "[ghostly wailing] ...sorry. anyway: ",
+              "i have UNFINISHED BUSINESS and it is: ",
+            ];
+            const ghostOutros = [
+              " ...tell my family i said hey 👻",
+              " ...the cold spot in the room? that's me. sorry.",
+              " ...i keep moving the furniture and nobody notices.",
+              " ...death is just like life but quieter and colder.",
+              " ...anyway i gotta go haunt the basement. later.",
+              " ...RIP me btw 💀 (literally)",
+            ];
+            sendContent = hauntings[Math.floor(Math.random()*hauntings.length)] + sendContent + ghostOutros[Math.floor(Math.random()*ghostOutros.length)];
+          } else {
+            const spooks = ["*rattles chains*","*knocks something off the shelf*","*breathes coldly*","*appears in mirror for 0.3 seconds*"];
+            sendContent = spooks[Math.floor(Math.random()*spooks.length)];
+          }
+        }
+
+        // ── Pirate mode ───────────────────────────────────────────────────────
+        if(mode === "pirate"){
+          displayName = `🏴‍☠️ ${displayName} (the Pirate)`;
+          if(sendContent){
+            const subs = [
+              [/\bmy\b/gi,"me"],
+              [/\byou\b/gi,"ye"],
+              [/\byour\b/gi,"yer"],
+              [/\bthe\b/gi,"th'"],
+              [/\bis\b/gi,"be"],
+              [/\bare\b/gi,"be"],
+              [/\bam\b/gi,"be"],
+              [/\bfriend\b/gi,"matey"],
+              [/\bfriends\b/gi,"mateys"],
+              [/\bhey\b/gi,"ahoy"],
+              [/\bhi\b/gi,"ahoy"],
+              [/\bhello\b/gi,"ahoy"],
+              [/\byes\b/gi,"aye"],
+              [/\byeah\b/gi,"aye"],
+              [/\byep\b/gi,"aye"],
+              [/\bno\b/gi,"nay"],
+              [/\bnope\b/gi,"nay"],
+              [/\bman\b/gi,"landlubber"],
+              [/\bdude\b/gi,"scallywag"],
+              [/\bguy\b/gi,"bilge rat"],
+              [/\bgoing\b/gi,"sailin'"],
+              [/\bcome\b/gi,"come aboard"],
+              [/\bstop\b/gi,"belay that"],
+              [/\bwant\b/gi,"be wantin'"],
+              [/\bthink\b/gi,"reckon"],
+              [/\bthat\b/gi,"that there"],
+              [/\bvery\b/gi,"mightily"],
+              [/\breally\b/gi,"truly"],
+              [/\bgood\b/gi,"fine"],
+              [/\bbad\b/gi,"foul"],
+              [/\bokay\b/gi,"arr, fine"],
+              [/\bok\b/gi,"arr"],
+            ];
+            for(const [pattern, replacement] of subs){
+              sendContent = sendContent.replace(pattern, replacement);
+            }
+            const interjections = [
+              " arr!",
+              " shiver me timbers!",
+              " by Davy Jones!",
+              " yo ho!",
+              " says I!",
+              " blast ye!",
+              " ARRR!",
+              " avast!",
+              ", says this here pirate",
+            ];
+            if(Math.random() < 0.7){
+              sendContent += interjections[Math.floor(Math.random()*interjections.length)];
+            }
+          } else {
+            const pirateIdles = [
+              "🏴‍☠️ *stares into the horizon and says nothing*",
+              "arr... *spits overboard*",
+              "🦜 *the parrot speaks instead*",
+              "*sharpens cutlass ominously*",
+              "arr, this pirate has nothin' to say to ye",
+              "*waves a flag and drinks rum*",
+            ];
+            sendContent = pirateIdles[Math.floor(Math.random()*pirateIdles.length)];
+          }
+        }
+
+        // ── French mode ───────────────────────────────────────────────────────
+        if(mode === "french"){
+          displayName = `${displayName} 🇫🇷`;
+          if(sendContent){
+            const frenchSwaps = [
+              [/\bhello\b/gi,"bonjour"],[/\bhi\b/gi,"salut"],[/\bhey\b/gi,"eh alors"],
+              [/\bgoodbye\b/gi,"au revoir"],[/\bbye\b/gi,"ciao"],[/\bsee you\b/gi,"à bientôt"],
+              [/\byes\b/gi,"oui"],[/\byeah\b/gi,"oui oui"],[/\bno\b/gi,"non"],
+              [/\bnope\b/gi,"non non"],[/\bmaybe\b/gi,"peut-être"],[/\bof course\b/gi,"bien sûr"],
+              [/\bthank you\b/gi,"merci"],[/\bthanks\b/gi,"merci"],[/\bplease\b/gi,"s'il vous plaît"],
+              [/\bsorry\b/gi,"pardon"],[/\bexcuse me\b/gi,"excusez-moi"],
+              [/\bgood\b/gi,"magnifique"],[/\bbad\b/gi,"terrible"],[/\bgreat\b/gi,"formidable"],
+              [/\bcool\b/gi,"fantastique"],[/\bawesome\b/gi,"époustouflant"],
+              [/\bbeautiful\b/gi,"magnifique"],[/\blogical\b/gi,"logique"],
+              [/\bfriend\b/gi,"mon ami"],[/\bfriends\b/gi,"mes amis"],[/\bman\b/gi,"monsieur"],
+              [/\bwoman\b/gi,"madame"],[/\bboy\b/gi,"garçon"],[/\bgirl\b/gi,"fille"],
+              [/\blove\b/gi,"amour"],[/\blife\b/gi,"la vie"],[/\bdeath\b/gi,"la mort"],
+              [/\bfood\b/gi,"la cuisine"],[/\bwine\b/gi,"vin"],[/\bbread\b/gi,"baguette"],
+              [/\bcheese\b/gi,"fromage"],[/\bwater\b/gi,"l'eau"],[/\bcoffee\b/gi,"café"],
+              [/\bwork\b/gi,"le travail"],[/\bmoney\b/gi,"l'argent"],[/\btime\b/gi,"le temps"],
+              [/\bI think\b/gi,"je pense"],[/\bI know\b/gi,"je sais"],
+              [/\bI don't know\b/gi,"je ne sais pas"],[/\bwhy\b/gi,"pourquoi"],
+              [/\bwhat\b/gi,"quoi"],[/\bwhere\b/gi,"où"],[/\bwhen\b/gi,"quand"],
+            ];
+            let t = sendContent;
+            for(const [from, to] of frenchSwaps) t = t.replace(from, to);
+            const signoffs = [
+              ": c'est la vie 🥐",
+              ": hon hon hon 🥖",
+              " - sacré bleu!",
+              ": mais oui, naturellement 🇫🇷",
+              ": zut alors!",
+              ": quelle horreur!",
+              " - voilà!",
+              ": c'est magnifique 🍷",
+            ];
+            sendContent = t + signoffs[Math.floor(Math.random()*signoffs.length)];
+          } else {
+            const frenchIdles = [
+              "*takes a long drag of a cigarette*",
+              "*shrugs elaborately*",
+              "hon hon hon… 🥐",
+              "*adjusts beret*",
+              "bof…",
+            ];
+            sendContent = frenchIdles[Math.floor(Math.random()*frenchIdles.length)];
+          }
+        }
+
+        // ── UWU / LOLCAT mode ─────────────────────────────────────────────────
+        if(mode === "uwu"){
+          displayName = `${member?.displayName || msg.author.displayName || msg.author.globalName || msg.author.username} :3`;
+          if(sendContent){
+            const uwuSwaps = [
+              [/r/gi,"w"],[/l/gi,"w"],
+              [/\bno\b/gi,"nyo"],[/\byes\b/gi,"yesh"],
+              [/\bthe\b/gi,"da"],[/\bmy\b/gi,"mwy"],
+              [/\byou\b/gi,"ewe"],[/\bwhat\b/gi,"wat"],
+              [/\bthis\b/gi,"dis"],[/\bthat\b/gi,"dat"],
+              [/\bnot\b/gi,"nyot"],[/\bwhy\b/gi,"wai"],
+              [/\bhere\b/gi,"hewe"],[/\bplease\b/gi,"pwease"],
+              [/\blove\b/gi,"wuv"],[/\blike\b/gi,"wike"],
+              [/\bcute\b/gi,"kawaii"],[/\bhello\b/gi,"hewwo"],
+              [/\bhi\b/gi,"hewwo"],[/\bhey\b/gi,"heyyy~"],
+              [/\bgoodbye\b/gi,"bai bai~"],[/\bbye\b/gi,"bai~"],
+              [/\bsorry\b/gi,"sowwy"],[/\bthank you\b/gi,"thankies"],
+              [/\bthanks\b/gi,"tankies"],[/\bstop\b/gi,"stahp"],
+              [/\bcat\b/gi,"kitty"],[/\bdog\b/gi,"doggo"],
+              [/!/g,"! UwU"],[/\?/g,"? :3"],
+              [/\./g,". OwO"],
+            ];
+            let t = sendContent;
+            for(const [from, to] of uwuSwaps) t = t.replace(from, to);
+            if(Math.random() < 0.5) t = "nyaa~ " + t;
+            const signoffs = ["mrrp","  :3","  meow meow :3","  Nyah~!"];
+            sendContent = t + "  " + signoffs[Math.floor(Math.random()*signoffs.length)];
+          } else {
+            const idlePurrs = ["*purrs*","mrrp :3","nyaa~ :3","*head boop*","meow meow :3"];
+            sendContent = idlePurrs[Math.floor(Math.random()*idlePurrs.length)];
+          }
+        }
+
+        // ── Random mode: pick a random real mode each message ────────────────
+        if(mode === "random"){
+          const RANDOM_MODES = ["evil","freaky","american","british","stupid","boomer","conspiracy","npc","sigma","medieval","ghost","pirate","rr_propaganda","french","uwu"];
+          const pickedMode = RANDOM_MODES[Math.floor(Math.random()*RANDOM_MODES.length)];
+          displayName = `Randomized ${member?.displayName || msg.author.displayName || msg.author.globalName || msg.author.username}`;
+          Object.defineProperty(clankEntry, '_resolvedMode', { value: pickedMode, writable: true, configurable: true });
+          const _rm = pickedMode;
+          if(_rm === "evil"){
+            if(sendContent) sendContent = sendContent + " I'M SO EVIL THOOO";
+          } else if(_rm === "freaky"){
+            if(sendContent) sendContent = `𝓕𝓻𝓮𝓪𝓴𝔂 ${sendContent}`;
+          } else if(_rm === "american"){
+            if(sendContent) sendContent = sendContent.toUpperCase() + " LAWD BLESS MERICA 🦅🦅🦅🔥🔥🔥🇺🇸🇺🇸🇺🇸";
+          } else if(_rm === "british"){
+            const britishSwaps2=[[/\btrash\b/gi,"rubbish"],[/\bgarbage\b/gi,"rubbish"],[/\belevator\b/gi,"lift"],[/\bapartment\b/gi,"flat"],[/\bcookies\b/gi,"biscuits"],[/\bcandy\b/gi,"sweets"],[/\bchips\b/gi,"crisps"],[/\bfries\b/gi,"chips"],[/\bcell phone\b/gi,"mobile"],[/\bphone\b/gi,"mobile"],[/\bsidewalk\b/gi,"pavement"],[/\bgas\b/gi,"petrol"],[/\btrunk\b/gi,"boot"],[/\bhood\b/gi,"bonnet"],[/\bdiaper\b/gi,"nappy"],[/\bvacation\b/gi,"holiday"],[/\bmath\b/gi,"maths"],[/\bsoccer\b/gi,"football"],[/\bstore\b/gi,"shop"],[/\bsneakers\b/gi,"trainers"],[/\bpants\b/gi,"trousers"],[/\bbeer\b/gi,"lager"],[/\bdrunk\b/gi,"bladdered"],[/\bbar\b/gi,"pub"],[/\bfriend\b/gi,"mate"],[/\bguy\b/gi,"bloke"],[/\bdude\b/gi,"geezer"],[/\bman\b/gi,"lad"],[/\bgirl\b/gi,"lass"],[/\bokay\b/gi,"alright"],[/\byes\b/gi,"aye"],[/\byeah\b/gi,"aye"],[/\bno\b/gi,"nah"],[/\bthanks\b/gi,"cheers"],[/\bthank you\b/gi,"cheers"],[/\bsorry\b/gi,"sorry mate"]];
+            if(sendContent){ let t=sendContent; for(const [f,r] of britishSwaps2) t=t.replace(f,r); sendContent=t+" innit bruv"; }
+          } else if(_rm === "stupid"){
+            const slurMap2=[[/th/gi,"d"],[/ing\b/gi,"in"],[/you\b/gi,"u"],[/your\b/gi,"ur"],[/the\b/gi,"da"],[/that\b/gi,"dat"],[/this\b/gi,"dis"],[/what\b/gi,"wut"],[/because\b/gi,"cuz"],[/s\b/gi,"z"],[/I\b/g,"i"]];
+            if(sendContent){ let t=sendContent; for(const [f,r] of slurMap2) t=t.replace(f,r); sendContent=t; }
+          } else if(_rm === "boomer"){
+            const outros2=[" Anyway, have you tried turning it off and on again? 📧"," Back in MY day we didn't have this nonsense. 📰"," Is this the Reddit? 🖱️"," Make sure to LIKE and SUBSCRIBE!! 👍"];
+            if(sendContent) sendContent=sendContent+outros2[Math.floor(Math.random()*outros2.length)];
+          } else if(_rm === "conspiracy"){
+            const theories2=[" (the government doesn't want you to know this)",": wake up sheeple 🐑",": do your own research before they delete this"," (they're putting something in the water btw)"];
+            const prefixes2=["okay so nobody is talking about this but ","THEY don't want you to know: ","i've been doing research and ","connect the dots people: "];
+            if(sendContent) sendContent=prefixes2[Math.floor(Math.random()*prefixes2.length)]+sendContent+theories2[Math.floor(Math.random()*theories2.length)];
+          } else if(_rm === "npc"){
+            const npcPre2=["Ah, a traveler! Anyway: ","Quest updated: ","Strange things have been happening. Also, ","These are dark times, traveler. But anyway, "];
+            const npcSuf2=[" Have you tried the items at the general store?"," I don't want any trouble."," Good luck out there, traveler."];
+            if(sendContent) sendContent=npcPre2[Math.floor(Math.random()*npcPre2.length)]+sendContent+npcSuf2[Math.floor(Math.random()*npcSuf2.length)];
+          } else if(_rm === "sigma"){
+            const sigmaSwaps2=[[/\bi\b/gi,"the sigma"],[/\bme\b/gi,"the sigma"],[/\bmy\b/gi,"the sigma's"],[/\byou\b/gi,"fellow grindset individual"],[/\bfriend\b/gi,"business associate"],[/\blove\b/gi,"strategically value"],[/\bwork\b/gi,"the grindset"],[/\bmoney\b/gi,"resources"]];
+            const sigmaOut2=[": no cap, stay sigma.",": the grindset never stops.",": lions don't lose sleep over sheep."];
+            if(sendContent){ let t=sendContent; for(const [f,r] of sigmaSwaps2) t=t.replace(f,r); sendContent=t+sigmaOut2[Math.floor(Math.random()*sigmaOut2.length)]; }
+          } else if(_rm === "medieval"){
+            const medSwaps2=[[/\byou\b/gi,"thee"],[/\byour\b/gi,"thy"],[/\bthe\b/gi,"ye"],[/\bare\b/gi,"art"],[/\bis\b/gi,"ist"],[/\byes\b/gi,"verily"],[/\bno\b/gi,"nay"],[/\bhi\b/gi,"hail"],[/\bhello\b/gi,"good morrow"],[/\bsorry\b/gi,"I beseech thy forgiveness"],[/\bgood\b/gi,"most virtuous"],[/\bbad\b/gi,"most foul"],[/\bfriend\b/gi,"loyal companion"]];
+            const medClose2=[": so it is written, so it shall be done. ⚔️",": hear ye, hear ye! 📯",": upon mine honour. 🛡️"];
+            if(sendContent){ let t=sendContent; for(const [f,r] of medSwaps2) t=t.replace(f,r); sendContent=t+medClose2[Math.floor(Math.random()*medClose2.length)]; }
+          } else if(_rm === "ghost"){
+            const hauntings2=["...you won't believe what happened to me. I died. anyway: ","speaking from beyond the grave: ","i have UNFINISHED BUSINESS and it is: "];
+            const ghostOut2=[" ...tell my family i said hey 👻"," ...i keep moving the furniture and nobody notices."," ...RIP me btw 💀 (literally)"];
+            if(sendContent) sendContent=hauntings2[Math.floor(Math.random()*hauntings2.length)]+sendContent+ghostOut2[Math.floor(Math.random()*ghostOut2.length)];
+            else sendContent="*rattles chains*";
+          } else if(_rm === "pirate"){
+            const pirSubs2=[[/\bmy\b/gi,"me"],[/\byou\b/gi,"ye"],[/\byour\b/gi,"yer"],[/\bthe\b/gi,"th'"],[/\bis\b/gi,"be"],[/\bfriend\b/gi,"matey"],[/\bhey\b/gi,"ahoy"],[/\bhi\b/gi,"ahoy"],[/\bhello\b/gi,"ahoy"],[/\byes\b/gi,"aye"],[/\byeah\b/gi,"aye"],[/\bno\b/gi,"nay"],[/\bman\b/gi,"landlubber"],[/\bgood\b/gi,"fine"],[/\bbad\b/gi,"foul"]];
+            const pirInter2=[" arr!"," shiver me timbers!"," by Davy Jones!"," yo ho!"];
+            if(sendContent){ let t=sendContent; for(const [f,r] of pirSubs2) t=t.replace(f,r); if(Math.random()<0.7) t+=pirInter2[Math.floor(Math.random()*pirInter2.length)]; sendContent=t; }
+            else sendContent="arr... *stares into the horizon*";
+          } else if(_rm === "rr_propaganda"){
+            const rrSig2=[" By the way, go sub to RespawnRaccoon!"," On my momma if you ain't subbed to RespawnRaccoon..."," By the way, do you know RespawnRaccoon?"," Dude, you gotta check out RespawnRaccoon fr: https://www.youtube.com/@respawnraccoon"];
+            sendContent=(sendContent||"")+rrSig2[Math.floor(Math.random()*rrSig2.length)];
+          } else if(_rm === "french"){
+            const frSwaps2=[[/\bhello\b/gi,"bonjour"],[/\bhi\b/gi,"salut"],[/\byes\b/gi,"oui"],[/\byeah\b/gi,"oui oui"],[/\bno\b/gi,"non"],[/\bthanks\b/gi,"merci"],[/\bsorry\b/gi,"pardon"],[/\bgood\b/gi,"magnifique"],[/\bfriend\b/gi,"mon ami"],[/\blove\b/gi,"amour"]];
+            const frOut2=[": c'est la vie 🥐",": hon hon hon 🥖"," - sacré bleu!"," - voilà!"];
+            if(sendContent){ let t=sendContent; for(const [f,r] of frSwaps2) t=t.replace(f,r); sendContent=t+frOut2[Math.floor(Math.random()*frOut2.length)]; }
+            else sendContent="*shrugs elaborately* bof…";
+          } else if(_rm === "uwu"){
+            const uwuSwaps2=[[/r/gi,"w"],[/l/gi,"w"],[/\bno\b/gi,"nyo"],[/\byes\b/gi,"yesh"],[/\bthe\b/gi,"da"],[/\byou\b/gi,"ewe"],[/\bwhat\b/gi,"wat"],[/\bhello\b/gi,"hewwo"],[/\bhi\b/gi,"hewwo"],[/\bsorry\b/gi,"sowwy"],[/!/g,"! UwU"],[/\?/g,"? :3"]];
+            const uwuOut2=["mrrp","  :3","  meow meow :3","  Nyah~!"];
+            if(sendContent){ let t=sendContent; for(const [f,r] of uwuSwaps2) t=t.replace(f,r); sendContent=t+"  "+uwuOut2[Math.floor(Math.random()*uwuOut2.length)]; }
+            else sendContent="*purrs* mrrp :3";
+          }
+        }
+
+        // ── RespawnRaccoon Propaganda mode ────────────────────────────────────
+        if(mode === "rr_propaganda"){
+          displayName = `Martyr of the Raccoon: ${displayName}`;
+          const rrSignoffs = [
+            " By the way, go sub to RespawnRaccoon!",
+            " By the way, go sub to RespawnRaccoon! Here's his YouTube link: https://www.youtube.com/@respawnraccoon",
+            " Dude, you gotta check out this RespawnRaccoon video fr: https://youtu.be/mmcH7sIeUAc?si=gUaOMxg1ssEc3M3h",
+            " On my momma if you ain't subbed to RespawnRaccoon...",
+            " Go sub to The Raccer!",
+            " By the way, do you know RespawnRaccoon?",
+            " Dude, this video by RespawnRaccoon made me cry. It's so good: https://youtu.be/CNid5vhK9qM?si=El29KJQXHkkfF41z",
+            " By the way, do you know that this one character RespawnRaccoon made called Static503 has a #1 fan? It's insane! Here's the video of it: https://youtu.be/-FNISEDVIxc?si=3LAVYJLCzRNbHwlX",
+            " That April Fools video that Kara and RespawnRaccoon made was pretty good! Check it out here: https://youtu.be/Um_O8_ZTCHI?si=9ha39BB4IzuD6UlM",
+            " Dude, I hear that RespawnRaccoon made this guy named BLANNNK famous fr. He's in the intro of this video here: https://youtu.be/0zF9gMV--jA?si=loeY33iJvJLcx__T",
+          ];
+          if(sendContent){
+            sendContent = sendContent + rrSignoffs[Math.floor(Math.random()*rrSignoffs.length)];
+          } else {
+            sendContent = rrSignoffs[Math.floor(Math.random()*rrSignoffs.length)].trim();
+          }
+        }
+
+        // ── Custom mode (built with /clankerbuild): must run BEFORE sendOpts is built ──
+        if(mode && customClankerModes.has(mode)){
+          const cm = customClankerModes.get(mode);
+          const rawName = displayName;
+          displayName = (cm.displayNameFormat || "{name}").replace("{name}", rawName);
+          if(sendContent){
+            let t = sendContent;
+            for(const [from, to] of (cm.words || [])){
+              const pattern = from.trim().replace(/[.*+?^${}()|[\]\\]/g,"\\$&").replace(/\s+/g, "\\s+");
+              t = t.replace(new RegExp(`\\b${pattern}\\b`, "gi"), to);
+            }
+            if(cm.messageStart) t = cm.messageStart + t;
+            if(cm.signoffs?.length) t += " " + cm.signoffs[Math.floor(Math.random()*cm.signoffs.length)];
+            sendContent = t;
+          }
+        }
+
+        const webhooks = await msg.channel.fetchWebhooks().catch(()=>null);
+        let webhook    = webhooks?.find(w => w.owner?.id === CLIENT_ID && w.name === "RoyalBot Proxy");
+        if(!webhook){
+          webhook = await msg.channel.createWebhook("RoyalBot Proxy", { avatar: avatarURL }).catch(()=>null);
+        }
+        if(!webhook) return;
+
+        const sendOpts = { username: displayName, avatarURL, allowedMentions: { parse: [] } };
+        if(sendContent)          sendOpts.content = sendContent;
+        if(attachFiles.length)   sendOpts.files   = attachFiles;
+        if(!sendContent && !attachFiles.length && stickers.length){
+          sendOpts.content = stickers.map(n => `[Sticker: ${n}]`).join(" ");
+        }
+
+        if(sendOpts.content || sendOpts.files){
+          const replyCtx = await buildWebhookReplyContext(msg);
+          if(replyCtx) applyWebhookReplyContext(sendOpts, replyCtx);
+          const sentMsg = await webhook.send(sendOpts).catch(()=>null);
+          if(sentMsg && mode === "rr_propaganda" && !replyCtx){
+            await sentMsg.suppressEmbeds(true).catch(()=>{});
+          }
+        }
+      } catch(e){ console.error("clankerify error:", e.message); }
+      return;
+    }
+  }
+  const newLevel=tryAwardXP(msg.author.id,msg.author.username);
+  if(newLevel){
+    const luc = levelUpConfig.get(msg.guild.id);
+    const enabled = luc ? luc.enabled : !disabledLevelUp.has(msg.guild.id);
+    if(enabled){
+      let ch = null;
+      if(luc?.channelId) {
+        ch = msg.guild.channels.cache.get(luc.channelId) || null;
+      }
+      if(!ch) {
+        const chId = guildChannels.get(msg.guild.id);
+        ch = chId ? msg.guild.channels.cache.get(chId) : null;
+      }
+      if(!ch) ch = msg.channel;
+      const ping = luc ? luc.ping : true;
+      const mention = ping ? `<@${msg.author.id}>` : `**${msg.author.username}**`;
+      if(ch) await safeSend(ch, `🎉 ${mention} levelled up to **Level ${newLevel}**! 🏆`);
+    }
+  }
+  const cg=countGames.get(msg.guild.id);
+  if(cg&&msg.channelId===cg.channelId){
+    const num=parseInt(msg.content.trim());
+    if(!isNaN(num)&&String(num)===msg.content.trim()){
+      if(msg.author.id===cg.lastUserId){
+        const was=cg.count;cg.count=0;cg.lastUserId=null;
+        await msg.react("❌").catch(()=>{});
+        await safeSend(msg.channel,`❌ <@${msg.author.id}> counted twice in a row! Back to **0** (was ${was}).`);
+      }else if(num===cg.count+1){
+        cg.count++;cg.lastUserId=msg.author.id;
+        if(cg.count===100){
+          countGames.delete(msg.guild.id);
+          getScore(msg.author.id,msg.author.username).coins+=CONFIG.win_countgame;
+          saveData();
+          await msg.react("🎉").catch(()=>{});
+          await safeSend(msg.channel,`🎉 **100!** <@${msg.author.id}> got the final count and wins **${CONFIG.win_countgame} coins**! The count game is over.`);
+        }else{await msg.react("✅").catch(()=>{});}
+      }else{
+        const was=cg.count;cg.count=0;cg.lastUserId=null;
+        await msg.react("❌").catch(()=>{});
+        await safeSend(msg.channel,`❌ <@${msg.author.id}> said **${num}** but expected **${was+1}**! Back to **0**.`);
+      }
+    }
+  }
+
+  // ── Paranoia watcher: reply to watched users' messages ─────────────────────
+  const paranoiaEntry = paranoiaWatchers.get(scopedKey(msg.guild.id, msg.author.id));
+  if(paranoiaEntry && paranoiaEntry.armed){
+    if(Math.random() * 100 < paranoiaEntry.chance){
+      const line = PARANOIA_MESSAGES[Math.floor(Math.random() * PARANOIA_MESSAGES.length)];
+      try{ await msg.reply({ content: line, allowedMentions:{ repliedUser: false } }); }catch(e){ console.error("paranoia reply error:", e.message); }
+    }
+  }
+
+  // ── Jarvis / RoyalBot image trigger ──────────────────────────────────────────
+  if(msg.reference){
+    const wakeMatch = msg.content.trim().match(/^(royalbot|jarvis)\b/i);
+    if(wakeMatch){
+      try {
+        const jarvisImages = await getJarvisImages();
+        if(jarvisImages.length){
+          const words = (msg.content.toLowerCase().match(/[a-z0-9]+/g)) || [];
+          const wordSet = new Set(words);
+          const hit = jarvisImages.find(img => wordSet.has(img.word));
+          if(hit){
+            const target = await msg.fetchReference().catch(() => null);
+            if(target){
+              await target.reply({ files: [hit.download_url], allowedMentions: { repliedUser: false } }).catch(()=>{});
+              const isJarvisWake = wakeMatch[1].toLowerCase() === "jarvis";
+              if(isJarvisWake && OWNER_IDS.includes(msg.author.id)){
+                const ackLine = JARVIS_ACK_LINES[Math.floor(Math.random() * JARVIS_ACK_LINES.length)];
+                await msg.reply({ content: ackLine, allowedMentions: { repliedUser: false } }).catch(()=>{});
+              }
+            }
+          }
+        }
+      } catch(e) { console.error("Jarvis trigger error:", e.message); }
+    }
+  }
+
+  // ── Jarvis Enhance: owner built automation chains, triggered by word ────────
+  if(jarvisEnhanceProfiles.size){
+    const betaBlocked = IS_BETA_BOT && !OWNER_IDS.includes(msg.author.id) && !(await isPatreonMember(msg.author.id));
+    if(!betaBlocked){
+    const jeWakeMatch = msg.content.trim().match(/^(royalbot|jarvis)\b[,:\-\s]*/i);
+    if(jeWakeMatch){
+      try {
+        const jeContentLower = msg.content.toLowerCase();
+        const jeWords = jeContentLower.match(/[a-z0-9]+/g) || [];
+        const jeWordSet = new Set(jeWords);
+        let matchedTrigger = null;
+        const jeAllProfiles = [...jarvisEnhanceProfiles.values()];
+        const jeOrdered = [...jeAllProfiles.filter(p => p.matchAll), ...jeAllProfiles.filter(p => !p.matchAll)];
+        const jeHasTrigger = (t) => {
+          const tl = t.toLowerCase();
+          return tl.includes(" ") ? jeContentLower.includes(tl) : jeWordSet.has(tl);
+        };
+        const profile = jeOrdered.find(p => {
+          if(p.matchAll){
+            if(p.triggers.length && p.triggers.every(jeHasTrigger)){ matchedTrigger = p.triggers[0]; return true; }
+            return false;
+          }
+          const hit = p.triggers.find(jeHasTrigger);
+          if(hit){ matchedTrigger = hit; return true; }
+          return false;
+        });
+        if(profile){
+          const locked = profile.ownerLocked !== false;
+          const allowed = locked ? isEffectiveOwner(msg.author.id, "jarvisenhance") : !msg.author.bot;
+          if(allowed){
+            const needsTarget = profile.actions.some(step => {
+              const def = JARVISENHANCE_ACTIONS.find(a=>a.id===step.type);
+              if(!def) return false;
+              if(def.needs!=="channel" && def.needs!=="none") return true;
+              return step.params?.replyMode === "reply";
+            });
+            let targetMsg=null, targetMember=null;
+            if(msg.reference){
+              targetMsg = await msg.fetchReference().catch(() => null);
+              if(targetMsg && msg.guild) targetMember = await msg.guild.members.fetch(targetMsg.author.id).catch(() => null);
+            }
+            if(!needsTarget || targetMsg){
+              const afterWake = msg.content.slice(jeWakeMatch[0].length);
+              const triggerRe = new RegExp(`\\b${matchedTrigger.replace(/[.*+?^${}()|[\]\\]/g,"\\$&")}\\b`, "i");
+              const restText = afterWake.replace(triggerRe, "").trim();
+              const ctx = {
+                targetMsg, targetUser: targetMsg ? targetMsg.author : null, targetMember,
+                channel: msg.channel, guild: msg.guild, restText,
+                actorId: msg.author.id, actorUser: msg.author, actorMsg: msg,
+              };
+              await runJarvisEnhanceProfile(profile, ctx);
+            }
+          }
+        }
+      } catch(e) { console.error("Jarvis Enhance trigger error:", e.message); }
+    }
+    }
+  }
+
+  // ── Permanent counting channel ────────────────────────────────────────────
+  const cc=countingChannels.get(msg.channelId);
+  if(cc){
+    const cbKey = scopedKey(msg.guild?.id, msg.author.id);
+    const cbUntil = countingBlocks.get(cbKey);
+    if(cbUntil){
+      if(Date.now() < cbUntil){
+        await msg.react("🚫").catch(()=>{});
+        return;
+      }
+      countingBlocks.delete(cbKey);
+    }
+    const trimmed=msg.content.trim();
+    const num=parseInt(trimmed);
+    if(!isNaN(num)&&/^-?\d+$/.test(trimmed)){
+      if(msg.author.id===cc.lastUserId){
+        cc.count=0;cc.lastUserId=null;
+        saveDataAndCommitNow().catch(()=>{});
+        await msg.react("❌").catch(()=>{});
+        await safeSend(msg.channel,`<@${msg.author.id}> messed the counting up! Shame on them! Start from zero.`);
+      }else if(num===cc.count+1){
+        cc.count++;cc.lastUserId=msg.author.id;
+        if(cc.count>(cc.highScore||0)){cc.highScore=cc.count;}
+        saveData();
+        await msg.react("✅").catch(()=>{});
+      }else{
+        cc.count=0;cc.lastUserId=null;
+        saveDataAndCommitNow().catch(()=>{});
+        await msg.react("❌").catch(()=>{});
+        await safeSend(msg.channel,`<@${msg.author.id}> messed the counting up! Shame on them! Start from zero.`);
+      }
+    }
+  }
+});
+
+// ── Interaction handler ───────────────────────────────────────────────────────
+client.on("interactionCreate",async interaction=>{
+  if(!instanceLocked)return;
+
+  // ── Blacklist: blocks ALL interactions (commands, buttons, menus) ─────────
+  if(interaction.user && isFullyBlacklisted(interaction.user.id)){
+    if(!isSilentBlacklisted(interaction.user.id)){
+      try{
+        const payload={content:`❌ <@${interaction.user.id}> is blacklisted from RoyalBot and cannot use this bot.`,ephemeral:true};
+        if(interaction.deferred||interaction.replied) await interaction.followUp(payload).catch(()=>{});
+        else await interaction.reply(payload).catch(()=>{});
+      }catch{}
+    }
+    return;
+  }
+
+  // ── The main bot stays in the Patreon server to check who holds the roles,
+  // but its commands aren't meant to be used there. ──────────────────────────
+  if(!IS_BETA_BOT && interaction.guildId === PATREON_GUILD_ID){
+    try{ await interaction.reply({content:"This bot cannot be used in this server.",ephemeral:true}); }catch{}
+    return;
+  }
+
+  // ── The beta bot is Patreon supporters only. Owners always get through. ────
+  if(IS_BETA_BOT && interaction.user && !OWNER_IDS.includes(interaction.user.id)){
+    if(!(await isPatreonMember(interaction.user.id))){
+      try{ await interaction.reply({content:`This is the beta bot: it is only available to Patreon supporters. Try to support RoyalBot here if you wish (pls) ${PATREON_LINK}`,ephemeral:true}); }catch{}
+      return;
+    }
+  }
+
+  if(!interaction.guildId && interaction.user && !interaction.user.bot){
+    if(!userInstalls.has(interaction.user.id)){
+      userInstalls.add(interaction.user.id);
+      saveData();
+    }
+  }
+
+  // ── BUTTONS & SELECT MENUS ────────────────────────────────────────────────────
+  if(interaction.isButton()||interaction.isSelectMenu()){
+    const uid=interaction.user.id;
+    const cid=interaction.customId;
+    try {
+
+    // ── /quotesetup panel: scope buttons, channel pickers, folder name, finish ─
+    if(cid.startsWith("qs_")){
+      let qsToken;
+      if(cid.startsWith("qs_req_")||cid.startsWith("qs_del_")){
+        const qsRest = cid.slice(7);
+        qsToken = qsRest.slice(0, qsRest.lastIndexOf("_"));
+      } else {
+        qsToken = cid.slice(cid.indexOf("_", 3) + 1);
+      }
+      const qb = quoteSetupBuilders.get(qsToken);
+      if(!qb){ await btnEphemeral(interaction, QS_TEXT.expired); return; }
+      if(qb.ownerId !== uid){ await btnEphemeral(interaction, QS_TEXT.notYourPanel); return; }
+      const qsGuild = client.guilds.cache.get(qb.guildId);
+      if(!qsGuild){ await btnEphemeral(interaction, QS_TEXT.expired); return; }
+
+      if(cid.startsWith("qs_global_")){
+        const gcfg = getOrCreateQuoteConfig(qb.guildId);
+        gcfg.mode = "global";
+        gcfg.globalToggled = false;
+        saveData();
+        quoteSetupBuilders.delete(qsToken);
+        try{ await interaction.update({ content: QS_TEXT.globalChosen, embeds:[], components:[] }); }catch{}
+        return;
+      }
+      if(cid.startsWith("qs_server_")){
+        notifyOwnerServerSpecific(qsGuild).catch(()=>{});
+        qb.step = "request";
+        try{ await interaction.update({ content:null, ...buildQuoteSetupPanel(qsToken) }); }catch(e){ console.error("[qs_server update]", e.message); }
+        return;
+      }
+      if(cid.startsWith("qs_req_")||cid.startsWith("qs_del_")){
+        const pickedId = interaction.values[0];
+        const picked = pickedId && pickedId !== "none" ? qsGuild.channels.cache.get(pickedId) : null;
+        if(!picked || picked.type !== "GUILD_TEXT"){ await btnEphemeral(interaction, QS_TEXT.textChannelOnly); return; }
+        if(cid.startsWith("qs_req_")){
+          qb.requestChannelId = picked.id;
+          qb.step = qb.deleteChannelId ? "folder" : "delete";
+        } else {
+          qb.deleteChannelId = picked.id;
+          qb.step = "folder";
+        }
+        qb.createdChannels = false;
+        try{ await interaction.update({ content:null, ...buildQuoteSetupPanel(qsToken) }); }catch{}
+        return;
+      }
+      if(cid.startsWith("qs_make_")){
+        if(!(await btnAck(interaction))) return;
+        const qsMe = qsGuild.members.me;
+        if(!qsMe || !qsMe.permissions.has("MANAGE_CHANNELS")){
+          await interaction.followUp({content:QS_TEXT.makeBothFailed,ephemeral:true}).catch(()=>{});
+          return;
+        }
+        try{
+          const gcfg = getOrCreateQuoteConfig(qb.guildId);
+          const made = await createQuoteChannels(qsGuild, gcfg.moderators);
+          qb.requestChannelId = made.requestCh.id;
+          qb.deleteChannelId = made.deleteCh.id;
+          qb.createdChannels = true;
+          qb.step = "folder";
+          await interaction.editReply({ content:null, ...buildQuoteSetupPanel(qsToken) });
+        }catch(e){
+          console.error("[qs_make] channel creation failed:", e.message);
+          await interaction.followUp({content:QS_TEXT.makeBothFailed,ephemeral:true}).catch(()=>{});
+        }
+        return;
+      }
+      if(cid.startsWith("qs_name_")){
+        await interaction.showModal({
+          title: QS_TEXT.folderModalTitle,
+          custom_id: `qs_modal_folder_${qsToken}`,
+          components:[{type:1,components:[{type:4,custom_id:"qs_folder_input",label:QS_TEXT.folderInputLabel,style:1,required:true,min_length:3,max_length:32,placeholder:QS_TEXT.folderInputHint,...(qb.folder?{value:qb.folder}:{})}]}],
+        }).catch(e=>console.error("[qs_name modal]",e.message));
+        return;
+      }
+      if(cid.startsWith("qs_back_")){
+        qb.step = qb.step === "folder" ? "delete" : "request";
+        try{ await interaction.update({ content:null, ...buildQuoteSetupPanel(qsToken) }); }catch{}
+        return;
+      }
+      if(cid.startsWith("qs_cancel_")){
+        quoteSetupBuilders.delete(qsToken);
+        try{ await interaction.update({ content: QS_TEXT.cancelled, embeds:[], components:[] }); }catch{}
+        return;
+      }
+      if(cid.startsWith("qs_finish_")){
+        if(!qb.requestChannelId || !qb.deleteChannelId || !qb.folder){ await btnEphemeral(interaction, QS_TEXT.needAllThree); return; }
+        if(!(await btnAck(interaction))) return;
+        try{
+          const check = await validateQuoteFolderChoice(qb.folder, qb.guildId);
+          if(!check.ok){ await interaction.followUp({content:check.reason,ephemeral:true}).catch(()=>{}); return; }
+          if(!check.exists){
+            const madeFolder = await createQuoteFolderOnGitHub(check.name);
+            if(!madeFolder){ await interaction.followUp({content:QS_TEXT.folderCreateFailed,ephemeral:true}).catch(()=>{}); return; }
+          }
+          const gcfg = getOrCreateQuoteConfig(qb.guildId);
+          gcfg.mode = "server";
+          gcfg.folder = check.name;
+          gcfg.requestChannelId = qb.requestChannelId;
+          gcfg.deleteChannelId = qb.deleteChannelId;
+          gcfg.globalToggled = false;
+          gcfg.createdChannels = !!qb.createdChannels;
+          saveData();
+          quoteSetupBuilders.delete(qsToken);
+          await interaction.editReply({ content: QS_TEXT.serverDone(gcfg.requestChannelId, gcfg.deleteChannelId, gcfg.folder), embeds:[], components:[] });
+        }catch(e){
+          console.error("[qs_finish] error:", e.message);
+          await interaction.followUp({content:QS_TEXT.folderCreateFailed,ephemeral:true}).catch(()=>{});
+        }
+        return;
+      }
+      return;
+    }
+
+    // ── /sotd panel: channel/hour/role pickers, finish, post now ────────────────
+    if(cid.startsWith("sotd_")){
+      if(!interaction.guildId || !isGuildOwner(interaction.guildId, uid)){ await btnEphemeral(interaction, "Server owner only."); return; }
+      const guild = interaction.guild;
+      const cfg = (() => { let c = sotdConfig.get(interaction.guildId); if(!c){ c = { playlists:[], usedVideoIds:[] }; sotdConfig.set(interaction.guildId, c); } return c; })();
+
+      if(cid.startsWith("sotd_sel_channel")){
+        const picked = guild.channels.cache.get(interaction.values[0]);
+        if(!picked || picked.type !== "GUILD_TEXT"){ await btnEphemeral(interaction, "Please select a text channel."); return; }
+        cfg.postChannelId = picked.id;
+        saveData();
+        try{ await interaction.update(buildSotdSetupStep(guild, interaction.guildId)); }catch{}
+        return;
+      }
+      if(cid.startsWith("sotd_sel_hour")){
+        cfg.hour = parseInt(interaction.values[0], 10);
+        saveData();
+        try{ await interaction.update(buildSotdSetupStep(guild, interaction.guildId)); }catch{}
+        return;
+      }
+      if(cid.startsWith("sotd_sel_role")){
+        const picked = interaction.values[0];
+        if(picked && picked !== "none") cfg.pingRoleId = picked;
+        saveData();
+        try{ await interaction.update(buildSotdSetupStep(guild, interaction.guildId)); }catch{}
+        return;
+      }
+      if(cid === "sotd_skip_role" || cid === "sotd_clear_role"){
+        cfg.pingRoleId = null;
+        saveData();
+        try{ await interaction.update(buildSotdSetupStep(guild, interaction.guildId)); }catch{}
+        return;
+      }
+      if(cid === "sotd_back"){
+        const step = getSotdSetupStep(cfg);
+        const backStep = step > 4 ? 4 : Math.max(1, step - 1);
+        try{ await interaction.update(buildSotdSetupStep(guild, interaction.guildId, backStep)); }catch{}
+        return;
+      }
+      if(cid === "sotd_postnow"){
+        if(!(await btnAck(interaction))) return;
+        const result = await postSotdForGuild(interaction.guildId, { manual:true });
+        await interaction.followUp({ content: result.ok ? "✅ Posted." : `❌ ${result.reason}`, ephemeral:true }).catch(()=>{});
+        return;
+      }
+      if(cid === "sotd_genre_open"){
+        try{ await interaction.update(buildSotdGenrePicker(interaction.guildId)); }catch{}
+        return;
+      }
+      if(cid === "sotd_genre_sel"){
+        const genre = interaction.values[0];
+        cfg.genreMode = { genre, expiresAt: Date.now() + 7*24*60*60*1000 };
+        saveData();
+        try{ await interaction.update(buildSotdSetupStep(guild, interaction.guildId, 4)); }catch{}
+        return;
+      }
+      if(cid === "sotd_genre_clear"){
+        cfg.genreMode = null;
+        saveData();
+        try{ await interaction.update(buildSotdSetupStep(guild, interaction.guildId, 4)); }catch{}
+        return;
+      }
+      if(cid === "sotd_genre_back"){
+        try{ await interaction.update(buildSotdSetupStep(guild, interaction.guildId, 4)); }catch{}
+        return;
+      }
+      return;
+    }
+
+    // ── SOTD fire votes: anyone can vote, not just the server owner ─────────────
+    if(cid.startsWith("sotdvote_fire_") || cid.startsWith("sotdvote_who_")){
+      const isWho = cid.startsWith("sotdvote_who_");
+      const videoId = cid.slice(isWho ? "sotdvote_who_".length : "sotdvote_fire_".length);
+
+      if(isWho){
+        await interaction.deferReply({ephemeral:true}).catch(()=>{});
+        const v = sotdVotes.get(videoId) || { count:0, voters:[] };
+        const names = await Promise.all(v.voters.map(async id => {
+          try{ const u = await client.users.fetch(id); return u.globalName || u.username; }
+          catch{ return `<@${id}>`; }
+        }));
+        await interaction.editReply({ content: `🔥 ${v.count} fire vote(s): ${names.length ? names.join(", ") : "_Nobody yet_"}` }).catch(()=>{});
+        return;
+      }
+
+      let v = sotdVotes.get(videoId);
+      if(!v){ v = { count:0, voters:[] }; sotdVotes.set(videoId, v); }
+      const idx = v.voters.indexOf(uid);
+      if(idx >= 0){ v.voters.splice(idx,1); v.count = Math.max(0, v.count-1); }
+      else { v.voters.push(uid); v.count++; }
+      saveData();
+      try{ await interaction.update({ components:[buildSotdActionRow(videoId)] }); }
+      catch{ await btnEphemeral(interaction, idx >= 0 ? "Vote removed." : "🔥'd!"); }
+      return;
+    }
+
+    // ── /sotd-playlist panel: add, remove, refresh ───────────────────────────────
+    if(cid.startsWith("sp_")){
+      if(!interaction.guildId || !isGuildOwner(interaction.guildId, uid)){ await btnEphemeral(interaction, "Server owner only."); return; }
+      const guild = interaction.guild;
+      const cfg = (() => { let c = sotdConfig.get(interaction.guildId); if(!c){ c = { playlists:[], usedVideoIds:[] }; sotdConfig.set(interaction.guildId, c); } return c; })();
+
+      if(cid === "sp_add"){
+        await interaction.showModal({
+          title:"Add a playlist",
+          custom_id:"sp_modal_add",
+          components:[
+            { type:1, components:[{ type:4, custom_id:"sp_url", label:"YouTube playlist URL", style:1, required:true }] },
+            { type:1, components:[{ type:4, custom_id:"sp_label", label:"Label (optional, uses playlist title)", style:1, required:false, max_length:60, placeholder:"Defaults to the playlist's own title on YouTube" }] },
+          ],
+        }).catch(e => console.error("[sp_add modal]", e.message));
+        return;
+      }
+      if(cid === "sp_remove"){
+        if(!cfg.playlists.length){ await btnEphemeral(interaction, "No playlists to remove."); return; }
+        const menu = new MessageSelectMenu().setCustomId("sp_remove_sel").setPlaceholder("Select a playlist to remove…")
+          .setOptions(cfg.playlists.map(p => ({ label:p.label.slice(0,100), value:p.id })));
+        try{ await interaction.update({ embeds: buildSotdPlaylistPanel(guild, interaction.guildId).embeds, components:[new MessageActionRow().addComponents(menu)] }); }catch{}
+        return;
+      }
+      if(cid === "sp_remove_sel"){
+        const id = interaction.values[0];
+        cfg.playlists = cfg.playlists.filter(p => p.id !== id);
+        saveData();
+        try{ await interaction.update(buildSotdPlaylistPanel(guild, interaction.guildId)); }catch{}
+        return;
+      }
+      if(cid === "sp_refresh"){
+        if(!(await btnAck(interaction))) return;
+        for(const pl of cfg.playlists){
+          try{ const info = await ytFetchPlaylistFlat(pl.url); pl.entries = info.entries; }
+          catch(e){ console.error("[sp_refresh]", pl.url, e.message); }
+        }
+        saveData();
+        await interaction.editReply(buildSotdPlaylistPanel(guild, interaction.guildId)).catch(()=>{});
+        return;
+      }
+      return;
+    }
+
+    // ── /gifquality panel: quality/fps pickers, convert, cancel ──────────────────
+    if(cid.startsWith("gifq_")){
+      const m = cid.match(/^gifq_(quality|fps|go|cancel)_(.+)$/);
+      if(!m) return;
+      const [, action, token] = m;
+      const job = gifqJobs.get(token);
+      if(!job){ await btnEphemeral(interaction, "This session expired, run `/gifquality` again."); return; }
+      if(job.ownerId !== uid){ await btnEphemeral(interaction, "Only the person who ran this can use it."); return; }
+
+      if(action === "quality"){
+        job.scalePct = parseInt(interaction.values[0], 10);
+        try{ await interaction.update(buildGifQualityPanel(token)); }catch{}
+        return;
+      }
+      if(action === "fps"){
+        job.targetFps = parseInt(interaction.values[0], 10);
+        try{ await interaction.update(buildGifQualityPanel(token)); }catch{}
+        return;
+      }
+      if(action === "cancel"){
+        cleanupGifqJob(token);
+        try{ await interaction.update({ content:"Cancelled.", embeds:[], components:[] }); }catch{}
+        return;
+      }
+      if(action === "go"){
+        if(!(await btnAck(interaction))) return;
+        try{
+          const outPath = path.join(job.workDir, "out.gif");
+          const vf = `fps=${job.targetFps},scale=iw*${job.scalePct/100}:-1:flags=lanczos,split[s0][s1];[s0]palettegen[p];[s1][p]paletteuse`;
+          await runFfmpeg(["-y","-i",job.srcPath,"-vf",vf,"-loop","0",outPath]);
+          const stat = fs.statSync(outPath);
+          const limit = getUploadLimitBytes(interaction.guild);
+          if(stat.size > limit){
+            await interaction.followUp({ content:`❌ The result is ${(stat.size/1e6).toFixed(1)} MB, over this server's ${(limit/1e6).toFixed(0)} MB limit. Try a lower quality or FPS.`, ephemeral:true });
+          } else {
+            await interaction.followUp({ files:[{ attachment: outPath, name:"output.gif" }], ephemeral:true });
+          }
+        }catch(e){
+          await interaction.followUp({ content:`❌ Conversion failed: ${e.message}`, ephemeral:true }).catch(()=>{});
+        } finally {
+          cleanupGifqJob(token);
+        }
+        return;
+      }
+      return;
+    }
+
+    // ── Quote review: accept / reject ────────────────────────────────────────
+    if(cid.startsWith("qr_accept_")||cid.startsWith("qr_reject_")){
+      const isAccept = cid.startsWith("qr_accept_");
+      const token = cid.slice(isAccept ? 10 : 10);
+      const pending = pendingReviews.get(token);
+      const isGlobalReviewer = OWNER_IDS.includes(uid) || hasTempOwnerFeature(uid,"quote_review");
+      const isServerReviewer = !!(pending && pending.destFolder && pending.guildId && interaction.guildId === pending.guildId && isServerQuoteStaff(uid, pending.guildId));
+      if(!isGlobalReviewer && !isServerReviewer){
+        try{await interaction.reply({content: pending && pending.destFolder ? QS_TEXT.notAllowedServerReview : "❌ Only owners can approve quote submissions.",ephemeral:true});}catch{}
+        return;
+      }
+
+      let submitterId, stagingName, mediaKind, rawName;
+      if(pending){
+        submitterId = pending.submitterId;
+        stagingName = pending.fileName;
+        mediaKind   = pending.mediaKind;
+        rawName     = pending.rawName;
+      } else {
+        const payload  = token;
+        const firstUnd = payload.indexOf("_");
+        submitterId    = payload.slice(0, firstUnd);
+        stagingName    = payload.slice(firstUnd + 1);
+        const stagingMatch = stagingName.match(/^(\d+)__(image|audio|video)__(.+)$/);
+        mediaKind = stagingMatch ? stagingMatch[2] : "image";
+        rawName   = stagingMatch ? stagingMatch[3] : stagingName;
+      }
+      const prefix = mediaKind === "image" ? "quote" : mediaKind === "audio" ? "eardestroyer" : "eyebleacher";
+      const destFolder = (pending && pending.destFolder) || "quotes2";
+
+      if(!await btnAck(interaction)) return;
+      if(pending) pendingReviews.delete(token);
+
+      if(!isAccept){
+        try{
+          await interaction.editReply({
+            content:`❌ **Submission rejected** by <@${uid}>\n\`${rawName}\` was **not** added to the quotes folder.`,
+            components:[]
+          });
+        }catch{}
+        try{
+          const submitter = await client.users.fetch(submitterId).catch(()=>null);
+          if(submitter) await submitter.send(`❌ Your quote submission \`${rawName}\` was **rejected** by a reviewer. It won't be added to the quotes folder.`).catch(()=>{});
+        }catch{}
+        return;
+      }
+
+      const embed = interaction.message.embeds[0];
+      const mediaUrl = mediaKind === "image"
+        ? (embed?.image?.url || embed?.thumbnail?.url || null)
+        : (interaction.message.attachments.first()?.url || null);
+      if(!mediaUrl){
+        try{await interaction.followUp({content:"❌ Couldn't retrieve the file URL from the submission. Try resubmitting.",ephemeral:true});}catch{}
+        return;
+      }
+
+      try{
+        const res = await fetch(mediaUrl);
+        if(!res.ok) throw new Error(`HTTP ${res.status}`);
+        const fileBuffer = Buffer.from(await res.arrayBuffer());
+        const extMatch = rawName.match(/\.([a-z0-9]+)$/i);
+        const ext = extMatch ? extMatch[1].toLowerCase() : (mediaKind === "image" ? "jpg" : mediaKind === "audio" ? "mp3" : "mp4");
+
+        if(fileBuffer.length > 1_000_000){
+          if(mediaKind === "image"){
+            await interaction.followUp({content:`❌ File too large (${(fileBuffer.length/1024/1024).toFixed(1)} MB). GitHub only accepts images under 1 MB.`,ephemeral:true}).catch(()=>{});
+            return;
+          }
+          const num = nextUploadNumber(prefix);
+          const fileName = `${prefix}_${num}.${ext}`;
+          try{
+            await interaction.editReply({
+              content:`⚠️ **Submission approved** by <@${uid}>, but \`${fileName}\` is ${(fileBuffer.length/1024/1024).toFixed(1)} MB: too large for \`${destFolder}\` (1 MB limit), so it wasn't saved there.`,
+              components:[],
+              files:[{attachment:fileBuffer, name:fileName}],
+            });
+          }catch{}
+          try{
+            const submitter = await client.users.fetch(submitterId).catch(()=>null);
+            if(submitter) await submitter.send(`✅ Your quote submission \`${rawName}\` was **approved**, but it was too large to store in \`${destFolder}\` (1 MB limit). A reviewer has it as \`${fileName}\`.`).catch(()=>{});
+          }catch{}
+          return;
+        }
+
+        const num = nextUploadNumber(prefix);
+        const fileName = `${prefix}_${num}.${ext}`;
+        const ghPath  = `${destFolder}/${fileName}`;
+        const encoded = fileBuffer.toString("base64");
+
+        const checkRes = await fetch(`https://api.github.com/repos/${GH_REPO}/contents/${ghPath}`,{
+          headers:{"User-Agent":"RoyalBot","Authorization":`token ${GH_TOKEN}`,"Accept":"application/vnd.github+json"}
+        });
+        let sha = null;
+        if(checkRes.ok){ const j=await checkRes.json(); sha=j.sha||null; }
+
+        const putRes = await fetch(`https://api.github.com/repos/${GH_REPO}/contents/${ghPath}`,{
+          method:"PUT",
+          headers:{"User-Agent":"RoyalBot","Authorization":`token ${GH_TOKEN}`,"Accept":"application/vnd.github+json","Content-Type":"application/json"},
+          body: JSON.stringify({message:`feat: approve quote submission ${fileName}`,content:encoded,...(sha?{sha}:{})})
+        });
+
+        if(!putRes.ok){
+          const err = await putRes.text();
+          console.error("qr_accept GitHub error:",err);
+          uploadCounters[prefix] = Math.max(0,(uploadCounters[prefix]||1)-1);
+          await interaction.followUp({content:`❌ GitHub upload failed (HTTP ${putRes.status}).`,ephemeral:true}).catch(()=>{});
+          return;
+        }
+        cacheQuoteFolder(fileName, destFolder);
+
+        const s = getScore(submitterId, null);
+        s.imagesUploaded = (s.imagesUploaded || 0) + 1;
+        if(!Array.isArray(s.uploadedImages)) s.uploadedImages = [];
+        if(!s.uploadedImages.includes(fileName)) s.uploadedImages.push(fileName);
+        saveData();
+
+        try{
+          await interaction.editReply({
+            content:`✅ **Quote approved** by <@${uid}>\n\`${fileName}\` has been uploaded to \`${destFolder}\`!`,
+            components:[]
+          });
+        }catch{}
+
+        try{
+          const submitter = await client.users.fetch(submitterId).catch(()=>null);
+          if(submitter) await submitter.send(`✅ Your quote submission \`${rawName}\` was **approved** and added as \`${fileName}\`! 🎉`).catch(()=>{});
+        }catch{}
+      }catch(e){
+        console.error("qr_accept error:",e.message);
+        try{await interaction.followUp({content:`❌ Something went wrong: ${e.message}`,ephemeral:true});}catch{}
+      }
+      return;
+    }
+
+    // ── /tempowner interactive panel: selects, grant, revoke, cancel ─────────
+    if(cid.startsWith("to_cmds_")||cid.startsWith("to_feats_")||cid.startsWith("to_dur_")||cid.startsWith("to_grant_")||cid.startsWith("to_revoke_")||cid.startsWith("to_cancel_")){
+      const token = cid.slice(cid.indexOf("_",3)+1);
+      const b = tempOwnerBuilders.get(token);
+      if(!b){ try{await interaction.reply({content:"❌ This panel has expired: run `/tempowner` again.",ephemeral:true});}catch{} return; }
+      if(b.ownerId !== uid){ try{await interaction.reply({content:"❌ Only the owner who ran this command can use this panel.",ephemeral:true});}catch{} return; }
+
+      if(cid.startsWith("to_cmds_")){
+        b.commands = new Set(interaction.values);
+        if(!(await btnAck(interaction))) return;
+        try{ await interaction.editReply(buildTempOwnerPanel(token)); }catch{}
+        return;
+      }
+      if(cid.startsWith("to_feats_")){
+        b.features = new Set(interaction.values);
+        if(!(await btnAck(interaction))) return;
+        try{ await interaction.editReply(buildTempOwnerPanel(token)); }catch{}
+        return;
+      }
+      if(cid.startsWith("to_dur_")){
+        b.duration = interaction.values[0];
+        if(!(await btnAck(interaction))) return;
+        try{ await interaction.editReply(buildTempOwnerPanel(token)); }catch{}
+        return;
+      }
+
+      if(cid.startsWith("to_cancel_")){
+        tempOwnerBuilders.delete(token);
+        if(!(await btnAck(interaction))) return;
+        try{ await interaction.editReply({content:"❌ Cancelled.",components:[]}); }catch{}
+        return;
+      }
+
+      if(cid.startsWith("to_revoke_")){
+        const existing = tempOwnerGrants.get(b.targetUserId);
+        if(existing?.timerId) clearTimeout(existing.timerId);
+        tempOwnerGrants.delete(b.targetUserId);
+        saveDataAndCommitNow().catch(()=>{});
+        tempOwnerBuilders.delete(token);
+        if(!(await btnAck(interaction))) return;
+        try{ await interaction.editReply({content:`🗑️ Revoked all temp owner access from <@${b.targetUserId}>.`,components:[]}); }catch{}
+        return;
+      }
+
+      if(!b.duration || (b.commands.size===0 && b.features.size===0)){
+        try{await interaction.reply({content:"❌ Pick at least one command or feature, and a duration, first.",ephemeral:true});}catch{}
+        return;
+      }
+      if(!(await btnAck(interaction))) return;
+
+      const existing = tempOwnerGrants.get(b.targetUserId);
+      if(existing?.timerId) clearTimeout(existing.timerId);
+
+      const expiresAt = b.duration === "permanent" ? null : (Date.now() + parseInt(b.duration) * 60_000);
+      const timerId = expiresAt === null ? null : setTimeout(()=>{ tempOwnerGrants.delete(b.targetUserId); }, parseInt(b.duration) * 60_000);
+      tempOwnerGrants.set(b.targetUserId, {
+        commands: new Set(b.commands),
+        features: new Set(b.features),
+        expiresAt,
+        timerId,
+        grantedBy: b.ownerId,
+        grantedAt: Date.now(),
+      });
+      saveDataAndCommitNow().catch(()=>{});
+      tempOwnerBuilders.delete(token);
+
+      const durText = b.duration === "permanent" ? "**permanently**" : `for **${b.duration} minute(s)**`;
+      const cmdsText = b.commands.size ? [...b.commands].map(c=>`\`/${c}\``).join(" ") : "_none_";
+      const featsText = b.features.size ? [...b.features].map(f=>GRANTABLE_OWNER_FEATURES.find(x=>x.id===f)?.label||f).join(", ") : "_none_";
+
+      try{
+        await interaction.editReply({
+          content:`✅ <@${b.targetUserId}> has been granted temp owner access ${durText}.\n**Commands:** ${cmdsText}\n**Features:** ${featsText}\n\n**📋 Current grants:**\n${formatGrantsList()}`,
+          components:[],
+        });
+      }catch{}
+
+      try{
+        const targetUser = await client.users.fetch(b.targetUserId).catch(()=>null);
+        if(targetUser){
+          const expiryText = expiresAt === null ? "This access is **permanent**." : `Expires <t:${Math.floor(expiresAt/1000)}:R>.`;
+          const dm = await targetUser.createDM();
+          await dm.send([
+            `🔑 **Temporary Owner Access Granted**`,
+            `You've been given owner access on RoyalBot. ${expiryText}`,
+            `**Commands:** ${cmdsText}`,
+            `**Features:** ${featsText}`,
+          ].join("\n"));
+        }
+      }catch(e){ console.warn("[tempowner] DM failed:", e.message); }
+
+      return;
+    }
+
+    // ── /blacklist interactive panel: selects, toggles, save, clear, cancel ────
+    if(cid.startsWith("bl_sel_")||cid.startsWith("bl_all_")||cid.startsWith("bl_silent_")||cid.startsWith("bl_save_")||cid.startsWith("bl_clear_")||cid.startsWith("bl_cancel_")){
+      let token;
+      const blSelMatch = cid.match(/^bl_sel_(.+)_(\d+)$/);
+      if(blSelMatch) token = blSelMatch[1];
+      else if(cid.startsWith("bl_all_")) token = cid.slice(7);
+      else if(cid.startsWith("bl_silent_")) token = cid.slice(10);
+      else if(cid.startsWith("bl_save_")) token = cid.slice(8);
+      else if(cid.startsWith("bl_clear_")) token = cid.slice(9);
+      else if(cid.startsWith("bl_cancel_")) token = cid.slice(10);
+
+      const b = blacklistBuilders.get(token);
+      if(!b){ try{await interaction.reply({content:"❌ This panel has expired: run `/blacklist` again.",ephemeral:true});}catch{} return; }
+      if(b.ownerId !== uid){ try{await interaction.reply({content:"❌ Only the owner who ran this command can use this panel.",ephemeral:true});}catch{} return; }
+
+      if(blSelMatch){
+        const cmdNames = buildGuildCommands().map(c=>c.name).sort();
+        const chunk = chunkArray(cmdNames.map(n=>({value:n})),25)[Number(blSelMatch[2])] || [];
+        const merged = mergeChunkedSelection([...b.features].filter(f=>f!=="all"), chunk, interaction.values);
+        b.features = new Set(merged);
+        if(!(await btnAck(interaction))) return;
+        try{ await interaction.editReply(buildBlacklistPanel(token)); }catch{}
+        return;
+      }
+
+      if(cid.startsWith("bl_all_")){
+        b.features = b.features.has("all") ? new Set() : new Set(["all"]);
+        if(!(await btnAck(interaction))) return;
+        try{ await interaction.editReply(buildBlacklistPanel(token)); }catch{}
+        return;
+      }
+
+      if(cid.startsWith("bl_silent_")){
+        b.silent = !b.silent;
+        if(!(await btnAck(interaction))) return;
+        try{ await interaction.editReply(buildBlacklistPanel(token)); }catch{}
+        return;
+      }
+
+      if(cid.startsWith("bl_cancel_")){
+        blacklistBuilders.delete(token);
+        if(!(await btnAck(interaction))) return;
+        try{ await interaction.editReply({content:"❌ Cancelled.",components:[]}); }catch{}
+        return;
+      }
+
+      if(cid.startsWith("bl_clear_")){
+        featureBlacklist.delete(b.targetUserId);
+        saveDataAndCommitNow().catch(()=>{});
+        blacklistBuilders.delete(token);
+        if(!(await btnAck(interaction))) return;
+        try{ await interaction.editReply({content:`✅ <@${b.targetUserId}> removed from the blacklist entirely.`,components:[]}); }catch{}
+        return;
+      }
+
+      if(b.features.size===0){
+        try{await interaction.reply({content:"❌ Pick at least one command, or Full Blacklist, first.",ephemeral:true});}catch{}
+        return;
+      }
+      if(OWNER_IDS.includes(b.targetUserId)){
+        try{await interaction.reply({content:"❌ Can't blacklist an owner.",ephemeral:true});}catch{}
+        return;
+      }
+      if(!(await btnAck(interaction))) return;
+
+      const wasFullyBlacklisted = isFullyBlacklisted(b.targetUserId);
+      featureBlacklist.set(b.targetUserId, { features: new Set(b.features), silent: b.silent });
+      saveDataAndCommitNow().catch(()=>{});
+      blacklistBuilders.delete(token);
+
+      const isAllNow = b.features.has("all");
+      const featsText = isAllNow ? "**🚫 Full blacklist**" : [...b.features].map(f=>`\`/${f}\``).join(" ");
+
+      try{
+        await interaction.editReply({
+          content:`✅ <@${b.targetUserId}> blacklist updated.\n**Blocked:** ${featsText}${b.silent?"\n🔇 Silent mode.":""}\n\n**📋 Currently blacklisted:**\n${formatBlacklistList()}`,
+          components:[],
+        });
+      }catch{}
+
+      if(isAllNow && !wasFullyBlacklisted && !b.silent){
+        try {
+          const targetUser = await client.users.fetch(b.targetUserId).catch(()=>null);
+          if(targetUser){
+            const dm = await targetUser.createDM();
+            await dm.send("You've been blacklisted.");
+          }
+          const relayChannelId = dmRelayChannels.get(b.targetUserId);
+          if(relayChannelId){
+            const hubGuild = dmRelayGuildId ? client.guilds.cache.get(dmRelayGuildId) : null;
+            const relayChannel = hubGuild ? hubGuild.channels.cache.get(relayChannelId) : null;
+            if(relayChannel) await relayChannel.send("🚫 This user has been blacklisted: DMs no longer relay through this channel.").catch(()=>{});
+          }
+        } catch(e) { console.error("[blacklist] notify failed:", e.message); }
+      }
+
+      return;
+    }
+
+    // ── Deleter: keep or delete a trashcan flagged quote ─────────────────────
+    if(cid.startsWith("del_keep_")||cid.startsWith("del_delete_")){
+      let delAllowed = OWNER_IDS.includes(uid) || hasTempOwnerFeature(uid,"quote_review");
+      if(!delAllowed && interaction.guildId){
+        const delCfg = quoteGuildConfigs.get(interaction.guildId);
+        if(delCfg && delCfg.folder && isServerQuoteStaff(uid, interaction.guildId)){
+          const delFileName = cid.startsWith("del_keep_") ? cid.slice(9) : cid.slice(11);
+          const delPath = await resolveQuoteGhPath(delFileName);
+          if(delPath.startsWith(`${delCfg.folder}/`)) delAllowed = true;
+        }
+      }
+      if(!delAllowed){
+        const delMsg = interaction.guildId && quoteGuildConfigs.has(interaction.guildId) ? QS_TEXT.notAllowedServerReview : "❌ Only owners can action flagged quotes.";
+        try{await interaction.reply({content:delMsg,ephemeral:true});}catch{}
+        return;
+      }
+      if(!(await btnAck(interaction))) return;
+
+      if(cid.startsWith("del_keep_")){
+        try{
+          await interaction.editReply({
+            content: interaction.message.content + `\n\n✅ **Kept** by <@${uid}>`,
+            components: []
+          });
+        }catch{}
+        return;
+      }
+
+      const fileName = cid.slice(11);
+      try {
+        const ghPath = await resolveQuoteGhPath(fileName);
+        const checkRes = await fetch(`https://api.github.com/repos/${GH_REPO}/contents/${ghPath}`,{
+          headers:{"User-Agent":"RoyalBot","Authorization":`token ${GH_TOKEN}`,"Accept":"application/vnd.github+json"}
+        });
+        if(!checkRes.ok){
+          await interaction.followUp({content:`❌ File not found or GitHub error (HTTP ${checkRes.status}).`,ephemeral:true});
+          return;
+        }
+        const fileData = await checkRes.json();
+        const sha = fileData.sha;
+        const delRes = await fetch(`https://api.github.com/repos/${GH_REPO}/contents/${ghPath}`,{
+          method:"DELETE",
+          headers:{"User-Agent":"RoyalBot","Authorization":`token ${GH_TOKEN}`,"Accept":"application/vnd.github+json","Content-Type":"application/json"},
+          body: JSON.stringify({message:`chore: delete flagged quote ${fileName} via trashcan review`,sha})
+        });
+        if(!delRes.ok){
+          await interaction.followUp({content:`❌ GitHub delete failed (HTTP ${delRes.status}).`,ephemeral:true});
+          return;
+        }
+        for(const [,s] of scores){
+          if(Array.isArray(s.uploadedImages)&&s.uploadedImages.includes(fileName))
+            s.uploadedImages = s.uploadedImages.filter(n=>n!==fileName);
+        }
+        for(const [,favSet] of favoritedQuotes){ favSet.delete(fileName); }
+        const flaggers = pendingFlagDeleters.get(fileName);
+        if(flaggers){ for(const flaggerId of flaggers) bumpFlagStat(flaggerId, "deleted"); }
+        pendingFlagDeleters.delete(fileName);
+        saveData();
+        try{
+          await interaction.editReply({
+            content: interaction.message.content + `\n\n🗑️ **Deleted** by <@${uid}>`,
+            components: []
+          });
+        }catch{}
+      }catch(e){
+        console.error("del_delete error:",e);
+        await interaction.followUp({content:"❌ Something went wrong during deletion.",ephemeral:true}).catch(()=>{});
+      }
+      return;
+    }
+
+    // ── "New quote" / "New good quote" / "New bad quote" buttons ────────────────
+    if(cid==="qnew_quote" || cid==="qnew_good" || cid==="qnew_bad"){
+      const qType = cid.slice(5);
+      const now_q = Date.now();
+      const last_q = quoteCooldown.get(uid) || 0;
+      if (now_q - last_q < 1500) {
+        try{ await interaction.reply({content:"Man chill tf out, 1.5 sec timeout",ephemeral:true}); }catch{}
+        return;
+      }
+      quoteCooldown.set(uid, now_q);
+      await interaction.deferUpdate().catch(()=>{});
+      try {
+        const chosen = qType==="good" ? await nextGoodQuoteImage(interaction.guildId)
+                     : qType==="bad"  ? await nextBadQuoteImage(interaction.guildId)
+                     : await nextQuoteImage(interaction.guildId);
+        if(!chosen){
+          await interaction.followUp({content:"Couldn't load quotes right now.",ephemeral:true}).catch(()=>{});
+          return;
+        }
+        const payload = Math.random() < 0.10
+          ? { content: "Do you wish to contribute to /quote? run /requestupload to send in your best quotes, screenshots or memes!", files: [chosen.download_url] }
+          : { files: [chosen.download_url] };
+        const sentMsg = await interaction.channel.send(payload).catch(()=>null);
+        if(sentMsg){
+          quoteVoteMessages.set(sentMsg.id, chosen.name);
+          const trashEntry = { filename: chosen.name, voters: new Set(), guildId: interaction.guildId||null, channelId: interaction.channelId||null, sentToDeleter: false, type: qType };
+          trashcanVotes.set(sentMsg.id, trashEntry);
+          const voteButtons = makeQuoteVoteButtons(sentMsg.id, quoteVotes.get(chosen.name), trashEntry);
+          await sentMsg.edit({ components: voteButtons }).catch(()=>{});
+          saveData();
+        }
+      } catch(e){
+        console.error("qnew_ button error:", e.message);
+      }
+      return;
+    }
+
+    // ── Favorite a quote (⭐ button, Patreon exclusive) ──────────────────────────
+    if(cid.startsWith("qfav_")){
+      const msgId = cid.slice("qfav_".length);
+      const filename = quoteVoteMessages.get(msgId);
+      if(!filename){ try{await interaction.reply({content:"❌ Couldn't find this quote.",ephemeral:true});}catch{} return; }
+      if(!(await isPatreonMember(uid))){
+        try{await interaction.reply({content:`Oops, this is a patreon exclusive feature! Try to support RoyalBot here if you wish (pls) ${PATREON_LINK}`,ephemeral:true});}catch{}
+        return;
+      }
+      let set = favoritedQuotes.get(uid);
+      if(!set){ set = new Set(); favoritedQuotes.set(uid, set); }
+      let added;
+      if(set.has(filename)){ set.delete(filename); added=false; } else { set.add(filename); added=true; }
+      saveData();
+      try{await interaction.reply({content: added ? `⭐ Added \`${filename}\` to your favorites.` : `☆ Removed \`${filename}\` from your favorites.`, ephemeral:true});}catch{}
+      return;
+    }
+
+    // ── /library "Favorites" button (Patreon exclusive): switches the view ────
+    if(cid.startsWith("libfav_")){
+      const backToUserId = cid.slice("libfav_".length);
+      if(!(await isPatreonMember(uid))){
+        try{await interaction.reply({content:`Oops, this is a patreon exclusive feature! Try to support RoyalBot here if you wish (pls) ${PATREON_LINK}`,ephemeral:true});}catch{}
+        return;
+      }
+      const favSet = favoritedQuotes.get(uid);
+      const files = favSet ? [...favSet] : [];
+      if(!files.length){ try{await interaction.reply({content:"⭐ You haven't favorited any quotes yet: click the ⭐ Favorite button on a quote to add one.",ephemeral:true});}catch{} return; }
+      const avatarUrl = interaction.user.displayAvatarURL({size:128,dynamic:true});
+      try{
+        await interaction.update({
+          ...(await buildLibraryEmbed(`${interaction.user.username} (Favorites)`, avatarUrl, files[0], 0, files.length)),
+          components: buildFavoriteLibraryButtons(0, files.length, backToUserId),
+        });
+      }catch{}
+      return;
+    }
+
+    // ── Favorites pagination (Patreon exclusive) ─────────────────────────────────
+    if(cid.startsWith("flib_prev_")||cid.startsWith("flib_next_")||cid.startsWith("flib_unfav_")||cid.startsWith("flib_back_")){
+      if(!(await isPatreonMember(uid))){
+        try{await interaction.reply({content:`Oops, this is a patreon exclusive feature! Try to support RoyalBot here if you wish (pls) ${PATREON_LINK}`,ephemeral:true});}catch{}
+        return;
+      }
+      const [,action,backToUserId,idxStr] = cid.match(/^flib_(prev|next|unfav|back)_(\d+)(?:_(\d+))?$/) || [];
+      if(!action) return;
+
+      if(action==="back"){
+        const targetScore = getScore(backToUserId, null);
+        const files = targetScore.uploadedImages || [];
+        if(!files.length){ try{await interaction.update({content:"That library is empty now.", embeds:[], components:[]});}catch{} return; }
+        const displayName = await client.users.fetch(backToUserId).then(u=>u.username).catch(()=>"User");
+        const avatarUrl = await client.users.fetch(backToUserId).then(u=>u.displayAvatarURL({size:128,dynamic:true})).catch(()=>null);
+        try{
+          await interaction.update({
+            ...(await buildLibraryEmbed(displayName, avatarUrl, files[0], 0, files.length)),
+            components: makeLibraryButtons(backToUserId, 0, files.length, false),
+          });
+        }catch{}
+        return;
+      }
+
+      const favSet = favoritedQuotes.get(uid);
+      let files = favSet ? [...favSet] : [];
+      if(!files.length){ try{await interaction.update({content:"⭐ You don't have any favorited quotes left.", embeds:[], components:[]});}catch{} return; }
+      let idx = parseInt(idxStr,10)||0;
+      if(action==="unfav"){
+        const removedName = files[idx];
+        favSet.delete(removedName);
+        saveData();
+        files = [...favSet];
+        if(!files.length){ try{await interaction.update({content:"⭐ Removed. You don't have any favorited quotes left.", embeds:[], components:[]});}catch{} return; }
+      } else if(action==="next"){
+        idx = idx+1;
+      } else {
+        idx = idx-1;
+      }
+      idx = Math.max(0, Math.min(idx, files.length-1));
+      const fn = files[idx];
+      const avatarUrl = interaction.user.displayAvatarURL({size:128,dynamic:true});
+      try{
+        await interaction.update({
+          ...(await buildLibraryEmbed(`${interaction.user.username} (Favorites)`, avatarUrl, fn, idx, files.length)),
+          components: buildFavoriteLibraryButtons(idx, files.length, backToUserId),
+        });
+      }catch{}
+      return;
+    }
+
+    // ── Quote vote buttons ─────────────────────────────────────────────────────
+    if(cid.startsWith("qvote_up_") || cid.startsWith("qvote_down_") || cid.startsWith("qvote_trash_") || cid.startsWith("qvote_who_") || cid.startsWith("qvote_uploader_")){
+      const [,direction,msgId] = cid.match(/^qvote_(up|down|trash|who|uploader)_(.+)$/)||[];
+      if(!msgId){ try{await interaction.reply({content:"❌ Invalid vote button.",ephemeral:true});}catch{} return; }
+
+      const filename = quoteVoteMessages.get(msgId);
+      if(!filename){
+        try{await interaction.reply({content:"❌ Couldn't find the quote this vote belongs to.",ephemeral:true});}catch{}
+        return;
+      }
+
+      // ── Who voted? (ephemeral breakdown) ─────────────────────────────────────
+      if(direction==="who"){
+        await interaction.deferReply({ephemeral:true}).catch(()=>{});
+        const uvm  = quoteUserVotes.get(filename) || new Map();
+        const upIds    = [...uvm.entries()].filter(([,v])=>v==="up").map(([id])=>id);
+        const downIds  = [...uvm.entries()].filter(([,v])=>v==="down").map(([id])=>id);
+        const tv       = trashcanVotes.get(msgId);
+        const trashIds = tv ? [...tv.voters] : [];
+
+        const fetchName = async id => {
+          try { const u = await client.users.fetch(id); return u.globalName || u.username; }
+          catch { return `<@${id}>`; }
+        };
+        const [upNames, downNames, trashNames] = await Promise.all([
+          Promise.all(upIds.map(fetchName)),
+          Promise.all(downIds.map(fetchName)),
+          Promise.all(trashIds.map(fetchName)),
+        ]);
+
+        const fmt = arr => arr.length ? arr.join(", ") : "_Nobody yet_";
+        const votes = quoteVotes.get(filename) || { up:0, down:0 };
+        const goodE  = appEmojiCache.get("goodquote");
+        const badE   = appEmojiCache.get("badquote");
+        const trashE = appEmojiCache.get("raccoontrashcan");
+        const goodStr  = goodE  ? `<:${goodE.name}:${goodE.id}>`  : "👍";
+        const badStr   = badE   ? `<:${badE.name}:${badE.id}>`   : "👎";
+        const trashStr = trashE ? `<:${trashE.name}:${trashE.id}>` : "🗑️";
+
+        await interaction.editReply({content:[
+          `**📊 Vote breakdown for \`${filename}\`**`,
+          `${goodStr} **Good (${votes.up}):** ${fmt(upNames)}`,
+          `${badStr} **Bad (${votes.down}):** ${fmt(downNames)}`,
+          `${trashStr} **Flagged (${trashIds.length}):** ${fmt(trashNames)}`,
+        ].join("\n")}).catch(()=>{});
+        return;
+      }
+
+      // ── Who uploaded this quote? (ephemeral) ─────────────────────────────────
+      if(direction==="uploader"){
+        await interaction.deferReply({ephemeral:true}).catch(()=>{});
+        const uploaderId = findQuoteUploader(filename);
+        if(!uploaderId){
+          await interaction.editReply({content:`🖼️ No upload record found for \`${filename}\`: it was likely added directly, before upload tracking existed.`}).catch(()=>{});
+          return;
+        }
+        const uploaderName = await client.users.fetch(uploaderId).then(u=>u.globalName||u.username).catch(()=>null);
+        await interaction.editReply({content:`🖼️ \`${filename}\` was uploaded by ${uploaderName?`**${uploaderName}** `:""}<@${uploaderId}>`}).catch(()=>{});
+        return;
+      }
+
+      await interaction.deferUpdate().catch(()=>{});
+
+      // ── Trash button ──────────────────────────────────────────────────────────
+      if(direction==="trash"){
+        const tv = trashcanVotes.get(msgId);
+        if(!tv){ return; }
+        const alreadyFlagged = tv.voters.has(uid);
+        if(alreadyFlagged){
+          tv.voters.delete(uid);
+        } else {
+          tv.voters.add(uid);
+          const flagChannelId = getFlagChannelId(tv.filename, tv.guildId);
+          if(!tv.sentToDeleter && tv.voters.size >= trashcanThreshold && flagChannelId){
+            tv.sentToDeleter = true;
+            pendingFlagDeleters.set(tv.filename, new Set(tv.voters));
+            for(const voterId of tv.voters) bumpFlagStat(voterId, "flagged");
+            (async()=>{
+              try{
+                const deleterCh = await client.channels.fetch(flagChannelId).catch(()=>null);
+                if(!deleterCh) return;
+                const gId = tv.guildId || "@me";
+                const cId = tv.channelId || "0";
+                const msgLink = `https://discord.com/channels/${gId}/${cId}/${msgId}`;
+                const payload = buildDeleterReviewPayload({
+                  fileName: tv.filename,
+                  flaggedLine: `👥 Flagged by: ${[...tv.voters].map(id=>`<@${id}>`).join(", ")} (${tv.voters.size}/${trashcanThreshold})`,
+                  msgLink,
+                });
+                await deleterCh.send(payload);
+              }catch(e){ console.error("[qvote trash] deleter send error:",e.message); }
+            })();
+          }
+        }
+        saveData();
+        const votes = quoteVotes.get(filename) || { up:0, down:0 };
+        const newButtons = makeQuoteVoteButtons(msgId, votes, tv);
+        await interaction.editReply({ components: newButtons }).catch(()=>{});
+        return;
+      }
+
+      // ── Up / Down buttons ─────────────────────────────────────────────────────
+      if(!quoteUserVotes.has(filename)) quoteUserVotes.set(filename, new Map());
+      const userVoteMap = quoteUserVotes.get(filename);
+      const prevVote = userVoteMap.get(uid) || null;
+      const newVote = (direction==="up") ? "up" : "down";
+
+      const v = quoteVotes.get(filename) || { up:0, down:0 };
+
+      if(prevVote === newVote){
+        if(newVote==="up")   { v.up   = Math.max(0, v.up-1);   bumpVoteStat(uid,"up",-1); }
+        else                 { v.down = Math.max(0, v.down-1); bumpVoteStat(uid,"down",-1); }
+        userVoteMap.delete(uid);
+      } else {
+        if(prevVote==="up")   { v.up   = Math.max(0, v.up-1);   bumpVoteStat(uid,"up",-1); }
+        if(prevVote==="down") { v.down = Math.max(0, v.down-1); bumpVoteStat(uid,"down",-1); }
+        if(newVote==="up")    { v.up++;   bumpVoteStat(uid,"up",1); }
+        else                  { v.down++; bumpVoteStat(uid,"down",1); }
+        userVoteMap.set(uid, newVote);
+      }
+
+      quoteVotes.set(filename, v);
+      saveData();
+
+      const tv = trashcanVotes.get(msgId) || null;
+      const newButtons = makeQuoteVoteButtons(msgId, v, tv);
+      await interaction.editReply({ components: newButtons }).catch(()=>{});
+      return;
+    }
+
+    if(cid.startsWith("clankerify_mode_")){
+      const parts    = cid.split("_");
+      const menuGuildId = parts[2];
+      const targetId = parts[3];
+      const durKey   = parts[4];
+      if(!(isEffectiveOwner(uid,"clankerify") || isGuildOwner(menuGuildId, uid))){
+        try{await interaction.reply({content:"Not for you.",ephemeral:true});}catch{}
+        return;
+      }
+      const duration = durKey === "perm" ? null : parseInt(durKey, 10);
+      const mode     = interaction.values[0] === "none" ? null : interaction.values[0];
+      const cmKey    = scopedKey(menuGuildId, targetId);
+
+      const expiresAt = duration ? Date.now() + duration * 60_000 : null;
+      clankerify.set(cmKey, { expiresAt, mode, ownerClanked: true });
+      saveData();
+
+      if(expiresAt){
+        setTimeout(() => {
+          clankerify.delete(cmKey);
+          saveData();
+        }, duration * 60_000);
+      }
+
+      const durationStr = duration ? `**${duration} minute(s)**` : "**permanently**";
+      const modeStr     = mode ? ` in **${mode.charAt(0).toUpperCase()+mode.slice(1)}** mode` : "";
+      try{
+        await interaction.update({
+          content:`🤖 <@${targetId}> has been clankerified ${durationStr}${modeStr} in this server. Their messages will be deleted and resent as a webhook.`,
+          components:[]
+        });
+      }catch{}
+      return;
+    }
+
+    // ── Self clank mode selection ─────────────────────────────────────────────
+    if(cid.startsWith("selfclank_mode_")){
+      const parts = cid.split("_");
+      const targetUserId = parts[2];
+      const durKey       = parts[3];
+      if(uid !== targetUserId){
+        try{await interaction.reply({content:"Not your selfclank menu.",ephemeral:true});}catch{}
+        return;
+      }
+      const scKey = scopedKey(interaction.guildId, uid);
+      const duration = parseInt(durKey, 10);
+      const mode = interaction.values[0] === "none" ? null : interaction.values[0];
+      const expiresAt = Date.now() + duration * 60_000;
+      clankerify.set(scKey, { expiresAt, mode });
+      if(interaction.guildId){
+        if(!selfClankUsers.has(interaction.guildId)) selfClankUsers.set(interaction.guildId, new Set());
+        selfClankUsers.get(interaction.guildId).add(uid);
+      }
+      saveData();
+      const guildIdSnap = interaction.guildId;
+      setTimeout(() => {
+        clankerify.delete(scKey);
+        if(guildIdSnap){
+          const gs = selfClankUsers.get(guildIdSnap);
+          if(gs) gs.delete(uid);
+        }
+        selfClankCooldown.set(uid, Date.now() + 10 * 60_000);
+        saveData();
+      }, duration * 60_000);
+      const modeStr = mode ? ` in **${mode.charAt(0).toUpperCase()+mode.slice(1)}** mode` : "";
+      try{
+        await interaction.update({
+          content:`🤖 You've selfclankerified yourself for **${duration} minute(s)**${modeStr}! Your messages will be deleted and resent as a webhook until it expires.`,
+          components:[]
+        });
+      }catch{}
+      return;
+    }
+
+    // ── Self clank community mode selection ───────────────────────────────────
+    if(cid.startsWith("selfclank_community_")){
+      const parts = cid.split("_");
+      const targetUserId = parts[2];
+      const durKey       = parts[3];
+      if(uid !== targetUserId){
+        try{await interaction.reply({content:"Not your selfclank menu.",ephemeral:true});}catch{}
+        return;
+      }
+      const scKey2 = scopedKey(interaction.guildId, uid);
+      const duration = parseInt(durKey, 10);
+      const mode = interaction.values[0];
+      if(!customClankerModes.has(mode)){
+        try{await interaction.reply({content:"❌ That community mode no longer exists.",ephemeral:true});}catch{}
+        return;
+      }
+      const expiresAt = Date.now() + duration * 60_000;
+      clankerify.set(scKey2, { expiresAt, mode });
+      if(interaction.guildId){
+        if(!selfClankUsers.has(interaction.guildId)) selfClankUsers.set(interaction.guildId, new Set());
+        selfClankUsers.get(interaction.guildId).add(uid);
+      }
+      saveData();
+      const guildIdSnap2 = interaction.guildId;
+      setTimeout(() => {
+        clankerify.delete(scKey2);
+        if(guildIdSnap2){ const gs=selfClankUsers.get(guildIdSnap2); if(gs) gs.delete(uid); }
+        selfClankCooldown.set(uid, Date.now() + 10 * 60_000);
+        saveData();
+      }, duration * 60_000);
+      const cm = customClankerModes.get(mode);
+      try{
+        await interaction.update({
+          content:`🤖 You've selfclankerified yourself for **${duration} minute(s)** using **${cm.emoji||"⭐"} ${mode}**!`,
+          components:[]
+        });
+      }catch{}
+      return;
+    }
+
+    // ── Clankerify community mode selection ───────────────────────────────────
+    if(cid.startsWith("clankerify_community_")){
+      const parts    = cid.split("_");
+      const menuGuildId = parts[2];
+      const targetId = parts[3];
+      const durKey2  = parts[4];
+      if(!(isEffectiveOwner(uid,"clankerify") || isGuildOwner(menuGuildId, uid))){
+        try{await interaction.reply({content:"Not for you.",ephemeral:true});}catch{}
+        return;
+      }
+      const duration = durKey2 === "perm" ? null : parseInt(durKey2, 10);
+      const mode     = interaction.values[0];
+      if(!customClankerModes.has(mode)){
+        try{await interaction.reply({content:"❌ That community mode no longer exists.",ephemeral:true});}catch{}
+        return;
+      }
+      const ccKey = scopedKey(menuGuildId, targetId);
+      const expiresAt = duration ? Date.now() + duration * 60_000 : null;
+      clankerify.set(ccKey, { expiresAt, mode, ownerClanked: true });
+      saveData();
+      if(expiresAt) setTimeout(() => { clankerify.delete(ccKey); saveData(); }, duration * 60_000);
+      const cm = customClankerModes.get(mode);
+      const durationStr = duration ? `**${duration} minute(s)**` : "**permanently**";
+      try{
+        await interaction.update({
+          content:`🤖 <@${targetId}> has been clankerified ${durationStr} in **${cm.emoji||"⭐"} ${mode}** (community mode) in this server.`,
+          components:[]
+        });
+      }catch{}
+      return;
+    }
+
+    // ── Activity check role selection ─────────────────────────────────────────
+    if(cid.startsWith("ac_required_")||cid.startsWith("ac_excluded_")){
+      if(!interaction.client._acPending) interaction.client._acPending = new Map();
+      const pending = interaction.client._acPending.get(interaction.user.id);
+      if(!pending){ try{await interaction.reply({content:"Session expired. Run /activity-check again.",ephemeral:true});}catch{}return; }
+
+      const isRequired = cid.startsWith("ac_required_");
+      const selected = interaction.values;
+
+      if(isRequired) pending.requiredIds = selected;
+      else           pending.excludedIds = selected;
+
+      interaction.client._acPending.set(interaction.user.id, pending);
+
+      const readyToSend = pending.requiredIds.length > 0;
+      const reqNames  = pending.requiredIds.map(id=>interaction.guild.roles.cache.get(id)?.name||id).join(", ")||"none";
+      const exclNames = pending.excludedIds.map(id=>interaction.guild.roles.cache.get(id)?.name||id).join(", ")||"none (RA/LOA always excluded)";
+
+      const sendBtn = new MessageActionRow().addComponents(
+        new MessageButton().setCustomId("ac_send_"+interaction.user.id).setLabel("Send Activity Check").setStyle("SUCCESS").setDisabled(!readyToSend)
+      );
+
+      try {
+        await interaction.update({
+          content:[
+            `📋 **Activity Check Setup**`,
+            `✅ Required roles: **${reqNames}**`,
+            `🚫 Excluded roles: **${exclNames}**`,
+            readyToSend ? `\nClick **Send Activity Check** when ready.` : `\nSelect at least one required role first.`
+          ].join("\n"),
+          components:[...interaction.message.components.slice(0,2), sendBtn]
+        });
+      } catch{}
+      return;
+    }
+
+    if(cid.startsWith("ac_send_")){
+      const userId = cid.slice(8);
+      if(interaction.user.id !== userId){ try{await interaction.reply({content:"Not your activity check.",ephemeral:true});}catch{}return; }
+      if(!interaction.client._acPending) interaction.client._acPending = new Map();
+      const pending = interaction.client._acPending.get(userId);
+      if(!pending){ try{await interaction.reply({content:"Session expired. Run /activity-check again.",ephemeral:true});}catch{}return; }
+      interaction.client._acPending.delete(userId);
+
+      const { channel, deadlineHr, customMsg, doPing, requiredIds, excludedIds, parsedSchedule, scheduleStr } = pending;
+      const cfg = raConfig.get(interaction.guildId)||{};
+      const autoExcluded = [cfg.raRoleId, cfg.loaRoleId].filter(Boolean);
+      const allExcluded  = [...new Set([...excludedIds, ...autoExcluded])];
+
+      const deadlineTs   = Math.floor((Date.now()+deadlineHr*3600000)/1000);
+      const roleMentions = requiredIds.map(id=>`<@&${id}>`).join(", ");
+      const pingText     = doPing ? requiredIds.map(id=>`<@&${id}>`).join(" ")+"\n" : "";
+
+      const msgContent = [
+        pingText,
+        `📋 **Activity Check**`,
+        ``,
+        customMsg||"React with ✅ to confirm you're active!",
+        ``,
+        `**Required roles:** ${roleMentions}`,
+        `**Deadline:** <t:${deadlineTs}:R> (<t:${deadlineTs}:f>)`,
+        ``,
+        `React below with ✅ to check in.`
+      ].join("\n");
+
+      try { await interaction.update({content:"✅ Sending activity check…",components:[]}); } catch{}
+
+      let sentMsg;
+      try {
+        sentMsg = await safeSend(channel, msgContent);
+        if(!sentMsg) return;
+        await sentMsg.react("✅");
+      } catch(e) {
+        await interaction.followUp({content:`❌ Failed to send: ${e.message}`,ephemeral:true}).catch(()=>{});
+        return;
+      }
+
+      activityChecks.set(sentMsg.id,{
+        guildId:    interaction.guildId,
+        channelId:  channel.id,
+        roleIds:    requiredIds,
+        excludedIds: allExcluded,
+        deadline:   Date.now()+deadlineHr*3600000,
+        messageId:  sentMsg.id,
+      });
+
+      if (parsedSchedule) {
+        const scKey = `${interaction.guildId}:${channel.id}`;
+        scheduledChecks.set(scKey, {
+          guildId:     interaction.guildId,
+          channelId:   channel.id,
+          dayOfWeek:   parsedSchedule.dayOfWeek,
+          hour:        parsedSchedule.hour,
+          minute:      parsedSchedule.minute,
+          deadlineHr,
+          customMsg,
+          doPing,
+          roleIds:     requiredIds,
+          excludedIds: allExcluded,
+          scheduleStr,
+        });
+      }
+
+      saveData();
+
+      setTimeout(async()=>{
+        const check = activityChecks.get(sentMsg.id);
+        if(!check) return;
+        activityChecks.delete(sentMsg.id);
+        saveData();
+
+        let reacted = new Set();
+        try {
+          const freshMsg = await channel.messages.fetch(sentMsg.id);
+          const reaction = freshMsg.reactions.cache.get("✅");
+          if(reaction){
+            const users = await reaction.users.fetch();
+            users.forEach(u=>{ if(!u.bot) reacted.add(u.id); });
+          }
+        } catch(e){ console.error("activity-check fetch error:",e); }
+
+        let missing = [];
+        try {
+          const members = await interaction.guild.members.fetch();
+          members.forEach(m=>{
+            if(m.user.bot) return;
+            const hasRequired = check.roleIds.some(rid=>m.roles.cache.has(rid));
+            if(!hasRequired) return;
+            const isExcluded = check.excludedIds.some(rid=>m.roles.cache.has(rid));
+            if(isExcluded) return;
+            if(!reacted.has(m.id)) missing.push(`<@${m.id}>`);
+          });
+        } catch(e){ console.error("activity-check member fetch error:",e); }
+
+        const respondedCount = reacted.size;
+        const missingText = missing.length ? missing.join(", ") : "None: everyone checked in! ✅";
+
+        await safeSend(channel,[
+          `📋 **Activity Check Closed**`,
+          ``,
+          `✅ **Checked in:** ${respondedCount} member${respondedCount!==1?"s":""}`,
+          `❌ **Did not respond:** ${missingText}`,
+        ].join("\n")).catch(()=>{});
+      }, deadlineHr*3600000);
+
+      return;
+    }
+
+    // ── Marriage proposal accept/decline ──────────────────────────────────────
+    if(cid.startsWith("marry_accept_")||cid.startsWith("marry_decline_")){
+      const isAccept = cid.startsWith("marry_accept_");
+      const parts = (isAccept ? cid.slice(13) : cid.slice(14)).split("_");
+      const proposerId = parts[0];
+      const targetId   = parts[1];
+
+      if(uid !== targetId){
+        try{await interaction.reply({content:"This proposal isn't for you!",ephemeral:true});}catch{}
+        return;
+      }
+
+      const proposerScore = getScore(proposerId, null);
+      const targetScore   = getScore(targetId, null);
+
+      if(targetScore.pendingProposal !== proposerId){
+        try{await interaction.reply({content:"This proposal has already expired or been resolved.",ephemeral:true});}catch{}
+        return;
+      }
+
+      if(!(await btnAck(interaction)))return;
+
+      if(isAccept){
+        if(proposerScore.marriedTo){
+          targetScore.pendingProposal = null;
+          saveData();
+          try{await interaction.editReply({content:`💔 The proposal can no longer be accepted: the proposer is already married to someone else.`,components:[]});}catch{}
+          return;
+        }
+        if(targetScore.marriedTo){
+          targetScore.pendingProposal = null;
+          saveData();
+          try{await interaction.editReply({content:`💔 You are already married to someone else!`,components:[]});}catch{}
+          return;
+        }
+        proposerScore.marriedTo       = targetId;
+        targetScore.marriedTo         = proposerId;
+        targetScore.pendingProposal   = null;
+        saveData();
+        try{await interaction.editReply({content:`💍 **${interaction.user.username}** said YES! 🎉\n<@${proposerId}> and <@${targetId}> are now married! Congratulations! 💕`,components:[]});}catch{}
+      } else {
+        targetScore.pendingProposal = null;
+        saveData();
+        try{await interaction.editReply({content:`💔 **${interaction.user.username}** declined the proposal. Maybe next time, <@${proposerId}>.`,components:[]});}catch{}
+      }
+      return;
+    }
+    // ── Library navigation ────────────────────────────────────────────────────
+    if(cid.startsWith("lib_")){
+      const parts = cid.split("_");
+      const dir = parts[1];
+      const targetUserId = parts[2];
+      const currentIdx = parseInt(parts[3]);
+      const targetScore = getScore(targetUserId, null);
+      const files = targetScore.uploadedImages || [];
+      if(!files.length){ try{await interaction.reply({content:"No images found.",ephemeral:true});}catch{}return; }
+      const targetUser = await client.users.fetch(targetUserId).catch(()=>null);
+      const displayName = targetUser?.username || "Unknown";
+      const avatarUrl = targetUser?.displayAvatarURL({ size:128, dynamic:true });
+
+      // ── Go to page prompt ─────────────────────────────────────────────────
+      if(dir === "goto"){
+        try{ await interaction.reply({content:`🔢 **Jump to image #**: Type a number between **1** and **${files.length}** in chat (30s):`,ephemeral:true}); }catch{}
+        const collector = interaction.channel.createMessageCollector({
+          filter: m => m.author.id === uid && !isNaN(m.content.trim()),
+          max: 1, time: 30000
+        });
+        collector.on("collect", async m => {
+          try{ await m.delete(); }catch{}
+          const gotoIdx = Math.max(0, Math.min(parseInt(m.content.trim()) - 1, files.length - 1));
+          const fileName = files[gotoIdx];
+          try{
+            await interaction.message.edit({
+              ...(await buildLibraryEmbed(displayName, avatarUrl, fileName, gotoIdx, files.length)),
+              components: makeLibraryButtons(targetUserId, gotoIdx, files.length, false),
+            });
+          }catch{}
+          try{ await interaction.followUp({content:`✅ Jumped to image **#${gotoIdx+1}**.`,ephemeral:true}); }catch{}
+        });
+        collector.on("end",(_,reason)=>{ if(reason==="time") interaction.followUp({content:"⏰ Timed out.",ephemeral:true}).catch(()=>{}); });
+        return;
+      }
+
+      // ── Prev / Next ───────────────────────────────────────────────────────
+      const newIdx = dir==="prev" ? Math.max(0,currentIdx-1) : Math.min(files.length-1,currentIdx+1);
+      const fileName = files[newIdx];
+      try{
+        await interaction.update({
+          ...(await buildLibraryEmbed(displayName, avatarUrl, fileName, newIdx, files.length)),
+          components: makeLibraryButtons(targetUserId, newIdx, files.length, false),
+        });
+      }catch{}
+      return;
+    }
+
+    // ── Library: flag currently viewed image for review ────────────────────────
+    if(cid.startsWith("libflag_")){
+      const parts = cid.split("_");
+      const targetUserId = parts[1];
+      const idx = parseInt(parts[2]);
+      const targetScore = getScore(targetUserId, null);
+      const files = targetScore.uploadedImages || [];
+      const fileName = files[idx];
+      if(!fileName){ try{await interaction.reply({content:"❌ Couldn't find that image anymore.",ephemeral:true});}catch{}return; }
+
+      const libFlagChannelId = getFlagChannelId(fileName, interaction.guildId);
+      if(!libFlagChannelId){
+        try{await interaction.reply({content:"No review channel configured.",ephemeral:true});}catch{}
+        return;
+      }
+
+      if(!(await btnAck(interaction))) return;
+
+      pendingFlagDeleters.set(fileName, new Set([uid]));
+      bumpFlagStat(uid, "flagged");
+
+      try{
+        const deleterCh = await client.channels.fetch(libFlagChannelId).catch(()=>null);
+        if(deleterCh){
+          const payload = buildDeleterReviewPayload({
+            fileName,
+            flaggedLine: `👤 Flagged by <@${uid}> via /library`,
+          });
+          await deleterCh.send(payload);
+        }
+      }catch(e){ console.error("[libflag] send to deleter failed:", e.message); }
+
+      try{
+        const targetUser = await client.users.fetch(targetUserId).catch(()=>null);
+        const displayName = targetUser?.username || "Unknown";
+        const avatarUrl = targetUser?.displayAvatarURL({ size:128, dynamic:true });
+        await interaction.editReply({
+          ...(await buildLibraryEmbed(displayName, avatarUrl, fileName, idx, files.length)),
+          components: makeLibraryButtons(targetUserId, idx, files.length, true),
+        });
+      }catch{}
+
+      try{ await interaction.followUp({content:"Flagged for review.",ephemeral:true}); }catch{}
+      return;
+    }
+
+    // ── Quote manager navigation & delete buttons ─────────────────────────────
+    if(cid.startsWith("qm_")){
+      if(!OWNER_IDS.includes(uid) && !hasTempOwnerFeature(uid,"quote_manager")){ await btnEphemeral(interaction,"Owner only."); return; }
+
+      if(cid.startsWith("qm_delete_")){
+        const fileName = cid.slice(10);
+        if(!(await btnAck(interaction))) return;
+        try {
+          const ghPath = await resolveQuoteGhPath(fileName);
+          const checkRes = await fetch(`https://api.github.com/repos/${GH_REPO}/contents/${ghPath}`,{
+            headers:{"User-Agent":"RoyalBot","Authorization":`token ${GH_TOKEN}`,"Accept":"application/vnd.github+json"}
+          });
+          if(!checkRes.ok){ await interaction.followUp({content:`❌ File not found or GitHub error (HTTP ${checkRes.status}).`,ephemeral:true}); return; }
+          const fileData = await checkRes.json();
+          const sha = fileData.sha;
+          const delRes = await fetch(`https://api.github.com/repos/${GH_REPO}/contents/${ghPath}`,{
+            method:"DELETE",
+            headers:{"User-Agent":"RoyalBot","Authorization":`token ${GH_TOKEN}`,"Accept":"application/vnd.github+json","Content-Type":"application/json"},
+            body: JSON.stringify({message:`chore: delete quote image ${fileName} via Discord`,sha})
+          });
+          if(!delRes.ok){ await interaction.followUp({content:`❌ GitHub delete failed (HTTP ${delRes.status}).`,ephemeral:true}); return; }
+          for(const [,s] of scores){
+            if(Array.isArray(s.uploadedImages)&&s.uploadedImages.includes(fileName))
+              s.uploadedImages = s.uploadedImages.filter(n=>n!==fileName);
+          }
+          saveData();
+          try { await interaction.editReply({content:`🗑️ \`${fileName}\` deleted. Use \`/quotemanage\` to continue browsing.`,components:[]}); } catch{}
+        } catch(e) {
+          console.error("qm_delete error:",e);
+          await interaction.followUp({content:"❌ Something went wrong during deletion.",ephemeral:true}).catch(()=>{});
+        }
+        return;
+      }
+
+      const parts_qm = cid.split("_");
+      const dir_qm   = parts_qm[1];
+      const curIdx   = parseInt(parts_qm[2]);
+      if(!(await btnAck(interaction))) return;
+      try {
+        const files_qm = (await fetchAllQuoteFiles()).filter(f=>/\.(png|jpe?g|gif|webp)$/i.test(f.name));
+        if(!files_qm.length){ await interaction.editReply({content:"📭 No images left in the quotes folders.",components:[]}); return; }
+        const newIdx_qm = dir_qm==="prev" ? Math.max(0,curIdx-1) : Math.min(files_qm.length-1,curIdx+1);
+        const file_qm = files_qm[newIdx_qm];
+        const imageUrl_qm = quoteRawUrl(file_qm.name, file_qm.folder);
+        const navRow_qm = new MessageActionRow().addComponents(
+          new MessageButton().setCustomId(`qm_prev_${newIdx_qm}`).setLabel("◀ Prev").setStyle("SECONDARY").setDisabled(newIdx_qm===0),
+          new MessageButton().setCustomId(`qm_next_${newIdx_qm}_${files_qm.length}`).setLabel("Next ▶").setStyle("SECONDARY").setDisabled(newIdx_qm>=files_qm.length-1),
+          new MessageButton().setCustomId(`qm_delete_${file_qm.name}`).setLabel("🗑️ Delete This").setStyle("DANGER"),
+        );
+        await interaction.editReply({
+          content:`🖼️ **Quote Manager**: ${newIdx_qm+1} of ${files_qm.length}\n\`${file_qm.name}\`\n${imageUrl_qm}`,
+          components:[navRow_qm],
+        });
+      } catch(e) {
+        console.error("qm nav error:",e);
+        await interaction.followUp({content:"❌ Something went wrong.",ephemeral:true}).catch(()=>{});
+      }
+      return;
+    }
+
+    if(cid.startsWith("hm_")){
+      const letter=cid.slice(3);
+      const gd=activeGames.get(interaction.channelId);
+      if(!gd||gd.type!=="hangman"){ try{await interaction.reply({content:"No active hangman game.",ephemeral:true});}catch{}return;}
+      if(gd.playerId!==uid){ try{await interaction.reply({content:"Not your game!",ephemeral:true});}catch{}return;}
+      if(!(await btnAck(interaction)))return;
+      gd.guessed.add(letter);
+      const wrong=[...gd.guessed].filter(l=>!gd.word.includes(l));
+      const won=!gd.word.split("").some(l=>!gd.guessed.has(l));
+      if(won){activeGames.delete(interaction.channelId);recordWin(uid,interaction.user.username,CONFIG.win_hangman);saveData();try{await interaction.editReply({content:`✅ **Got it!** Word was **${gd.word}**! 🎉 (+${CONFIG.win_hangman} coins)\n\n${renderHangman(gd.word,gd.guessed)}`,components:makeHangmanButtons(gd.word,gd.guessed,true)});}catch{}}
+      else if(wrong.length>=6){activeGames.delete(interaction.channelId);recordLoss(uid,interaction.user.username);saveData();try{await interaction.editReply({content:`💀 **Game over!** Word was **${gd.word}**.\n\n${renderHangman(gd.word,new Set([...gd.guessed,...gd.word.split("")]))}`,components:makeHangmanButtons(gd.word,gd.guessed,true)});}catch{}}
+      else{try{await interaction.editReply({content:`🪢 **Hangman**\n\n${renderHangman(gd.word,gd.guessed)}`,components:makeHangmanButtons(gd.word,gd.guessed)});}catch{}}
+      return;
+    }
+
+    if(cid.startsWith("snake_")){
+      const dir=cid.slice(6);
+      if(dir==="noop"){try{await interaction.deferUpdate();}catch{}return;}
+      const gd=activeGames.get(interaction.channelId);
+      if(!gd||gd.type!=="snake"){try{await interaction.reply({content:"No active snake game.",ephemeral:true});}catch{}return;}
+      if(gd.playerId!==uid){try{await interaction.reply({content:"Not your game!",ephemeral:true});}catch{}return;}
+      if(!(await btnAck(interaction)))return;
+      const result=moveSnake(gd,dir);
+      if(result!=="ok"){activeGames.delete(interaction.channelId);const coins=gd.score*CONFIG.win_snake_per_point;if(coins>0)getScore(uid,interaction.user.username).coins+=coins;recordLoss(uid,interaction.user.username);saveData();try{await interaction.editReply({content:`💀 **Game Over!** Score: **${gd.score}**${coins>0?` (+${coins} coins)`:""}\n\n${renderSnake(gd)}`,components:makeSnakeButtons(true)});}catch{}}
+      else{try{await interaction.editReply({content:`🐍 **Snake** | Score: ${gd.score}\n\n${renderSnake(gd)}`,components:makeSnakeButtons()});}catch{}}
+      return;
+    }
+
+    if(cid.startsWith("ms_")){
+      const parts2=cid.split("_"); const row=parseInt(parts2[1]),col=parseInt(parts2[2]);
+      const gd=activeGames.get(interaction.channelId);
+      if(!gd||gd.type!=="minesweeper"){await btnEphemeral(interaction,"No active minesweeper game here.");return;}
+      if(gd.playerId!==uid){await btnEphemeral(interaction,"This is not your game!");return;}
+      if(!await btnAck(interaction))return;
+      const g=gd.game;
+      const mineCount=g.mineCount||{easy:3,medium:6,hard:10}[gd.diff||"easy"];
+      const reward={easy:CONFIG.win_minesweeper_easy,medium:CONFIG.win_minesweeper_medium,hard:CONFIG.win_minesweeper_hard}[gd.diff||"easy"];
+      try{
+        if(g.firstClick){
+          placeMinesAvoiding(g,row,col);
+          revealMS(g,row,col);
+          const allDone=g.revealed.every((v,i)=>v||g.mines[i]);
+          if(allDone){
+            activeGames.delete(interaction.channelId);
+            recordWin(uid,interaction.user.username,reward);
+            saveData();
+            await interaction.editReply({content:`🎉 **Board cleared!** +${reward} coins\n💣 **Minesweeper** (${gd.diff||"easy"}) - ${mineCount} mines`,components:makeMSButtons(g,true)});
+          } else {
+            const remaining=g.revealed.filter((v,i)=>!v&&!g.mines[i]).length;
+            await interaction.editReply({content:`💣 **Minesweeper** (${gd.diff||"easy"}) - ${mineCount} mines | ${remaining} cells left`,components:makeMSButtons(g)});
+          }
+          return;
+        }
+        if(g.mines[row*g.cols+col]){
+          g.revealed.fill(true);
+          activeGames.delete(interaction.channelId);
+          recordLoss(uid,interaction.user.username);
+          saveData();
+          await interaction.editReply({
+            content:`💥 **BOOM!** You hit a mine! Game over.\n💣 **Minesweeper** (${gd.diff||"easy"}) - ${mineCount} mines`,
+            components:makeMSButtons(g,true)
+          });
+        } else {
+          revealMS(g,row,col);
+          const allDone=g.revealed.every((v,i)=>v||g.mines[i]);
+          if(allDone){
+            activeGames.delete(interaction.channelId);
+            recordWin(uid,interaction.user.username,reward);
+            saveData();
+            await interaction.editReply({
+              content:`🎉 **Board cleared!** +${reward} coins\n💣 **Minesweeper** (${gd.diff||"easy"}) - ${mineCount} mines`,
+              components:makeMSButtons(g,true)
+            });
+          } else {
+            const remaining=g.revealed.filter((v,i)=>!v&&!g.mines[i]).length;
+            await interaction.editReply({
+              content:`💣 **Minesweeper** (${gd.diff||"easy"}) - ${mineCount} mines | ${remaining} cells left`,
+              components:makeMSButtons(g)
+            });
+          }
+        }
+      }catch(e){console.error("ms click:",e?.message);}
+      return;
+    }
+
+    if(cid.startsWith("ttt_")){
+      const idx=parseInt(cid.slice(4));
+      const gd=activeGames.get(interaction.channelId);
+      if(!gd||gd.type!=="ttt"){try{await interaction.reply({content:"No active TTT game.",ephemeral:true});}catch{}return;}
+      if(uid!==gd.players[gd.turn]){try{await interaction.reply({content:"Not your turn!",ephemeral:true});}catch{}return;}
+      if(gd.board[idx]){try{await interaction.reply({content:"That spot is taken!",ephemeral:true});}catch{}return;}
+      if(!(await btnAck(interaction)))return;
+      gd.board[idx]=gd.turn===0?"X":"O";
+      const result=checkTTTWin(gd.board);
+      const[p0,p1]=[gd.players[0],gd.players[1]];
+      if(result){activeGames.delete(interaction.channelId);let txt;if(result==="draw"){recordDraw(p0,null);recordDraw(p1,null);txt="🤝 **Draw!**";}else{recordWin(gd.players[gd.turn],interaction.user.username,CONFIG.win_ttt);recordLoss(gd.players[1-gd.turn],null);txt=`🎉 <@${gd.players[gd.turn]}> wins! (+${CONFIG.win_ttt} coins)`;}saveData();try{await interaction.editReply({content:`❌⭕ **Tic Tac Toe**\n<@${p0}> ❌  vs  <@${p1}> ⭕\n\n${renderTTT(gd.board)}\n\n${txt}`,components:makeTTTButtons(gd.board,true)});}catch{}}
+      else{gd.turn=1-gd.turn;try{await interaction.editReply({content:`❌⭕ **Tic Tac Toe**\n<@${p0}> ❌  vs  <@${p1}> ⭕\n\n${renderTTT(gd.board)}\n\nIt's <@${gd.players[gd.turn]}>'s turn!`,components:makeTTTButtons(gd.board)});}catch{}}
+      return;
+    }
+
+    if(cid.startsWith("c4_")){
+      const col=parseInt(cid.slice(3));
+      const gd=activeGames.get(interaction.channelId);
+      if(!(await btnAck(interaction)))return;
+      if(!gd||gd.type!=="c4"){try{await interaction.followUp({content:"No active Connect 4 game.",ephemeral:true});}catch{}return;}
+      if(uid!==gd.players[gd.turn]){try{await interaction.followUp({content:"Not your turn!",ephemeral:true});}catch{}return;}
+      if(gd.board[col]!==0){try{await interaction.followUp({content:"That column is full!",ephemeral:true});}catch{}return;}
+      const row=dropC4(gd.board,col,gd.turn+1);
+      const[p0,p1]=[gd.players[0],gd.players[1]];
+      if(checkC4Win(gd.board,gd.turn+1)){
+        activeGames.delete(interaction.channelId);
+        recordWin(gd.players[gd.turn],interaction.user.username,CONFIG.win_c4);
+        recordLoss(gd.players[1-gd.turn],null);
+        saveData();
+        try{await interaction.editReply({content:`🔴🔵 **Connect 4**\n<@${p0}> 🔴  vs  <@${p1}> 🔵\n\n${renderC4(gd.board)}\n🎉 <@${gd.players[gd.turn]}> wins! (+${CONFIG.win_c4} coins)`,components:makeC4Buttons(true)});}catch{}
+      } else if(!gd.board.includes(0)){
+        activeGames.delete(interaction.channelId);
+        recordDraw(p0,null);recordDraw(p1,null);
+        saveData();
+        try{await interaction.editReply({content:`🔴🔵 **Connect 4**\n<@${p0}> 🔴  vs  <@${p1}> 🔵\n\n${renderC4(gd.board)}\n🤝 **Draw!**`,components:makeC4Buttons(true)});}catch{}
+      } else {
+        gd.turn=1-gd.turn;
+        try{await interaction.editReply({content:`🔴🔵 **Connect 4**\n<@${p0}> 🔴  vs  <@${p1}> 🔵\n\n${renderC4(gd.board)}\n<@${gd.players[gd.turn]}>'s turn!`,components:makeC4Buttons()});}catch{}
+      }
+      return;
+    }
+
+    if(cid.startsWith("bj_")){
+      const action=cid.slice(3);
+      const gd=activeGames.get(interaction.channelId);
+      if(!gd||gd.type!=="blackjack"){try{await interaction.reply({content:"No active blackjack game.",ephemeral:true});}catch{}return;}
+      if(gd.playerId!==uid){try{await interaction.reply({content:"Not your game!",ephemeral:true});}catch{}return;}
+      if(!(await btnAck(interaction)))return;
+      const{deck,playerHand,dealerHand,bet,playerScore}=gd;
+      const showBoard=(hide=true)=>`🃏 **Blackjack** (bet: ${bet} coins)\n\n**Your hand:** ${renderHand(playerHand)} - **${handVal(playerHand)}**\n**Dealer:** ${renderHand(dealerHand,hide)}${hide?"":" - **"+handVal(dealerHand)+"**"}`;
+      const bjFx=activeEffects.get(uid)||{};
+      const bjCharm=bjFx.lucky_charm_expiry&&bjFx.lucky_charm_expiry>Date.now();
+      const bjWin=(coins)=>bjCharm?Math.floor(coins*(1+CONFIG.lucky_charm_bonus/100)):coins;
+      if(action==="hit"){
+        playerHand.push(deck.pop());const pv=handVal(playerHand);
+        if(pv>21){activeGames.delete(interaction.channelId);playerScore.coins-=bet;recordLoss(uid,interaction.user.username);saveData();try{await interaction.editReply({content:`${showBoard(false)}\n\n💥 **Bust!** Lost **${bet}** coins.\n💰 Balance: **${playerScore.coins}**`,components:makeBJButtons(true)});}catch{}}
+        else if(pv===21){while(handVal(dealerHand)<17)dealerHand.push(deck.pop());const dv=handVal(dealerHand);let msg;if(dv>21||pv>dv){const w=bjWin(bet);playerScore.coins+=w;recordWin(uid,interaction.user.username,0);msg=`✅ You win **${w}** coins!`+(bjCharm?" 🍀":"");}else if(pv===dv){recordDraw(uid,interaction.user.username);msg=`🤝 Push!`;}else{playerScore.coins-=bet;recordLoss(uid,interaction.user.username);msg=`❌ Dealer wins. Lost **${bet}** coins.`;}activeGames.delete(interaction.channelId);saveData();try{await interaction.editReply({content:`${showBoard(false)}\n\n${msg}\n💰 Balance: **${playerScore.coins}**`,components:makeBJButtons(true)});}catch{}}
+        else{try{await interaction.editReply({content:showBoard(true),components:makeBJButtons()});}catch{}}
+      }else{
+        while(handVal(dealerHand)<17)dealerHand.push(deck.pop());const pv=handVal(playerHand),dv=handVal(dealerHand);let msg;if(dv>21||pv>dv){const w=bjWin(bet);playerScore.coins+=w;recordWin(uid,interaction.user.username,0);msg=`✅ You win **${w}** coins!`+(bjCharm?" 🍀":"");}else if(pv===dv){recordDraw(uid,interaction.user.username);msg=`🤝 Push!`;}else{playerScore.coins-=bet;recordLoss(uid,interaction.user.username);msg=`❌ Dealer wins. Lost **${bet}** coins.`;}activeGames.delete(interaction.channelId);saveData();try{await interaction.editReply({content:`${showBoard(false)}\n\n${msg}\n💰 Balance: **${playerScore.coins}**`,components:makeBJButtons(true)});}catch{}
+      }
+      return;
+    }
+
+    if(cid.startsWith("rps_")){
+      const lastUnd=cid.lastIndexOf("_");
+      const playerId=cid.slice(lastUnd+1);
+      const beforePlayer=cid.slice(0,lastUnd);
+      const choiceUnd=beforePlayer.lastIndexOf("_");
+      const choice=beforePlayer.slice(choiceUnd+1);
+      const gameId=beforePlayer.slice(4,choiceUnd);
+      if(uid!==playerId){try{await interaction.reply({content:"This button isn't for you!",ephemeral:true});}catch{}return;}
+      const gd=activeGames.get(gameId);
+      if(!gd||gd.type!=="rps"){try{await interaction.reply({content:"This game has expired.",ephemeral:true});}catch{}return;}
+      if(gd.choices[uid]){try{await interaction.reply({content:"You already chose!",ephemeral:true});}catch{}return;}
+      if(!(await btnAck(interaction)))return;
+      gd.choices[uid]=choice;
+      try{await interaction.editReply({content:`✅ You chose **${choice}**! Waiting for opponent...`,components:[]});}catch{}
+      if(Object.keys(gd.choices).length===2){
+        activeGames.delete(gameId);
+        const[id1,id2]=[gd.p1,gd.p2],c1=gd.choices[id1],c2=gd.choices[id2];
+        const beats={"✊":"✌️","✋":"✊","✌️":"✋"},names={"✊":"Rock","✋":"Paper","✌️":"Scissors"};
+        let txt;if(c1===c2){recordDraw(id1,null);recordDraw(id2,null);txt="🤝 **Draw!**";}
+        else if(beats[c1]===c2){recordWin(id1,gd.u1,CONFIG.win_rps);recordLoss(id2,null);txt=`🎉 <@${id1}> wins! ${names[c1]} beats ${names[c2]} (+${CONFIG.win_rps} coins)`;}
+        else{recordWin(id2,gd.u2,CONFIG.win_rps);recordLoss(id1,null);txt=`🎉 <@${id2}> wins! ${names[c2]} beats ${names[c1]} (+${CONFIG.win_rps} coins)`;}
+        saveData();
+        const ch=client.channels.cache.get(gd.channelId);
+        if(ch)await safeSend(ch,`✊✋✌️ **RPS Results!**\n<@${id1}>: ${names[c1]}\n<@${id2}>: ${names[c2]}\n\n${txt}`);
+      }
+      return;
+    }
+
+    if(cid.startsWith("help_page_")){
+      const page=parseInt(cid.slice(10));
+      const TOTAL=8;
+      if(page<0||page>=TOTAL){try{await interaction.deferUpdate();}catch{}return;}
+      if(!(await btnAck(interaction)))return;
+      const HELP_PAGES=[
+        {title:"🎉 Social & Utility :  Page 1 / 8",description:["**Romance**","`/marry user:…`: Propose 💍: target gets Accept/Decline buttons","`/divorce`: End the marriage 💔","`/partner [user]`: See who someone is married to","","**Media**","`/quote`: Inspirational quote image ✨","`/goodquote`: Top rated quote image ⭐","`/badquote`: Bottom rated quote image 💀","`/avatar user:…`: Get someone's avatar","","**Utility**","`/ping`: Bot latency 🏓","`/echo [message] [embed] [image] [title] [color] [replyto]`: Make the bot say something","`/remind time:… message:…`: Set a reminder (1 min – 1 week)","`/messageschedule time:… message:…`: Schedule a message to send later, as you, via webhook 📨 (e.g. `5 hours`, `2 days`, `1 week`, `1 month`)","`/premiere hours:… channel:… [title]`: Countdown to a video upload 🎬","`/upload source|link:…`: Upload an image/audio/video to the quotes folder 🖼️🔊🎬 *(authorized users)*","","**Info**","`/botinfo`: Bot stats","`/serverinfo`: Server member/channel/role info"].join("\n")},
+        {title:"📈 XP & Leaderboards :  Page 2 / 8",description:["**XP**","You earn XP by sending messages (1 min cooldown). 5–15 XP per message.","Level formula: `floor(50 × level^1.5)` XP per level","","`/xp [user]`: Check XP, level, and progress bar","`/xpleaderboard [scope:global|server]`: Top 10 by XP","","**Stats & Leaderboards**","`/score [user]`: Wins, losses, win rate, streak","`/leaderboard [type]`: Global top 10","`/serverleaderboard [type]`: Server top 10","> Types: `wins` `coins` `streak` `beststreak` `games` `winrate` `images`"].join("\n")},
+        {title:"⚙️ Server Config :  Page 3 / 8",description:["Most commands here require **Manage Server** permission.","","**Channels & Messages**","`/channelpicker channel:… [levelup]`: Set the bot's main channel","`/xpconfig setting:…`: Level up messages (on/off, ping toggle, channel)","`/setwelcome channel:… [message]`: Welcome message (`{user}` `{server}` `{count}`)","`/setleave channel:… [message]`: Leave message","`/setboostmsg channel:… [message]`: Boost announcement","`/disableownermsg enabled:…`: Toggle bot owner broadcasts","`/purge amount:…`: Bulk delete (needs Manage Messages)","`/counting action:set|remove|status`: Set a permanent counting channel","","**Roles**","`/autorole [role]`: Auto assign role on join (blank to disable)","`/reactionrole action:add|remove|list …`: Emoji reaction roles","`/dropdownroles action:build`: Dropdown-menu roles (upgrade to reaction roles)","`/rolespingfix`: List & fix roles that can @everyone","","**Competitions & Tickets**","`/invitecomp hours:…`: Invite competition with coin rewards","`/ticketsetup` · `/closeticket` · `/addtoticket` · `/removefromticket`","","**Overview**","`/serverconfig`: View all current settings"].join("\n")},
+        {title:"🛡️ Activity & RA/LOA :  Page 4 / 8",description:["**Activity Checks** *(Manage Server)*","`/activity-check channel:… [deadline] [message] [ping] [schedule]` - Send a check-in to staff","> Specify which roles must respond and who is excluded","> Auto closes after the deadline and reports who didn't check in","> Add `schedule:Monday 09:00` (UTC) to repeat it weekly automatically","","**RA / LOA Setup** *(Manage Server)*","`/raconfig action:create`: Auto create Reduced Activity + LOA roles","`/raconfig action:set_ra|set_loa role:…`: Use existing roles","`/raconfig action:view`: See current config","","**Assigning Roles**","`/staffrole type:ra|loa user:… action:give|remove [duration]`: Give/remove RA or LOA role","> `duration` is in hours: omit for permanent"].join("\n")},
+        {title:"📺 YouTube Tracking :  Page 5 / 8",description:["Track a YouTube channel's subscriber count live in Discord.","All commands require **Manage Server** permission.","","**Setup (do this first)**","`/ytsetup channel:… discord_channel:… [apikey:…]`: Connect a YouTube channel","> Accepts `@handle`, full URL, or channel ID starting with UC","> Provide your YouTube Data API v3 key on first use: it's saved to botdata","> Get a free key at console.cloud.google.com → enable YouTube Data API v3","","**Live Sub Count**","`/subcount threshold:1K|10K`: Post an embed that edits itself every 5 min","","**Sub Goal**","`/subgoal goal:N [message]`: Live progress bar towards a target sub count","> Fires a custom or default message when the goal is reached","","**Milestones**","`/milestones action:add subs:N [message]`: Announce when a sub count is crossed","`/milestones action:remove subs:N`: Remove a milestone","`/milestones action:list`: View all milestones and their status"].join("\n")},
+        {title:"🤖 Community Modes :  Page 6 / 8",description:["Clankerify replaces a user's messages with a webhook impersonating them in a chosen personality.","","**For Everyone**","`/selfclank duration:1 to 5`: Clankerify yourself for 1–5 min with any mode","> Choose from built in modes or any custom modes players have built","> Max 2 selfclanked users per server at once","> `/selfclank duration:0` to cancel early","","**Built-in Modes**","🤖 No mode (plain) · 😈 Evil · 😏 Freaky · 🦅 American · 🫖 British","🪖 Stupid · 📰 Boomer · 🔺 Conspiracy · 🗺️ NPC · 😤 Sigma","⚔️ Medieval · 👻 Ghost · 🏴‍☠️ Pirate · 🦝 RespawnRaccoon Propaganda","🇫🇷 French · 🐱 UWU/LOLCAT · 🎲 Random","","**Custom Modes**: anyone can build one with `/clankerbuild`","`/clankerbuild action:create name:<id>`: Opens a builder modal with:","  • Display name format (`{name}` = the user's name)","  • Word replacements (`Test>Test2; friend>pardner, …`)","  • Signoffs (`yeehaw!;much obliged;git along now`)","  • Message start prefix","  • Emoji shown in the mode selector","`/clankerbuild action:list`: View all custom modes","`/clankerbuild action:delete name:<id>`: Remove a custom mode","","Custom modes appear automatically in the `/clankerify` and `/selfclank` dropdowns."].join("\n")},
+        {title:"🖼️ Media & Quotes :  Page 7 / 8",description:["**Quotes Folder**","`/upload source|link:…`: Upload an image/audio/video *(authorized users)*","`/requestupload source:…`: Submit a file to be reviewed for the quotes folder","`/managememers action:add|remove|list [user]`: [Owner] Manage the upload allowlist","`/quotemanage …`: [Owner] Browse, delete, and configure the quotes folder","`/dailyquote action:set|disable|status [channel] [hour]`: Auto post a daily quote (Manage Server)","`/library user:… [page]`: Browse a user's uploaded quotes","","**Other Media Tools**","`/pixeltxt action:structure|destructure file:…`: Convert an image to/from a compressed text format","`/jarvisdatabase source:… name:…`: Upload a trigger image/gif/video straight to the Jarvis folder","`/download url:… [format] [resolution]`: Download a YouTube video as MP4 or MP3"].join("\n")},
+        {title:"🔒 Owner Tools :  Page 8 / 8",description:["**Bot Management**","`/servers`: List servers & invite links","`/botstats`: Bot stats","`/setstatus text:… [type]`: Set bot presence","`/restart`: Restart the bot","`/refreshcmds`: Force reregister slash commands in this guild","`/adminconfig [key] [value]`: View/edit global config values","","**User & Server Actions**","`/forcemarry user1:… user2:…`: Force marry two users","`/forcedivorce user:…`: Force divorce a user","`/leaveserver server:…`: Leave a server","`/blacklist [user]`: Interactive picker: block a user from specific commands, or Full Blacklist","`/shadowdelete user:… percentage:…`: Randomly delete a % of a user's messages","`/clankerify user:… [duration]`: Resend a user's messages as a webhook impersonating them","`/impersonation user:… [as_user] [pfp] [name] [mode] [duration]`: Like clankerify, but resend as someone/something else","`/thecount user:…`: Open a queue channel for a user; messages sent there wait until /send","`/send`: Deliver everything queued in every /thecount channel to their respective users","`/paranoia user:… [chance]`: DM a user creepy paranoia messages","`/fakemessage user:… [message] [file] [mode]`: Send a message as another user via webhook","`/fakequote user:… text:… [displayname] [username]`: Generate a 'Make it a Quote' style card","`/theremnant message:…`: Send a mysterious dimensional transmission","`/jarvisenhance action:… name:…`: Build a custom Jarvis trigger word (categorized: Clankerify, Moderation, Messaging, Broadcast): say it while replying to run a chain of actions in order, mode/duration picked with no typing, and blank text fields autofill from whatever you say after the trigger word","","**Access & Relay**","`/tempowner user:… duration:… [commands]`: Grant a user temporary owner access","`/dmconfig [server] [user]`: Set up the DM relay hub or open a relay channel"].join("\n")},
+      ];
+      const p=HELP_PAGES[page];
+      const navRow=new MessageActionRow().addComponents(
+        new MessageButton().setCustomId(`help_page_${page-1}`).setLabel("◀ Prev").setStyle("SECONDARY").setDisabled(page===0),
+        new MessageButton().setCustomId(`help_page_${page+1}`).setLabel("Next ▶").setStyle("SECONDARY").setDisabled(page>=TOTAL-1),
+      );
+      try{await interaction.editReply({embeds:[{title:p.title,description:p.description,color:0x5865F2,footer:{text:`Page ${page+1} of ${TOTAL}`}}],components:[navRow]});}catch(e){console.error("help_page:",e?.message);}
+      return;
+    }
+
+    if(cid==="rolespingfix_fix"){
+      if(!OWNER_IDS.includes(interaction.user.id)&&!interaction.member?.permissions.has("MANAGE_GUILD"))return interaction.reply({content:"❌ You need the **Manage Server** permission to use this.",ephemeral:true});
+      await interaction.deferUpdate();
+      const guild=interaction.guild;
+      await guild.roles.fetch();
+      const dangerous=guild.roles.cache.filter(r=>{
+        if(r.managed||r.id===guild.id)return false;
+        return r.permissions.has("MENTION_EVERYONE");
+      });
+      if(!dangerous.size){
+        return interaction.editReply({embeds:[{title:"✅ Already clean",description:"No roles have Mention Everyone anymore.",color:0x57F287}],components:[]});
+      }
+      const results=[];
+      for(const[,role]of dangerous){
+        try{
+          const newPerms=role.permissions.remove("MENTION_EVERYONE");
+          await role.setPermissions(newPerms,`/rolespingfix used by ${interaction.user.tag}`);
+          results.push(`✅ Fixed: \`${role.name}\``);
+        }catch(e){
+          results.push(`❌ Failed: \`${role.name}\` - ${e.message}`);
+        }
+      }
+      return interaction.editReply({embeds:[{
+        title:"🔧 Role Fix Complete",
+        description:results.join("\n"),
+        color:0x57F287,
+        footer:{text:"Mention Everyone permission removed from all listed roles."},
+      }],components:[]});
+    }
+    if(cid==="botstats_users"||cid.startsWith("botstats_page_")){
+      if(!OWNER_IDS.includes(uid)){await btnEphemeral(interaction,"Owner only.");return;}
+      if(!await btnAck(interaction))return;
+      const PAGE_SIZE=30;
+      const page=cid.startsWith("botstats_page_")?parseInt(cid.slice(14)):0;
+      const ids=[...userInstalls];
+      const totalPages=Math.max(1,Math.ceil(ids.length/PAGE_SIZE));
+      const pageIds=ids.slice(page*PAGE_SIZE,(page+1)*PAGE_SIZE);
+      const userLines=[];
+      for(const id of pageIds){
+        try{
+          const u=await client.users.fetch(id).catch(()=>null);
+          if(u) userLines.push(`${u.username}${u.discriminator!=="0"?`#${u.discriminator}`:""}  \`${id}\``);
+          else   userLines.push(`(unknown)  \`${id}\``);
+        }catch{ userLines.push(`(error)  \`${id}\``); }
+      }
+      const header=`👤 **App Users: Page ${page+1}/${totalPages}** (${ids.length} total tracked)\n\`\`\`\n${userLines.join("\n")||"None"}\n\`\`\``;
+      const navRow=new MessageActionRow().addComponents(
+        new MessageButton().setCustomId(`botstats_page_${page-1}`).setLabel("← Prev").setStyle("SECONDARY").setDisabled(page===0),
+        new MessageButton().setCustomId("botstats_users").setLabel("Back to Stats").setStyle("SECONDARY"),
+        new MessageButton().setCustomId(`botstats_page_${page+1}`).setLabel("Next →").setStyle("SECONDARY").setDisabled(page>=totalPages-1),
+      );
+      try{await interaction.editReply({content:header,components:[navRow]});}catch(e){console.error("botstats_users:",e?.message);}
+      return;
+    }
+
+    // ── Reaction role manual builder ─────────────────────────────────────────────
+    if(cid.startsWith("rr_")){
+      if(cid.startsWith("rr_remove_")){
+        const token = cid.slice("rr_remove_".length);
+        const b = rrBuilders.get(token);
+        if(!b || b.ownerId!==uid){ try{await interaction.reply({content:"This panel expired, run /reactionrole action:manual again.",ephemeral:true});}catch{} return; }
+        const key = interaction.values[0];
+        reactionRoles.delete(key);
+        saveData();
+        try{ await interaction.update(buildReactionRoleManualPanel(token)); }catch{}
+        return;
+      }
+      if(cid.startsWith("rr_addstart_")){
+        const token = cid.slice("rr_addstart_".length);
+        const b = rrBuilders.get(token);
+        if(!b || b.ownerId!==uid){ try{await interaction.reply({content:"This panel expired, run /reactionrole action:manual again.",ephemeral:true});}catch{} return; }
+        await interaction.showModal({
+          title:"Add a Reaction Role",
+          custom_id:`rr_modal_emoji_${token}`,
+          components:[
+            {type:1,components:[{type:4,custom_id:"rr_emoji_input",label:"Emoji (paste it, or type a custom emoji code)",style:1,required:true,max_length:100}]},
+          ],
+        }).catch(e=>console.error("[rr_addstart modal]",e.message));
+        return;
+      }
+      if(cid.startsWith("rr_pickrole_")){
+        const token = cid.slice("rr_pickrole_".length, cid.lastIndexOf("_"));
+        const b = rrBuilders.get(token);
+        if(!b || b.ownerId!==uid || !b.pendingEmoji) return;
+        const roleId = interaction.values[0];
+        const role = interaction.guild?.roles.cache.get(roleId);
+        const norm = normalizeEmojiKey(b.pendingEmoji);
+        const key = `${b.guildId}:${b.messageId}:${norm}`;
+        reactionRoles.set(key, roleId);
+        saveData();
+        const targetCh = interaction.guild?.channels.cache.get(b.channelId);
+        const targetMsg = targetCh ? await targetCh.messages.fetch(b.messageId).catch(()=>null) : null;
+        if(targetMsg) await targetMsg.react(b.pendingEmoji).catch(()=>{});
+        b.pendingEmoji = null;
+        try{ await interaction.update(buildReactionRoleManualPanel(token)); }catch{}
+        return;
+      }
+      if(cid.startsWith("rr_cancel_")){
+        const token = cid.slice("rr_cancel_".length);
+        const b = rrBuilders.get(token);
+        if(!b || b.ownerId!==uid) return;
+        b.pendingEmoji = null;
+        try{ await interaction.update(buildReactionRoleManualPanel(token)); }catch{}
+        return;
+      }
+      if(cid.startsWith("rr_done_")){
+        const token = cid.slice("rr_done_".length);
+        rrBuilders.delete(token);
+        try{ await interaction.update({content:"Done.", components:[]}); }catch{}
+        return;
+      }
+    }
+
+    // ── Dropdown roles builder (/dropdownroles action:build) ─────────────────────
+    if(cid.startsWith("ddb_")){
+      const expiredMsg = "This panel expired, run /dropdownroles action:build again.";
+
+      if(cid.startsWith("ddb_edit_")){
+        const token = cid.slice("ddb_edit_".length);
+        const b = ddBuilders.get(token);
+        if(!b || b.ownerId!==uid){ try{await interaction.reply({content:expiredMsg,ephemeral:true});}catch{} return; }
+        const index = parseInt(interaction.values[0],10);
+        ddTouch(token);
+        try{ await interaction.update(buildDdEditPanel(token, index)); }catch{}
+        return;
+      }
+      if(cid.startsWith("ddb_new_")){
+        const token = cid.slice("ddb_new_".length);
+        const b = ddBuilders.get(token);
+        if(!b || b.ownerId!==uid){ try{await interaction.reply({content:expiredMsg,ephemeral:true});}catch{} return; }
+        if(b.dropdowns.length>=DD_MAX_DROPDOWNS){ try{await interaction.reply({content:`❌ Max ${DD_MAX_DROPDOWNS} dropdowns per message.`,ephemeral:true});}catch{} return; }
+        await interaction.showModal({
+          title:"New Dropdown",
+          custom_id:`ddb_modal_newname_${token}`,
+          components:[
+            {type:1,components:[{type:4,custom_id:"ddb_name_input",label:"Dropdown name (shown as the placeholder)",style:1,required:true,max_length:100}]},
+          ],
+        }).catch(e=>console.error("[ddb_new modal]",e.message));
+        return;
+      }
+      if(cid.startsWith("ddb_detect_")){
+        const token = cid.slice("ddb_detect_".length);
+        const b = ddBuilders.get(token);
+        if(!b || b.ownerId!==uid){ try{await interaction.reply({content:expiredMsg,ephemeral:true});}catch{} return; }
+        await interaction.showModal({
+          title:"Detect from Messages",
+          custom_id:`ddb_modal_detect_${token}`,
+          components:[
+            {type:1,components:[{type:4,custom_id:"ddb_detect_input",label:"Message IDs (one per line)",style:2,required:true,max_length:1000,placeholder:"Each ID's message needs EMOJI | @Role lines, like /reactionrole auto"}]},
+          ],
+        }).catch(e=>console.error("[ddb_detect modal]",e.message));
+        return;
+      }
+      if(cid.startsWith("ddb_post_")){
+        const token = cid.slice("ddb_post_".length);
+        const b = ddBuilders.get(token);
+        if(!b || b.ownerId!==uid){ try{await interaction.reply({content:expiredMsg,ephemeral:true});}catch{} return; }
+        if(!b.dropdowns.length){ try{await interaction.reply({content:"❌ Add at least one dropdown first.",ephemeral:true});}catch{} return; }
+        ddTouch(token);
+        try{ await interaction.update(buildDdChannelPicker(token)); }catch{}
+        return;
+      }
+      if(cid.startsWith("ddb_cancel_")){
+        const token = cid.slice("ddb_cancel_".length);
+        const b = ddBuilders.get(token);
+        if(!b || b.ownerId!==uid){ try{await interaction.reply({content:expiredMsg,ephemeral:true});}catch{} return; }
+        ddBuilders.delete(token);
+        try{ await interaction.update({content:"Cancelled.", components:[]}); }catch{}
+        return;
+      }
+      if(cid.startsWith("ddb_back_")){
+        const token = cid.slice("ddb_back_".length);
+        const b = ddBuilders.get(token);
+        if(!b || b.ownerId!==uid){ try{await interaction.reply({content:expiredMsg,ephemeral:true});}catch{} return; }
+        ddTouch(token);
+        try{ await interaction.update(buildDdMainPanel(token)); }catch{}
+        return;
+      }
+      if(cid.startsWith("ddb_removeopt_")){
+        const rest = cid.slice("ddb_removeopt_".length);
+        const [token, indexStr] = rest.split("_");
+        const index = parseInt(indexStr,10);
+        const b = ddBuilders.get(token);
+        if(!b || b.ownerId!==uid || !b.dropdowns[index]){ try{await interaction.reply({content:expiredMsg,ephemeral:true});}catch{} return; }
+        const optIndex = parseInt(interaction.values[0],10);
+        b.dropdowns[index].options.splice(optIndex,1);
+        ddTouch(token);
+        try{ await interaction.update(buildDdEditPanel(token, index)); }catch{}
+        return;
+      }
+      if(cid.startsWith("ddb_addopt_")){
+        const rest = cid.slice("ddb_addopt_".length);
+        const [token, indexStr] = rest.split("_");
+        const index = parseInt(indexStr,10);
+        const b = ddBuilders.get(token);
+        if(!b || b.ownerId!==uid || !b.dropdowns[index]){ try{await interaction.reply({content:expiredMsg,ephemeral:true});}catch{} return; }
+        await interaction.showModal({
+          title:"Add an Option",
+          custom_id:`ddb_modal_emoji_${token}_${index}`,
+          components:[
+            {type:1,components:[{type:4,custom_id:"ddb_emoji_input",label:"Emoji (paste it, or type a custom emoji code)",style:1,required:true,max_length:100}]},
+          ],
+        }).catch(e=>console.error("[ddb_addopt modal]",e.message));
+        return;
+      }
+      if(cid.startsWith("ddb_rename_")){
+        const rest = cid.slice("ddb_rename_".length);
+        const [token, indexStr] = rest.split("_");
+        const index = parseInt(indexStr,10);
+        const b = ddBuilders.get(token);
+        if(!b || b.ownerId!==uid || !b.dropdowns[index]){ try{await interaction.reply({content:expiredMsg,ephemeral:true});}catch{} return; }
+        await interaction.showModal({
+          title:"Rename Dropdown",
+          custom_id:`ddb_modal_rename_${token}_${index}`,
+          components:[
+            {type:1,components:[{type:4,custom_id:"ddb_rename_input",label:"New name",style:1,required:true,max_length:100,value:b.dropdowns[index].name}]},
+          ],
+        }).catch(e=>console.error("[ddb_rename modal]",e.message));
+        return;
+      }
+      if(cid.startsWith("ddb_moveup_")){
+        const rest = cid.slice("ddb_moveup_".length);
+        const [token, indexStr] = rest.split("_");
+        const index = parseInt(indexStr,10);
+        const b = ddBuilders.get(token);
+        if(!b || b.ownerId!==uid || index<=0 || !b.dropdowns[index]){ try{await interaction.reply({content:expiredMsg,ephemeral:true});}catch{} return; }
+        [b.dropdowns[index-1], b.dropdowns[index]] = [b.dropdowns[index], b.dropdowns[index-1]];
+        ddTouch(token);
+        try{ await interaction.update(buildDdEditPanel(token, index-1)); }catch{}
+        return;
+      }
+      if(cid.startsWith("ddb_movedown_")){
+        const rest = cid.slice("ddb_movedown_".length);
+        const [token, indexStr] = rest.split("_");
+        const index = parseInt(indexStr,10);
+        const b = ddBuilders.get(token);
+        if(!b || b.ownerId!==uid || index>=b.dropdowns.length-1){ try{await interaction.reply({content:expiredMsg,ephemeral:true});}catch{} return; }
+        [b.dropdowns[index+1], b.dropdowns[index]] = [b.dropdowns[index], b.dropdowns[index+1]];
+        ddTouch(token);
+        try{ await interaction.update(buildDdEditPanel(token, index+1)); }catch{}
+        return;
+      }
+      if(cid.startsWith("ddb_deletedd_")){
+        const rest = cid.slice("ddb_deletedd_".length);
+        const [token, indexStr] = rest.split("_");
+        const index = parseInt(indexStr,10);
+        const b = ddBuilders.get(token);
+        if(!b || b.ownerId!==uid || !b.dropdowns[index]){ try{await interaction.reply({content:expiredMsg,ephemeral:true});}catch{} return; }
+        b.dropdowns.splice(index,1);
+        ddTouch(token);
+        try{ await interaction.update(buildDdMainPanel(token)); }catch{}
+        return;
+      }
+      if(cid.startsWith("ddb_pickrole_")){
+        const rest = cid.slice("ddb_pickrole_".length);
+        const [token, indexStr] = rest.split("_");
+        const index = parseInt(indexStr,10);
+        const b = ddBuilders.get(token);
+        if(!b || b.ownerId!==uid || b.pendingEmoji==null || !b.dropdowns[index]) return;
+        const roleId = interaction.values[0];
+        b.dropdowns[index].options.push({ emojiRaw: b.pendingEmoji, roleId });
+        b.pendingEmoji = null;
+        b.pendingIndex = null;
+        ddTouch(token);
+        try{ await interaction.update(buildDdEditPanel(token, index)); }catch{}
+        return;
+      }
+      if(cid.startsWith("ddb_cancelopt_")){
+        const rest = cid.slice("ddb_cancelopt_".length);
+        const [token, indexStr] = rest.split("_");
+        const index = parseInt(indexStr,10);
+        const b = ddBuilders.get(token);
+        if(!b || b.ownerId!==uid){ try{await interaction.reply({content:expiredMsg,ephemeral:true});}catch{} return; }
+        b.pendingEmoji = null;
+        b.pendingIndex = null;
+        try{ await interaction.update(buildDdEditPanel(token, index)); }catch{}
+        return;
+      }
+      if(cid.startsWith("ddb_postchannel_")){
+        const rest = cid.slice("ddb_postchannel_".length);
+        const [token] = rest.split("_");
+        const b = ddBuilders.get(token);
+        if(!b || b.ownerId!==uid){ try{await interaction.reply({content:expiredMsg,ephemeral:true});}catch{} return; }
+        const channelId = interaction.values[0];
+        const guild = client.guilds.cache.get(b.guildId);
+        const targetCh = guild?.channels.cache.get(channelId);
+        if(!targetCh){ try{await interaction.reply({content:"❌ Channel not found.",ephemeral:true});}catch{} return; }
+        if(!(await btnAck(interaction))) return;
+        try{
+          const rows = buildLiveDropdownRows(guild, b.setId, b.dropdowns);
+          const sent = await targetCh.send({ content:"🎛️ **Choose your roles below!**", components: rows });
+          dropdownRoleSets.set(`${b.guildId}:${b.setId}`, {
+            dropdowns: b.dropdowns.map(dd => ({ name:dd.name, options: dd.options.map(o=>({emojiRaw:o.emojiRaw, roleId:o.roleId})) })),
+          });
+          saveData();
+          ddBuilders.delete(token);
+          await interaction.editReply({content:`✅ Posted! [Jump to message](${sent.url})\nSet ID: \`${b.setId}\` (use it with /dropdownroles action:delete if you ever want to take it down)`, components:[]}).catch(()=>{});
+        }catch(e){
+          console.error("[ddb_postchannel]", e.message);
+          await interaction.editReply({content:`❌ Failed to post: ${e.message}`, components:[]}).catch(()=>{});
+        }
+        return;
+      }
+    }
+
+    // ── Live dropdown roles: a user picking roles from a posted select menu ──────
+    if(cid.startsWith("ddsel_")){
+      const rest = cid.slice("ddsel_".length);
+      const ddIndex = parseInt(rest.slice(rest.lastIndexOf("_")+1),10);
+      const setId = rest.slice(0, rest.lastIndexOf("_"));
+      const guildId = interaction.guildId;
+      if(!guildId) return;
+      const set = dropdownRoleSets.get(`${guildId}:${setId}`);
+      const dd = set?.dropdowns?.[ddIndex];
+      if(!dd){ try{await interaction.reply({content:"❌ This dropdown is no longer configured.",ephemeral:true});}catch{} return; }
+      if(!(await btnAck(interaction))) return;
+      try{
+        const guild = client.guilds.cache.get(guildId);
+        const member = await guild.members.fetch(uid).catch(()=>null);
+        if(!member){ await interaction.followUp({content:"❌ Couldn't find your member record, try again.",ephemeral:true}).catch(()=>{}); return; }
+        const allRoleIds = dd.options.map(o=>o.roleId);
+        const selected = interaction.values;
+        const toAdd = selected.filter(id=>!member.roles.cache.has(id));
+        const toRemove = allRoleIds.filter(id=>!selected.includes(id) && member.roles.cache.has(id));
+        if(toAdd.length) await member.roles.add(toAdd).catch(e=>console.error("[ddsel add]",e.message));
+        if(toRemove.length) await member.roles.remove(toRemove).catch(e=>console.error("[ddsel remove]",e.message));
+        const addedNames = toAdd.map(id=>guild.roles.cache.get(id)?.name).filter(Boolean);
+        const removedNames = toRemove.map(id=>guild.roles.cache.get(id)?.name).filter(Boolean);
+        const parts = [];
+        if(addedNames.length) parts.push(`Added: ${addedNames.join(", ")}`);
+        if(removedNames.length) parts.push(`Removed: ${removedNames.join(", ")}`);
+        await interaction.followUp({content: parts.length ? `✅ ${parts.join(" | ")}` : "No changes.", ephemeral:true}).catch(()=>{});
+      }catch(e){
+        console.error("[ddsel] error:", e.message);
+        await interaction.followUp({content:"❌ Something went wrong applying your roles.",ephemeral:true}).catch(()=>{});
+      }
+      return;
+    }
+
+    if(cid.startsWith("ts_")){
+      if(!interaction.guildId){await btnEphemeral(interaction,"Server only.");return;}
+      if(!isTicketAdmin(interaction)){await btnEphemeral(interaction,"You need Manage Server permission.");return;}
+      const guildId=interaction.guildId;
+      const guild=interaction.guild;
+      const buildStep=(stepOverride)=>buildTicketSetupStep(guild,guildId,stepOverride);
+
+      if(!await btnAck(interaction))return;
+      const cfg=ticketConfigs.get(guildId)||{nextId:0};
+      try{
+
+      const selMatch=cid.match(/^ts_sel_(channel|roles|log|transcript|panel_ch)_(\d+)$/);
+      if(selMatch){
+        const kind=selMatch[1];
+        const chunkIndex=Number(selMatch[2]);
+        if(kind==="channel"){
+          const val=interaction.values[0];
+          if(val!=="none")cfg.categoryId=val;
+          ticketConfigs.set(guildId,cfg);saveData();
+          try{await interaction.editReply(buildStep(2));}catch(e){console.error("ts_sel_channel:",e?.message);}
+          return;
+        }
+        if(kind==="roles"){
+          const rls=getEligibleTicketRoles(guild);
+          const chunk=chunkArray(rls,25)[chunkIndex]?.map(r=>({value:r.id}))||[];
+          cfg.supportRoleIds=mergeChunkedSelection(cfg.supportRoleIds,chunk,interaction.values);
+          cfg.supportRoleId=cfg.supportRoleIds[0]||null;
+          ticketConfigs.set(guildId,cfg);saveData();
+          try{await interaction.editReply(buildStep(cfg.supportRoleIds.length?3:2));}catch(e){console.error("ts_sel_roles:",e?.message);}
+          return;
+        }
+        if(kind==="log"){
+          const val=interaction.values[0];
+          if(val!=="none")cfg.logChannelId=val;
+          ticketConfigs.set(guildId,cfg);saveData();
+          try{await interaction.editReply(buildStep(4));}catch(e){console.error("ts_sel_log:",e?.message);}
+          return;
+        }
+        if(kind==="transcript"){
+          const val=interaction.values[0];
+          if(val!=="none")cfg.transcriptChannelId=val;
+          ticketConfigs.set(guildId,cfg);saveData();
+          try{await interaction.editReply(buildStep(5));}catch(e){console.error("ts_sel_transcript:",e?.message);}
+          return;
+        }
+        if(kind==="panel_ch"){
+          const val=interaction.values[0];
+          if(val!=="none")cfg.panelChannelId=val;
+          ticketConfigs.set(guildId,cfg);saveData();
+          try{await interaction.editReply(buildStep(6));}catch(e){console.error("ts_sel_panel_ch:",e?.message);}
+          return;
+        }
+      }
+      if(cid==="ts_skip_log"){cfg.logChannelId=null;ticketConfigs.set(guildId,cfg);saveData();try{await interaction.editReply(buildStep(4));}catch(e){console.error("ts_skip_log:",e?.message);}return;}
+      if(cid==="ts_clear_log"){delete cfg.logChannelId;ticketConfigs.set(guildId,cfg);saveData();try{await interaction.editReply(buildStep(3));}catch(e){console.error("ts_clear_log:",e?.message);}return;}
+      if(cid==="ts_skip_transcript"){cfg.transcriptChannelId=null;ticketConfigs.set(guildId,cfg);saveData();try{await interaction.editReply(buildStep(5));}catch(e){console.error("ts_skip_transcript:",e?.message);}return;}
+      if(cid==="ts_clear_transcript"){delete cfg.transcriptChannelId;ticketConfigs.set(guildId,cfg);saveData();try{await interaction.editReply(buildStep(4));}catch(e){console.error("ts_clear_transcript:",e?.message);}return;}
+      if(cid==="ts_back"){
+        const s=getTicketSetupStep(cfg);
+        if(s>=6){delete cfg.panelChannelId;}
+        else if(s===5){delete cfg.transcriptChannelId;}
+        else if(s===4){delete cfg.logChannelId;}
+        else if(s===3){cfg.supportRoleIds=[];cfg.supportRoleId=null;}
+        else if(s===2){delete cfg.categoryId;}
+        ticketConfigs.set(guildId,cfg);saveData();
+        try{await interaction.editReply(buildStep());}catch(e){console.error("ts_back:",e?.message);}
+        return;
+      }
+      if(cid==="ts_reset"){ticketConfigs.set(guildId,{nextId:cfg.nextId||0});saveData();try{await interaction.editReply(buildStep(1));}catch(e){console.error("ts_reset:",e?.message);}return;}
+      if(cid==="ts_set_msg"){
+        try{await interaction.followUp({content:`✏️ **Customize panel message**: type it in chat now (2 min).\nCurrent: ${cfg.panelMessage?`\`${cfg.panelMessage}\``:"*(default)*"}`,ephemeral:true});}catch{}
+        const col=interaction.channel.createMessageCollector({filter:m=>m.author.id===uid,max:1,time:120000});
+        col.on("collect",async m=>{
+          try{await m.delete();}catch{}
+          cfg.panelMessage=m.content.trim();
+          ticketConfigs.set(guildId,cfg);saveData();
+          try{await interaction.editReply(buildStep(6));await interaction.followUp({content:"✅ Panel message saved!",ephemeral:true});}catch{}
+        });
+        col.on("end",(_,r)=>{if(r==="time")interaction.followUp({content:"⏰ Timed out.",ephemeral:true}).catch(()=>{});});
+        return;
+      }
+      if(cid==="ts_post_panel"){
+        if(!cfg.categoryId||!cfg.supportRoleIds?.length||!cfg.panelChannelId){try{await interaction.followUp({content:"⚠️ Complete all steps first.",ephemeral:true});}catch{}return;}
+        if(cfg.panelMessageId&&cfg.panelChannelId){const oldCh=guild.channels.cache.get(cfg.panelChannelId);if(oldCh){const old=await oldCh.messages.fetch(cfg.panelMessageId).catch(()=>null);if(old)await old.delete().catch(()=>{});}}
+        const targetCh=guild.channels.cache.get(cfg.panelChannelId)||interaction.channel;
+        const panelContent=cfg.panelMessage||"🎫 **Support Tickets**\n\nNeed help? Click the button below to open a private support ticket with our team.";
+        try{
+          const msg=await safeSend(targetCh,{content:panelContent,components:[new MessageActionRow().addComponents(new MessageButton().setCustomId("ticket_open").setLabel("Open a Ticket 🎫").setStyle("PRIMARY"))]});
+          if(msg){cfg.panelMessageId=msg.id;cfg.panelChannelId=targetCh.id;}
+          ticketConfigs.set(guildId,cfg);saveData();
+          try{await interaction.editReply(buildStep(6));}catch{}
+          try{await interaction.followUp({content:`✅ Ticket panel posted in <#${targetCh.id}>!`,ephemeral:true});}catch{}
+        }catch(e){try{await interaction.followUp({content:`❌ Failed: ${e.message}`,ephemeral:true});}catch{}}
+        return;
+      }
+      try{await interaction.editReply(buildStep());}catch{}
+      return;
+      }catch(e){
+        console.error("[ts_ button]",e?.stack||e?.message);
+        try{await interaction.followUp({content:`❌ Ticket setup hit an error: \`${e?.message||e}\``,ephemeral:true});}catch{}
+        return;
+      }
+    }
+
+    if(cid==="ticket_open"){
+      if(!await btnAck(interaction))return;
+      const guildId=interaction.guildId;
+      const cfg=ticketConfigs.get(guildId);
+      if(!cfg||!cfg.categoryId||!cfg.supportRoleIds?.length){try{await interaction.followUp({content:"⚠️ Ticket system is not configured. Ask an admin to use `/ticketsetup`.",ephemeral:true});}catch{}return;}
+      const existing=[...openTickets.values()].find(t=>t.guildId===guildId&&t.userId===uid&&t.status!=="deleted");
+      if(existing){const ch=interaction.guild.channels.cache.get(existing.channelId);try{await interaction.followUp({content:`You already have an open ticket: ${ch?`<#${ch.id}>`:"(channel deleted)"}`,ephemeral:true});}catch{}return;}
+      const cfg2=ticketConfigs.get(guildId);
+      cfg2.nextId=(cfg2.nextId||0)+1;
+      const ticketId=String(cfg2.nextId).padStart(4,"0");
+      try{
+        const guild=interaction.guild;
+        const member=interaction.member;
+        const channel=await guild.channels.create(`ticket-${ticketId}`,{
+          type:"GUILD_TEXT",
+          parent:cfg2.categoryId||undefined,
+          permissionOverwrites:[
+            {id:guild.roles.everyone,deny:["VIEW_CHANNEL"]},
+            {id:uid,allow:["VIEW_CHANNEL","SEND_MESSAGES","READ_MESSAGE_HISTORY"]},
+            {id:client.user.id,allow:["VIEW_CHANNEL","SEND_MESSAGES","READ_MESSAGE_HISTORY","MANAGE_CHANNELS"]},
+            ...(cfg2.supportRoleIds||[]).map(rid=>({id:rid,allow:["VIEW_CHANNEL","SEND_MESSAGES","READ_MESSAGE_HISTORY"]})),
+          ],
+          topic:`Ticket #${ticketId} | Opened by ${member.user.tag}`
+        });
+        openTickets.set(channel.id,{guildId,userId:uid,ticketId,channelId:channel.id,subject:"",openedAt:Date.now(),status:"open"});saveData();
+        const activeRow=buildTicketActiveRow();
+        await channel.send({content:`🎫 **Ticket #${ticketId}**: <@${uid}>\n\nHello <@${uid}>! Support will be with you shortly.${(cfg2.supportRoleIds||[]).map(r=>`<@&${r}>`).join(" ")?`\n${(cfg2.supportRoleIds||[]).map(r=>`<@&${r}>`).join(" ")}`:""}`,components:[activeRow]});
+        if(cfg2.logChannelId){const logCh=guild.channels.cache.get(cfg2.logChannelId);if(logCh)await safeSend(logCh,`📂 **Ticket #${ticketId} opened** by <@${uid}>: <#${channel.id}>`);}
+        try{await interaction.followUp({content:`✅ Your ticket has been created: <#${channel.id}>`,ephemeral:true});}catch{}
+      }catch(e){console.error("ticket_open error:",e);try{await interaction.followUp({content:`❌ Failed to create ticket: ${e.message}`,ephemeral:true});}catch{}}
+      return;
+    }
+
+    if(cid==="ticket_close"){
+      if(!await btnAck(interaction))return;
+      const ticket=openTickets.get(interaction.channelId);
+      if(!ticket){try{await interaction.followUp({content:"This doesn't look like a ticket channel.",ephemeral:true});}catch{}return;}
+      const cfg=ticketConfigs.get(ticket.guildId);
+      const member=interaction.member;
+      const isStaff=isTicketStaff(cfg,member);
+      const canClose=ticket.userId===uid||isStaff;
+      if(!canClose){try{await interaction.followUp({content:"You don't have permission to close this ticket.",ephemeral:true});}catch{}return;}
+      try{await interaction.channel.permissionOverwrites.edit(ticket.userId,{VIEW_CHANNEL:false,SEND_MESSAGES:false});}catch{}
+      ticket.status="closed";
+      ticket.closedBy=uid;
+      ticket.closedAt=Date.now();
+      saveData();
+      const staffRow=buildTicketStaffRow();
+      try{
+        await interaction.editReply({
+          content:`🔒 **Ticket #${ticket.ticketId} closed** by <@${uid}>.\n\n*<@${ticket.userId}> no longer has access.*\n**Staff:** Use the buttons below to reopen or permanently delete this ticket.`,
+          components:[staffRow]
+        });
+      }catch{}
+      return;
+    }
+
+    if(cid==="ticket_reopen"){
+      if(!await btnAck(interaction))return;
+      const ticket=openTickets.get(interaction.channelId);
+      if(!ticket){try{await interaction.followUp({content:"This doesn't look like a ticket channel.",ephemeral:true});}catch{}return;}
+      const cfg=ticketConfigs.get(ticket.guildId);
+      const member=interaction.member;
+      const isStaff=isTicketStaff(cfg,member);
+      if(!isStaff){try{await interaction.followUp({content:"Only support staff can reopen tickets.",ephemeral:true});}catch{}return;}
+      try{await interaction.channel.permissionOverwrites.edit(ticket.userId,{VIEW_CHANNEL:true,SEND_MESSAGES:true,READ_MESSAGE_HISTORY:true});}catch{}
+      ticket.status="open";
+      delete ticket.closedBy;
+      delete ticket.closedAt;
+      saveData();
+      const activeRow=buildTicketActiveRow();
+      try{
+        await interaction.editReply({
+          content:`🔓 **Ticket #${ticket.ticketId} reopened** by <@${uid}>.\n\n<@${ticket.userId}> has been given access again.`,
+          components:[activeRow]
+        });
+      }catch{}
+      return;
+    }
+
+    if(cid==="ticket_delete"){
+      if(!await btnAck(interaction))return;
+      const ticket=openTickets.get(interaction.channelId);
+      if(!ticket){try{await interaction.followUp({content:"This doesn't look like a ticket channel.",ephemeral:true});}catch{}return;}
+      const cfg=ticketConfigs.get(ticket.guildId);
+      const member=interaction.member;
+      const isStaff=isTicketStaff(cfg,member);
+      if(!isStaff){try{await interaction.followUp({content:"Only support staff can delete tickets.",ephemeral:true});}catch{}return;}
+      openTickets.delete(interaction.channelId);saveData();
+      try{
+        await interaction.editReply({content:`🗑️ **Ticket #${ticket.ticketId}** is being transcripted and deleted...`,components:[]});
+        await sendTicketTranscript(interaction.channel,ticket,cfg,`@${interaction.user.username}`);
+        if(cfg?.logChannelId){const logCh=interaction.guild.channels.cache.get(cfg.logChannelId);if(logCh)await safeSend(logCh,`🗑️ **Ticket #${ticket.ticketId} deleted** by <@${uid}>`);}
+        setTimeout(()=>interaction.channel.delete().catch(()=>{}),3000);
+      }catch{interaction.channel.delete().catch(()=>{});}
+      return;
+    }
+
+    if(cid==="ticket_claim"){
+      if(!await btnAck(interaction))return;
+      const ticket=openTickets.get(interaction.channelId);
+      if(!ticket){try{await interaction.followUp({content:"This doesn't look like a ticket channel.",ephemeral:true});}catch{}return;}
+      const cfg=ticketConfigs.get(ticket.guildId);
+      const member=interaction.member;
+      const canClaim=isTicketStaff(cfg,member);
+      if(!canClaim){try{await interaction.followUp({content:"Only support staff can claim tickets.",ephemeral:true});}catch{}return;}
+      ticket.claimedBy=uid;
+      saveData();
+      try{
+        await interaction.editReply({content:`🎫 **Ticket #${ticket.ticketId}**: <@${ticket.userId}>\n🙋 **Claimed by <@${uid}>**`,components:[new MessageActionRow().addComponents(new MessageButton().setCustomId("ticket_close").setLabel("Close Ticket 🔒").setStyle("DANGER"))]});
+        await safeSend(interaction.channel,`✅ <@${uid}> has claimed this ticket and will be assisting you.`);
+      }catch{}
+      return;
+    }
+
+    // ── Tomato This: select menu handlers (legacy, now handled by modal) ───────
+    if(cid.startsWith("tomato_count_")||cid.startsWith("tomato_speed_")){
+      try{await interaction.deferUpdate();}catch{}
+      return;
+    }
+
+    // ── Tomato This: fire button (legacy, now modal driven) ───────────────────
+    if(cid.startsWith("tomato_fire_")){
+      try{await interaction.deferUpdate();}catch{}
+      return;
+    }
+
+    // ── /clankerbuild_new: open blank create modal ────────────────────────────
+    if(cid === "clankerbuild_new"){
+      await interaction.showModal({
+        title:"🛠️ New Clanker Mode",
+        custom_id:"clankerbuild_modal_NEW",
+        components:[
+          {type:1,components:[{type:4,custom_id:"cb_name",    label:"Mode ID (lowercase, no spaces)",        style:1, required:true,  placeholder:"cowboy",                max_length:40  }]},
+          {type:1,components:[{type:4,custom_id:"cb_emoji",   label:"Emoji (shown in dropdown)",             style:1, required:false, placeholder:"🌟",                    max_length:10  }]},
+          {type:1,components:[{type:4,custom_id:"cb_display", label:"Display name format ({name} = user)",  style:1, required:true,  placeholder:"🤠 {name} pardner",     max_length:80  }]},
+          {type:1,components:[{type:4,custom_id:"cb_words",   label:"Word replacements (Test>Test2; …)",     style:2, required:false, placeholder:"hello>howdy; friend>pardner", max_length:1000}]},
+          {type:1,components:[{type:4,custom_id:"cb_signoffs",label:"Signoffs separated by ;",              style:2, required:false, placeholder:"yeehaw!;much obliged;git along now", max_length:1000}]},
+        ],
+      }).catch(e=>console.error("[clankerbuild_new modal]",e.message));
+      return;
+    }
+
+    // ── /clankerbuild pick to edit select ──────────────────────────────────────
+    if(cid.startsWith("clankerbuild_pick_edit_")){
+      const modeName = interaction.values[0];
+      const existing = customClankerModes.get(modeName) || {};
+      if(!OWNER_IDS.includes(uid) && existing.creatorId !== uid){
+        try{await interaction.reply({content:"❌ You can only edit your own modes.",ephemeral:true});}catch{}
+        return;
+      }
+      await interaction.showModal({
+        title:`✏️ Edit: ${modeName}`,
+        custom_id:`clankerbuild_modal_EDIT_${modeName}`,
+        components:[
+          {type:1,components:[{type:4,custom_id:"cb_emoji",   label:"Emoji (shown in dropdown)",            style:1, required:false, placeholder:"🌟",                    value:existing.emoji||"",                          max_length:10  }]},
+          {type:1,components:[{type:4,custom_id:"cb_display", label:"Display name format ({name} = user)", style:1, required:true,  placeholder:"🤠 {name} pardner",     value:existing.displayNameFormat||"{name}",         max_length:80  }]},
+          {type:1,components:[{type:4,custom_id:"cb_words",   label:"Word replacements (Test>Test2; …)",    style:2, required:false, placeholder:"hello>howdy; friend>pardner", value:(existing.words||[]).map(([f,t])=>`${f}>${t}`).join("; "), max_length:1000}]},
+          {type:1,components:[{type:4,custom_id:"cb_signoffs",label:"Signoffs separated by ;",             style:2, required:false, placeholder:"yeehaw!;much obliged",   value:(existing.signoffs||[]).join("; "),            max_length:1000}]},
+          {type:1,components:[{type:4,custom_id:"cb_start",   label:"Message start prefix (optional)",     style:1, required:false, placeholder:"🤠 ",                   value:existing.messageStart||"",                   max_length:200 }]},
+        ],
+      }).catch(e=>console.error("[clankerbuild_pick_edit modal]",e.message));
+      return;
+    }
+
+    // ── /clankerbuild pick to delete select ────────────────────────────────────
+    if(cid.startsWith("clankerbuild_pick_delete_")){
+      const modeName = interaction.values[0];
+      const existing = customClankerModes.get(modeName);
+      if(!existing){ try{await interaction.reply({content:"Mode not found.",ephemeral:true});}catch{} return; }
+      if(!OWNER_IDS.includes(uid) && existing.creatorId !== uid){
+        try{await interaction.reply({content:"❌ You can only delete your own modes.",ephemeral:true});}catch{}
+        return;
+      }
+      try{
+        await interaction.reply({
+          content:`🗑️ Delete **${existing.emoji||"⭐"} ${modeName}** (by ${existing.creatorName||"?"})?`,
+          components:[new MessageActionRow().addComponents(
+            new MessageButton().setCustomId(`clankerbuild_delconfirm_${modeName}`).setLabel("Delete").setStyle("DANGER"),
+            new MessageButton().setCustomId("clankerbuild_delcancel").setLabel("Cancel").setStyle("SECONDARY"),
+          )],
+          ephemeral:true,
+        });
+      }catch(e){console.error("[clankerbuild_pick_delete]",e.message);}
+      return;
+    }
+
+    // ── /clankerbuild delete confirm / cancel ──────────────────────────────────
+    if(cid.startsWith("clankerbuild_delconfirm_")){
+      const modeName = cid.slice("clankerbuild_delconfirm_".length);
+      const existing = customClankerModes.get(modeName);
+      if(!existing){ try{await interaction.update({content:"Mode not found.",components:[]});}catch{} return; }
+      if(!OWNER_IDS.includes(uid) && existing.creatorId !== uid){
+        try{await interaction.update({content:"❌ You can only delete your own modes.",components:[]});}catch{}
+        return;
+      }
+      customClankerModes.delete(modeName);
+      saveData();
+      try{await interaction.update({content:`✅ Deleted mode \`${modeName}\`.`, components:[]});}catch{}
+      return;
+    }
+    if(cid === "clankerbuild_delcancel"){
+      try{await interaction.update({content:"Cancelled.", components:[]});}catch{}
+      return;
+    }
+
+    // ── /jarvisenhance builder ───────────────────────────────────────────────────
+    if(cid.startsWith("je_category_")){
+      const token = cid.slice("je_category_".length);
+      const b = jarvisEnhanceBuilders.get(token);
+      if(!b || b.ownerId!==uid){ try{await interaction.reply({content:"❌ This panel expired: run `/jarvisenhance` again.",ephemeral:true});}catch{} return; }
+      b.category = interaction.values[0];
+      try{ await interaction.update(buildJarvisEnhancePanel(token)); }catch{}
+      return;
+    }
+    if(cid.startsWith("je_addback_")){
+      const token = cid.slice("je_addback_".length);
+      const b = jarvisEnhanceBuilders.get(token);
+      if(!b || b.ownerId!==uid) return;
+      b.category = null;
+      try{ await interaction.update(buildJarvisEnhancePanel(token)); }catch{}
+      return;
+    }
+
+    if(cid.startsWith("je_addtype_")){
+      const token = cid.slice("je_addtype_".length);
+      const b = jarvisEnhanceBuilders.get(token);
+      if(!b || b.ownerId!==uid){ try{await interaction.reply({content:"❌ This panel expired: run `/jarvisenhance` again.",ephemeral:true});}catch{} return; }
+      const actionType = interaction.values[0];
+      const def = JARVISENHANCE_ACTIONS.find(a=>a.id===actionType);
+      if(!def) return;
+      if(actionType==="clankerify" || actionType==="impersonation"){
+        b.pendingActionType = actionType;
+        b.pendingMode = null;
+        try{ await interaction.update(buildJarvisModePicker(token)); }catch{}
+        return;
+      }
+      if(!def.fields.length){
+        b.actions.push({ type:actionType, params:{} });
+        b.selectedStep = b.actions.length-1;
+        try{ await interaction.update(buildJarvisEnhancePanel(token)); }catch{}
+        return;
+      }
+      b.pendingActionType = actionType;
+      await interaction.showModal({
+        title:`➕ ${def.label}`.slice(0,45),
+        custom_id:`je_modal_params_${token}`,
+        components: def.fields.map(f => ({type:1,components:[{type:4,custom_id:f.key,label:f.label.slice(0,45),style:f.style,required:!!f.required,max_length:f.max||100}]})),
+      }).catch(e=>console.error("[je_addtype modal]",e.message));
+      return;
+    }
+
+    if(cid.startsWith("je_pickmode_")){
+      const token = cid.slice("je_pickmode_".length);
+      const b = jarvisEnhanceBuilders.get(token);
+      if(!b || b.ownerId!==uid || !b.pendingActionType) return;
+      b.pendingMode = interaction.values[0];
+      try{ await interaction.update(buildJarvisDurationPicker(token)); }catch{}
+      return;
+    }
+    if(cid.startsWith("je_pickduration_")){
+      const token = cid.slice("je_pickduration_".length);
+      const b = jarvisEnhanceBuilders.get(token);
+      if(!b || b.ownerId!==uid || !b.pendingActionType) return;
+      const raw = interaction.values[0];
+      const duration = raw==="permanent" ? "" : (raw==="disable" ? "0" : raw);
+      b.actions.push({ type:b.pendingActionType, params:{ mode:b.pendingMode, duration } });
+      b.selectedStep = b.actions.length-1;
+      b.pendingActionType = null;
+      b.pendingMode = null;
+      try{ await interaction.update(buildJarvisEnhancePanel(token)); }catch{}
+      return;
+    }
+    if(cid.startsWith("je_pickreply_")){
+      const token = cid.slice("je_pickreply_".length);
+      const b = jarvisEnhanceBuilders.get(token);
+      if(!b || b.ownerId!==uid || !b.pendingActionType) return;
+      const params = { ...(b.pendingParams||{}), replyMode: interaction.values[0] };
+      b.actions.push({ type:b.pendingActionType, params });
+      b.selectedStep = b.actions.length-1;
+      b.pendingActionType = null;
+      b.pendingParams = null;
+      try{ await interaction.update(buildJarvisEnhancePanel(token)); }catch{}
+      return;
+    }
+    if(cid.startsWith("je_addcancel_")){
+      const token = cid.slice("je_addcancel_".length);
+      const b = jarvisEnhanceBuilders.get(token);
+      if(!b || b.ownerId!==uid) return;
+      b.pendingActionType = null;
+      b.pendingMode = null;
+      b.pendingParams = null;
+      try{ await interaction.update(buildJarvisEnhancePanel(token)); }catch{}
+      return;
+    }
+
+    if(cid.startsWith("je_manage_")){
+      const token = cid.slice("je_manage_".length);
+      const b = jarvisEnhanceBuilders.get(token);
+      if(!b || b.ownerId!==uid){ try{await interaction.reply({content:"❌ This panel expired: run `/jarvisenhance` again.",ephemeral:true});}catch{} return; }
+      b.selectedStep = parseInt(interaction.values[0],10);
+      try{ await interaction.update(buildJarvisEnhancePanel(token)); }catch{}
+      return;
+    }
+
+    if(cid.startsWith("je_moveup_")){
+      const token = cid.slice("je_moveup_".length);
+      const b = jarvisEnhanceBuilders.get(token);
+      if(!b || b.ownerId!==uid) return;
+      const i = b.selectedStep;
+      if(i!==null && i>0){ [b.actions[i-1],b.actions[i]] = [b.actions[i],b.actions[i-1]]; b.selectedStep = i-1; }
+      try{ await interaction.update(buildJarvisEnhancePanel(token)); }catch{}
+      return;
+    }
+    if(cid.startsWith("je_movedown_")){
+      const token = cid.slice("je_movedown_".length);
+      const b = jarvisEnhanceBuilders.get(token);
+      if(!b || b.ownerId!==uid) return;
+      const i = b.selectedStep;
+      if(i!==null && i<b.actions.length-1){ [b.actions[i],b.actions[i+1]] = [b.actions[i+1],b.actions[i]]; b.selectedStep = i+1; }
+      try{ await interaction.update(buildJarvisEnhancePanel(token)); }catch{}
+      return;
+    }
+    if(cid.startsWith("je_removestep_")){
+      const token = cid.slice("je_removestep_".length);
+      const b = jarvisEnhanceBuilders.get(token);
+      if(!b || b.ownerId!==uid) return;
+      if(b.selectedStep!==null){ b.actions.splice(b.selectedStep,1); b.selectedStep = null; }
+      try{ await interaction.update(buildJarvisEnhancePanel(token)); }catch{}
+      return;
+    }
+
+    if(cid.startsWith("je_triggers_")){
+      const token = cid.slice("je_triggers_".length);
+      const b = jarvisEnhanceBuilders.get(token);
+      if(!b || b.ownerId!==uid){ try{await interaction.reply({content:"❌ This panel expired: run `/jarvisenhance` again.",ephemeral:true});}catch{} return; }
+      await interaction.showModal({
+        title:"✏️ Trigger Word(s)",
+        custom_id:`je_modal_triggers_${token}`,
+        components:[
+          {type:1,components:[{type:4,custom_id:"je_triggers_input",label:"Word(s), comma separated",style:2,required:true,value:b.triggers.join(", "),placeholder:"clankerfy, clank",max_length:300}]},
+        ],
+      }).catch(e=>console.error("[je_triggers modal]",e.message));
+      return;
+    }
+
+    if(cid.startsWith("je_ownerlock_")){
+      const token = cid.slice("je_ownerlock_".length);
+      const b = jarvisEnhanceBuilders.get(token);
+      if(!b || b.ownerId!==uid){ try{await interaction.reply({content:"❌ This panel expired: run `/jarvisenhance` again.",ephemeral:true});}catch{} return; }
+      b.ownerLocked = !b.ownerLocked;
+      try{ await interaction.update(buildJarvisEnhancePanel(token)); }catch{}
+      return;
+    }
+
+    if(cid.startsWith("je_save_")){
+      const token = cid.slice("je_save_".length);
+      const b = jarvisEnhanceBuilders.get(token);
+      if(!b || b.ownerId!==uid){ try{await interaction.reply({content:"❌ This panel expired: run `/jarvisenhance` again.",ephemeral:true});}catch{} return; }
+      if(!b.triggers.length || !b.actions.length){ try{await interaction.reply({content:"❌ Set at least one trigger word and one action first.",ephemeral:true});}catch{} return; }
+      jarvisEnhanceProfiles.set(b.name, {
+        triggers: b.triggers,
+        actions: b.actions,
+        ownerLocked: b.ownerLocked !== false,
+        creatorId: uid,
+        creatorName: interaction.user.username,
+        createdAt: Date.now(),
+      });
+      saveData();
+      jarvisEnhanceBuilders.delete(token);
+      try{ await interaction.update({content:`✅ Saved \`${b.name}\`${b.ownerLocked===false ? " (unlocked: anyone can trigger it)" : " (🔒 owner locked)"}. Reply to a message and say "Jarvis, ${b.triggers[0]}" or "RoyalBot, ${b.triggers[0]}" to run it.`, components:[]}); }catch{}
+      return;
+    }
+
+    if(cid.startsWith("je_cancel_")){
+      const token = cid.slice("je_cancel_".length);
+      jarvisEnhanceBuilders.delete(token);
+      try{ await interaction.update({content:"Cancelled.", components:[]}); }catch{}
+      return;
+    }
+
+    if(cid.startsWith("je_delconfirm_")){
+      const name = cid.slice("je_delconfirm_".length);
+      if(!isEffectiveOwner(uid,"jarvisenhance")){ try{await interaction.update({content:"❌ Owner only.",components:[]});}catch{} return; }
+      jarvisEnhanceProfiles.delete(name);
+      saveData();
+      try{await interaction.update({content:`✅ Deleted profile \`${name}\`.`, components:[]});}catch{}
+      return;
+    }
+    if(cid === "je_delcancel"){
+      try{await interaction.update({content:"Cancelled.", components:[]});}catch{}
+      return;
+    }
+
+    // ── /jarvislist pagination ───────────────────────────────────────────────────
+    if(cid.startsWith("jlist_prev_")||cid.startsWith("jlist_next_")){
+      const isNext = cid.startsWith("jlist_next_");
+      const curPage = parseInt(cid.slice(isNext?"jlist_next_".length:"jlist_prev_".length),10)||0;
+      const images = await getJarvisImages();
+      try{ await interaction.update(buildJarvisListPage(images, isNext?curPage+1:curPage-1)); }catch{}
+      return;
+    }
+
+    // ── /TheRemnant: public "Respond" button opens a reply modal ──────────────
+    if(cid === "theremnant_respond"){
+      await interaction.showModal({
+        title:"👁️ Respond to the Remnant",
+        custom_id:"theremnant_modal",
+        components:[
+          {type:1,components:[{type:4,custom_id:"remnant_reply",label:"Your message",style:2,required:true,placeholder:"Speak into the rift…",max_length:1500}]},
+        ],
+      }).catch(e=>console.error("[theremnant_respond modal]",e.message));
+      return;
+    }
+
+    // ── /serverstats: interactive panel ────────────────────────────────────────
+    if(cid.startsWith("ss_")){
+      if(!interaction.guildId) return;
+      const guild=interaction.guild;
+      const canManage=OWNER_IDS.includes(uid)||interaction.member?.permissions.has("MANAGE_GUILD");
+      if(!canManage){ await btnEphemeral(interaction,"❌ You need **Manage Server** permission to do that."); return; }
+      let cfg=serverStatsConfig.get(guild.id);
+
+      if(cid==="ss_setup"){
+        if(!await btnAck(interaction)) return;
+        if(!cfg) cfg={categoryId:null,channels:[],intervalMinutes:15,locked:true,lastUpdate:0};
+        try{
+          const category=await guild.channels.create("📊 SERVER STATS",{type:"GUILD_CATEGORY"});
+          cfg.categoryId=category.id;
+          await guild.members.fetch().catch(()=>{});
+          cfg.channels=[];
+          for(const type of ["all","humans","bots"]){
+            const meta=SS_STAT_TYPES[type];
+            const entry={id:null,type,label:meta.label,emoji:""};
+            const name=ssChannelName(guild,entry);
+            const overwrites=cfg.locked!==false?[{id:guild.roles.everyone,deny:["CONNECT"],allow:["VIEW_CHANNEL"]}]:[];
+            const ch=await guild.channels.create(name,{type:"GUILD_VOICE",parent:category.id,permissionOverwrites:overwrites});
+            entry.id=ch.id;
+            cfg.channels.push(entry);
+          }
+          cfg.lastUpdate=Date.now();
+          serverStatsConfig.set(guild.id,cfg);
+          saveData();
+        }catch(e){
+          console.error("[serverstats setup]",e.message);
+          await interaction.followUp({content:"❌ I couldn't create the stat channels: check that I have **Manage Channels** permission.",ephemeral:true}).catch(()=>{});
+          return;
+        }
+        await interaction.editReply(ssBuildMainPanel(guild)).catch(()=>{});
+        return;
+      }
+
+      if(!cfg){ await btnEphemeral(interaction,"❌ Server stats aren't set up yet."); return; }
+
+      if(cid==="ss_back"){
+        if(!await btnAck(interaction)) return;
+        await interaction.editReply(ssBuildMainPanel(guild)).catch(()=>{});
+        return;
+      }
+
+      if(cid==="ss_add"){
+        if(!await btnAck(interaction)) return;
+        const [row1,row2]=ssBuildAddMenu(cfg);
+        await interaction.editReply({content:"## ➕ Add a Stat\nPick one or more stats to add as live channels.",components:[row1,row2]}).catch(()=>{});
+        return;
+      }
+
+      if(cid==="ss_add_sel"){
+        const values=interaction.values||[];
+        if(!await btnAck(interaction)) return;
+        try{ await guild.members.fetch(); }catch{}
+        const roleWanted=values.includes("role");
+        const simple=values.filter(v=>v!=="role");
+        for(const type of simple){
+          if(cfg.channels.length>=SS_MAX_CHANNELS) break;
+          const meta=SS_STAT_TYPES[type];
+          const entry={id:null,type,label:meta.label,emoji:""};
+          const name=ssChannelName(guild,entry);
+          const overwrites=cfg.locked!==false?[{id:guild.roles.everyone,deny:["CONNECT"],allow:["VIEW_CHANNEL"]}]:[];
+          try{
+            const ch=await guild.channels.create(name,{type:"GUILD_VOICE",parent:cfg.categoryId||undefined,permissionOverwrites:overwrites});
+            entry.id=ch.id;
+            cfg.channels.push(entry);
+          }catch(e){console.error("[serverstats add]",e.message);}
+        }
+        saveData();
+        if(roleWanted && cfg.channels.length<SS_MAX_CHANNELS){
+          const roles=[...guild.roles.cache.filter(r=>!r.managed&&r.id!==guild.id).sort((a,b)=>b.position-a.position).values()].slice(0,25);
+          const opts=roles.map(r=>({label:r.name.slice(0,100),value:r.id,emoji:{name:"🏷️"}}));
+          const row=new MessageActionRow().addComponents(new MessageSelectMenu().setCustomId("ss_addrole_sel").setPlaceholder("Which role should be counted?").setOptions(opts.length?opts:[{label:"No roles found",value:"none"}]).setDisabled(!opts.length));
+          const backRow=new MessageActionRow().addComponents(new MessageButton().setCustomId("ss_back").setLabel("← Back").setStyle("SECONDARY"));
+          await interaction.editReply({content:"## 🏷️ Add a Role Stat\nPick the role you want a live member counter for.",components:[row,backRow]}).catch(()=>{});
+          return;
+        }
+        await interaction.editReply(ssBuildMainPanel(guild)).catch(()=>{});
+        return;
+      }
+
+      if(cid==="ss_addrole_sel"){
+        const roleId=interaction.values?.[0];
+        if(!await btnAck(interaction)) return;
+        if(!roleId||roleId==="none"){ await interaction.editReply(ssBuildMainPanel(guild)).catch(()=>{}); return; }
+        const role=guild.roles.cache.get(roleId);
+        if(!role || cfg.channels.length>=SS_MAX_CHANNELS){ await interaction.editReply(ssBuildMainPanel(guild)).catch(()=>{}); return; }
+        try{ await guild.members.fetch(); }catch{}
+        const entry={id:null,type:"role",roleId:role.id,label:role.name,emoji:""};
+        const name=ssChannelName(guild,entry);
+        const overwrites=cfg.locked!==false?[{id:guild.roles.everyone,deny:["CONNECT"],allow:["VIEW_CHANNEL"]}]:[];
+        try{
+          const ch=await guild.channels.create(name,{type:"GUILD_VOICE",parent:cfg.categoryId||undefined,permissionOverwrites:overwrites});
+          entry.id=ch.id;
+          cfg.channels.push(entry);
+          saveData();
+        }catch(e){console.error("[serverstats addrole]",e.message);}
+        await interaction.editReply(ssBuildMainPanel(guild)).catch(()=>{});
+        return;
+      }
+
+      if(cid==="ss_manage"){
+        if(!await btnAck(interaction)) return;
+        const [row1,row2]=ssBuildManageList(guild,cfg);
+        await interaction.editReply({content:"## ✏️ Edit / Remove a Stat\nPick a stat channel below.",components:[row1,row2]}).catch(()=>{});
+        return;
+      }
+
+      if(cid==="ss_manage_sel"){
+        const entryId=interaction.values?.[0];
+        if(!await btnAck(interaction)) return;
+        if(!entryId||entryId==="none"){ await interaction.editReply(ssBuildMainPanel(guild)).catch(()=>{}); return; }
+        await interaction.editReply(ssBuildEditActions(guild,cfg,entryId)).catch(()=>{});
+        return;
+      }
+
+      if(cid.startsWith("ss_moveup_")||cid.startsWith("ss_movedown_")){
+        const entryId=cid.replace(/^ss_(moveup|movedown)_/,"");
+        if(!await btnAck(interaction)) return;
+        const idx=cfg.channels.findIndex(e=>e.id===entryId);
+        if(idx===-1){ await interaction.editReply(ssBuildMainPanel(guild)).catch(()=>{}); return; }
+        const dir=cid.startsWith("ss_moveup_")?-1:1;
+        const swapIdx=idx+dir;
+        if(swapIdx>=0 && swapIdx<cfg.channels.length){
+          [cfg.channels[idx],cfg.channels[swapIdx]]=[cfg.channels[swapIdx],cfg.channels[idx]];
+          saveData();
+          try{
+            for(let i=0;i<cfg.channels.length;i++){
+              const ch=guild.channels.cache.get(cfg.channels[i].id);
+              if(ch) await ch.setPosition(i).catch(()=>{});
+            }
+          }catch{}
+        }
+        await interaction.editReply(ssBuildEditActions(guild,cfg,entryId)).catch(()=>{});
+        return;
+      }
+
+      if(cid.startsWith("ss_remove_")){
+        const entryId=cid.replace("ss_remove_","");
+        if(!await btnAck(interaction)) return;
+        const idx=cfg.channels.findIndex(e=>e.id===entryId);
+        if(idx!==-1){
+          const ch=guild.channels.cache.get(entryId);
+          if(ch) await ch.delete().catch(()=>{});
+          cfg.channels.splice(idx,1);
+          saveData();
+        }
+        await interaction.editReply(ssBuildMainPanel(guild)).catch(()=>{});
+        return;
+      }
+
+      if(cid.startsWith("ss_editlabel_")||cid.startsWith("ss_editemoji_")){
+        const isEmoji=cid.startsWith("ss_editemoji_");
+        const entryId=cid.replace(isEmoji?"ss_editemoji_":"ss_editlabel_","");
+        const entry=cfg.channels.find(e=>e.id===entryId);
+        if(!entry) return;
+        await interaction.showModal({
+          title:isEmoji?"Change Emoji":"Rename Label",
+          custom_id:`ss_modal_${isEmoji?"emoji":"label"}_${entryId}`,
+          components:[{type:1,components:[{type:4,custom_id:"ss_input",label:isEmoji?"New emoji (leave blank for none)":"New label text",style:1,required:!isEmoji,max_length:isEmoji?10:60,value:isEmoji?(entry.emoji||""):entry.label}]}],
+        }).catch(e=>console.error("[serverstats modal]",e.message));
+        return;
+      }
+
+      if(cid==="ss_settings"){
+        if(!await btnAck(interaction)) return;
+        await interaction.editReply(ssBuildSettingsPanel(guild,cfg)).catch(()=>{});
+        return;
+      }
+
+      if(cid==="ss_interval_sel"){
+        const minutes=parseInt(interaction.values?.[0],10);
+        if(!await btnAck(interaction)) return;
+        if(minutes>=SS_MIN_INTERVAL_MIN){ cfg.intervalMinutes=minutes; saveData(); }
+        await interaction.editReply(ssBuildSettingsPanel(guild,cfg)).catch(()=>{});
+        return;
+      }
+
+      if(cid==="ss_togglelock"){
+        if(!await btnAck(interaction)) return;
+        cfg.locked = cfg.locked===false ? true : false;
+        try{
+          for(const entry of cfg.channels){
+            const ch=guild.channels.cache.get(entry.id);
+            if(!ch) continue;
+            if(cfg.locked===false) await ch.permissionOverwrites.edit(guild.roles.everyone,{CONNECT:null}).catch(()=>{});
+            else await ch.permissionOverwrites.edit(guild.roles.everyone,{CONNECT:false,VIEW_CHANNEL:true}).catch(()=>{});
+          }
+        }catch{}
+        saveData();
+        await interaction.editReply(ssBuildSettingsPanel(guild,cfg)).catch(()=>{});
+        return;
+      }
+
+      if(cid==="ss_renamecat"){
+        await interaction.showModal({
+          title:"Rename Category",
+          custom_id:"ss_modal_renamecat",
+          components:[{type:1,components:[{type:4,custom_id:"ss_input",label:"New category name",style:1,required:true,max_length:100,value:guild.channels.cache.get(cfg.categoryId)?.name||"📊 SERVER STATS"}]}],
+        }).catch(e=>console.error("[serverstats renamecat modal]",e.message));
+        return;
+      }
+
+      if(cid==="ss_refresh"){
+        if(!await btnAck(interaction)) return;
+        await ssUpdateGuildChannels(guild,cfg,{force:true}).catch(()=>{});
+        await interaction.editReply(ssBuildMainPanel(guild)).catch(()=>{});
+        return;
+      }
+
+      if(cid==="ss_delete"){
+        if(!await btnAck(interaction)) return;
+        const row=new MessageActionRow().addComponents(
+          new MessageButton().setCustomId("ss_delete_confirm").setLabel("🗑️ Yes, delete everything").setStyle("DANGER"),
+          new MessageButton().setCustomId("ss_back").setLabel("Cancel").setStyle("SECONDARY"),
+        );
+        await interaction.editReply({content:"## ⚠️ Are you sure?\nThis will delete the stats category and all its channels. This can't be undone.",components:[row]}).catch(()=>{});
+        return;
+      }
+
+      if(cid==="ss_delete_confirm"){
+        if(!await btnAck(interaction)) return;
+        try{
+          for(const entry of cfg.channels){
+            const ch=guild.channels.cache.get(entry.id);
+            if(ch) await ch.delete().catch(()=>{});
+          }
+          const cat=guild.channels.cache.get(cfg.categoryId);
+          if(cat) await cat.delete().catch(()=>{});
+        }catch{}
+        serverStatsConfig.delete(guild.id);
+        saveData();
+        await interaction.editReply(ssBuildMainPanel(guild)).catch(()=>{});
+        return;
+      }
+
+      try{await interaction.deferUpdate();}catch{}
+      return;
+    }
+
+    try{await interaction.deferUpdate();}catch{}
+    return;
+    } catch(btnErr) {
+      console.error("[button/select handler error]", btnErr);
+      try {
+        if(!interaction.replied && !interaction.deferred)
+          await interaction.reply({content:"❌ Something went wrong. Please try again.", ephemeral:true});
+        else
+          await interaction.followUp({content:"❌ Something went wrong. Please try again.", ephemeral:true}).catch(()=>{});
+      } catch {}
+    }
+  }
+
+  // ── Modal submits ─────────────────────────────────────────────────────────────
+  if(interaction.isModalSubmit()){
+    const uid = interaction.user.id;
+    const cid = interaction.customId;
+
+    // ── /TheRemnant: reply modal submit ────────────────────────────────────────
+    if(cid === "theremnant_modal"){
+      const replyText = (interaction.fields.getTextInputValue("remnant_reply")||"").trim();
+      if(!replyText) return safeReply(interaction,{content:"❌ Message can't be empty.",ephemeral:true});
+      if(isFullyBlacklisted(uid)) return isSilentBlacklisted(uid) ? undefined : safeReply(interaction,{content:"❌ You can't do that.",ephemeral:true});
+
+      try{
+        const relayChannel = await ensureDmRelayChannel(interaction.user);
+        if(!relayChannel){
+          return safeReply(interaction,{content:"❌ The rift isn't open right now: try again later.",ephemeral:true});
+        }
+        await relayChannel.send({
+          embeds:[{
+            description: replyText,
+            color: 0x8E44AD,
+            footer:{text:"📡 Received via The Remnant"},
+            timestamp: new Date().toISOString(),
+          }],
+        }).catch(()=>{});
+        return safeReply(interaction,{content:"📡 Your message has been sent into the rift…",ephemeral:true});
+      } catch(e){
+        console.error("[theremnant_modal]", e.message);
+        return safeReply(interaction,{content:"❌ Something went wrong sending your message.",ephemeral:true});
+      }
+    }
+
+    // ── /quotesetup: folder name modal submit ───────────────────────────────────
+    if(cid.startsWith("qs_modal_folder_")){
+      const qsToken = cid.slice("qs_modal_folder_".length);
+      const qb = quoteSetupBuilders.get(qsToken);
+      if(!qb) return safeReply(interaction,{content:QS_TEXT.expired,ephemeral:true});
+      if(qb.ownerId !== uid) return safeReply(interaction,{content:QS_TEXT.notYourPanel,ephemeral:true});
+      const rawFolder = interaction.fields.getTextInputValue("qs_folder_input") || "";
+      await interaction.deferReply({ephemeral:true}).catch(()=>{});
+      const check = await validateQuoteFolderChoice(rawFolder, qb.guildId);
+      if(!check.ok) return safeReply(interaction,{content:check.reason,ephemeral:true});
+      qb.folder = check.name;
+      qb.step = "folder";
+      return safeReply(interaction,{...buildQuoteSetupPanel(qsToken), ephemeral:true});
+    }
+
+    // ── /sotd-playlist: add playlist modal submit ────────────────────────────────
+    if(cid === "sp_modal_add"){
+      if(!interaction.guildId || !isGuildOwner(interaction.guildId, uid)) return safeReply(interaction,{content:"Server owner only.",ephemeral:true});
+      const url = (interaction.fields.getTextInputValue("sp_url") || "").trim();
+      const labelInput = (interaction.fields.getTextInputValue("sp_label") || "").trim();
+      let sotdParsedUrl;
+      try{ sotdParsedUrl = new URL(url); }
+      catch{ return safeReply(interaction,{content:"❌ That's not a valid URL.",ephemeral:true}); }
+      const sotdHost = sotdParsedUrl.hostname.replace(/^(www|m|music)\./, "");
+      const sotdIsYoutube = sotdHost === "youtube.com" || sotdHost === "youtu.be";
+      if(!sotdIsYoutube || !sotdParsedUrl.searchParams.has("list")){
+        return safeReply(interaction,{content:"❌ That doesn't look like a YouTube playlist URL (needs `list=` in it, from a youtube.com or youtu.be link).",ephemeral:true});
+      }
+      await interaction.deferReply({ephemeral:true});
+      let info;
+      try{ info = await ytFetchPlaylistFlat(url); }
+      catch(e){ return safeReply(interaction,{content:`❌ Couldn't read that playlist: ${e.message}`,ephemeral:true}); }
+      if(!info.entries.length) return safeReply(interaction,{content:"❌ That playlist has no videos in it.",ephemeral:true});
+
+      const cfg = (() => { let c = sotdConfig.get(interaction.guildId); if(!c){ c = { playlists:[], usedVideoIds:[] }; sotdConfig.set(interaction.guildId, c); } return c; })();
+      cfg.playlists.push({ id: `${Date.now().toString(36)}${Math.floor(Math.random()*1000)}`, url, label: labelInput || info.title, entries: info.entries });
+      saveData();
+      const addedPanel = buildSotdPlaylistPanel(interaction.guild, interaction.guildId);
+      const addedPreview = await buildSotdPreviewEmbed(interaction.guild, cfg).catch(()=>null);
+      if(addedPreview) addedPanel.embeds.push(addedPreview);
+      return safeReply(interaction,{ ...addedPanel, content:`✅ Added **${labelInput || info.title}** (${info.entries.length} track(s)).` });
+    }
+
+    // ── Reaction role manual builder: emoji modal submit ────────────────────────
+    if(cid.startsWith("rr_modal_emoji_")){
+      const token = cid.slice("rr_modal_emoji_".length);
+      const b = rrBuilders.get(token);
+      if(!b || b.ownerId!==uid)
+        return safeReply(interaction,{content:"This panel expired, run /reactionrole action:manual again.",ephemeral:true});
+      const emoji = (interaction.fields.getTextInputValue("rr_emoji_input")||"").trim();
+      if(!emoji) return safeReply(interaction,{content:"Provide an emoji.",ephemeral:true});
+      b.pendingEmoji = emoji;
+      return safeReply(interaction,{...buildReactionRoleRolePicker(token), ephemeral:true});
+    }
+
+    // ── Dropdown roles builder: modal submits ───────────────────────────────────
+    if(cid.startsWith("ddb_modal_newname_")){
+      const token = cid.slice("ddb_modal_newname_".length);
+      const b = ddBuilders.get(token);
+      if(!b || b.ownerId!==uid)
+        return safeReply(interaction,{content:"This panel expired, run /dropdownroles action:build again.",ephemeral:true});
+      const name = (interaction.fields.getTextInputValue("ddb_name_input")||"").trim();
+      if(!name) return safeReply(interaction,{content:"Provide a name.",ephemeral:true});
+      if(b.dropdowns.length>=DD_MAX_DROPDOWNS) return safeReply(interaction,{content:`❌ Max ${DD_MAX_DROPDOWNS} dropdowns per message.`,ephemeral:true});
+      b.dropdowns.push({ name: name.slice(0,100), options: [] });
+      ddTouch(token);
+      return safeReply(interaction,{...buildDdEditPanel(token, b.dropdowns.length-1), ephemeral:true});
+    }
+
+    if(cid.startsWith("ddb_modal_rename_")){
+      const rest = cid.slice("ddb_modal_rename_".length);
+      const [token, indexStr] = rest.split("_");
+      const index = parseInt(indexStr,10);
+      const b = ddBuilders.get(token);
+      if(!b || b.ownerId!==uid || !b.dropdowns[index])
+        return safeReply(interaction,{content:"This panel expired, run /dropdownroles action:build again.",ephemeral:true});
+      const name = (interaction.fields.getTextInputValue("ddb_rename_input")||"").trim();
+      if(!name) return safeReply(interaction,{content:"Provide a name.",ephemeral:true});
+      b.dropdowns[index].name = name.slice(0,100);
+      ddTouch(token);
+      return safeReply(interaction,{...buildDdEditPanel(token, index), ephemeral:true});
+    }
+
+    if(cid.startsWith("ddb_modal_emoji_")){
+      const rest = cid.slice("ddb_modal_emoji_".length);
+      const [token, indexStr] = rest.split("_");
+      const index = parseInt(indexStr,10);
+      const b = ddBuilders.get(token);
+      if(!b || b.ownerId!==uid || !b.dropdowns[index])
+        return safeReply(interaction,{content:"This panel expired, run /dropdownroles action:build again.",ephemeral:true});
+      const emoji = (interaction.fields.getTextInputValue("ddb_emoji_input")||"").trim();
+      if(!emoji) return safeReply(interaction,{content:"Provide an emoji.",ephemeral:true});
+      b.pendingEmoji = emoji;
+      b.pendingIndex = index;
+      ddTouch(token);
+      return safeReply(interaction,{...buildDdRolePicker(token, index), ephemeral:true});
+    }
+
+    // ── Dropdown roles builder: detect from pasted message IDs ──────────────────
+    if(cid.startsWith("ddb_modal_detect_")){
+      const token = cid.slice("ddb_modal_detect_".length);
+      const b = ddBuilders.get(token);
+      if(!b || b.ownerId!==uid)
+        return safeReply(interaction,{content:"This panel expired, run /dropdownroles action:build again.",ephemeral:true});
+      const raw = (interaction.fields.getTextInputValue("ddb_detect_input")||"").trim();
+      const ids = [...new Set(raw.split(/[\s,]+/).map(s=>s.trim()).filter(s=>/^\d{10,25}$/.test(s)))];
+      if(!ids.length) return safeReply(interaction,{content:"❌ No valid message IDs found.",ephemeral:true});
+      await interaction.deferReply({ephemeral:true}).catch(()=>{});
+      const guild = client.guilds.cache.get(b.guildId);
+      const results = [];
+      for(const messageId of ids){
+        if(b.dropdowns.length>=DD_MAX_DROPDOWNS){ results.push(`⚠️ \`${messageId}\`: skipped, already at ${DD_MAX_DROPDOWNS} dropdowns`); continue; }
+        const targetMsg = await findMessageInGuild(guild, messageId);
+        if(!targetMsg){ results.push(`❌ \`${messageId}\`: message not found`); continue; }
+        const parsed = parseReactionRoleLines(targetMsg.content, guild);
+        if(!parsed.length){ results.push(`❌ \`${messageId}\`: no emoji + role lines found`); continue; }
+        const options = [];
+        for(const {emojiRaw, roleId} of parsed){
+          if(!guild.roles.cache.get(roleId)) continue;
+          options.push({ emojiRaw, roleId });
+        }
+        if(!options.length){ results.push(`❌ \`${messageId}\`: no valid roles found`); continue; }
+        const firstLine = targetMsg.content.split("\n").map(l=>l.trim()).find(l=>l && !parseReactionRoleLines(l, guild).length);
+        const name = (firstLine || `Dropdown (msg ${messageId})`).slice(0,100);
+        b.dropdowns.push({ name, options });
+        results.push(`✅ \`${messageId}\`: created "${name}" with ${options.length} option${options.length!==1?"s":""}`);
+      }
+      ddTouch(token);
+      const panel = buildDdMainPanel(token);
+      return safeReply(interaction,{content:`**Detection results:**\n${results.join("\n")}\n\n${panel.content}`, components:panel.components, ephemeral:true});
+    }
+
+    // ── /jarvisenhance builder: action params modal submit ─────────────────────
+    if(cid.startsWith("je_modal_params_")){
+      const token = cid.slice("je_modal_params_".length);
+      const b = jarvisEnhanceBuilders.get(token);
+      if(!b || b.ownerId!==uid || !b.pendingActionType)
+        return safeReply(interaction,{content:"❌ This panel expired: run `/jarvisenhance` again.",ephemeral:true});
+      const def = JARVISENHANCE_ACTIONS.find(a => a.id === b.pendingActionType);
+      const params = {};
+      for(const f of (def?.fields||[])){
+        params[f.key] = (interaction.fields.getTextInputValue(f.key)||"").trim();
+      }
+      if(def?.replyable){
+        b.pendingParams = params;
+        return safeReply(interaction,{...buildJarvisReplyModePicker(token), ephemeral:true});
+      }
+      b.actions.push({ type:b.pendingActionType, params });
+      b.selectedStep = b.actions.length-1;
+      b.pendingActionType = null;
+      return safeReply(interaction,{...buildJarvisEnhancePanel(token), ephemeral:true});
+    }
+
+    // ── /jarvisenhance builder: trigger words modal submit ──────────────────────
+    if(cid.startsWith("je_modal_triggers_")){
+      const token = cid.slice("je_modal_triggers_".length);
+      const b = jarvisEnhanceBuilders.get(token);
+      if(!b || b.ownerId!==uid)
+        return safeReply(interaction,{content:"❌ This panel expired: run `/jarvisenhance` again.",ephemeral:true});
+      const raw = interaction.fields.getTextInputValue("je_triggers_input")||"";
+      b.triggers = raw.split(",").map(s=>s.trim().toLowerCase()).filter(Boolean);
+      return safeReply(interaction,{...buildJarvisEnhancePanel(token), ephemeral:true});
+    }
+
+    // ── /serverstats modal submits ──────────────────────────────────────────────
+    if(cid.startsWith("ss_modal_label_")||cid.startsWith("ss_modal_emoji_")){
+      if(!interaction.guildId) return;
+      const guild=interaction.guild;
+      const cfg=serverStatsConfig.get(guild.id);
+      const isEmoji=cid.startsWith("ss_modal_emoji_");
+      const entryId=cid.replace(isEmoji?"ss_modal_emoji_":"ss_modal_label_","");
+      const entry=cfg?.channels.find(e=>e.id===entryId);
+      const value=(interaction.fields.getTextInputValue("ss_input")||"").trim();
+      if(!entry) return safeReply(interaction,{content:"❌ Something went wrong.",ephemeral:true});
+      if(!isEmoji && !value) return safeReply(interaction,{content:"❌ Label can't be empty.",ephemeral:true});
+      if(isEmoji) entry.emoji=value.slice(0,10); else entry.label=value.slice(0,60);
+      saveData();
+      try{
+        const ch=guild.channels.cache.get(entry.id);
+        if(ch) await ch.setName(ssChannelName(guild,entry)).catch(()=>{});
+      }catch{}
+      return safeReply(interaction,{...ssBuildEditActions(guild,cfg,entryId),ephemeral:true});
+    }
+
+    if(cid==="ss_modal_renamecat"){
+      if(!interaction.guildId) return;
+      const guild=interaction.guild;
+      const cfg=serverStatsConfig.get(guild.id);
+      if(!cfg) return safeReply(interaction,{content:"❌ Server stats aren't set up.",ephemeral:true});
+      const value=(interaction.fields.getTextInputValue("ss_input")||"").trim();
+      if(!value) return safeReply(interaction,{content:"❌ Name can't be empty.",ephemeral:true});
+      try{
+        const cat=guild.channels.cache.get(cfg.categoryId);
+        if(cat) await cat.setName(value.slice(0,100)).catch(()=>{});
+      }catch{}
+      saveData();
+      return safeReply(interaction,{...ssBuildSettingsPanel(guild,cfg),ephemeral:true});
+    }
+
+    // ── /clankerbuild modal submit ────────────────────────────────────────────
+    if(cid === "clankerbuild_modal_NEW" || cid.startsWith("clankerbuild_modal_EDIT_")){
+      const isNew    = cid === "clankerbuild_modal_NEW";
+      const modeName = isNew
+        ? (interaction.fields.getTextInputValue("cb_name")||"").trim().toLowerCase().replace(/\s+/g,"_")
+        : cid.slice("clankerbuild_modal_EDIT_".length);
+
+      if(!modeName || modeName.length > 40)
+        return safeReply(interaction,{content:"❌ Mode ID must be 1–40 characters.",ephemeral:true});
+
+      const BUILTIN_MODES2 = new Set(["none","evil","freaky","american","british","stupid","boomer","conspiracy","npc","sigma","medieval","ghost","pirate","rr_propaganda","french","uwu","random"]);
+      if(BUILTIN_MODES2.has(modeName))
+        return safeReply(interaction,{content:`❌ \`${modeName}\` is a built in mode and cannot be overwritten.`,ephemeral:true});
+
+      const existingMode = customClankerModes.get(modeName);
+      if(!isNew && existingMode && !OWNER_IDS.includes(uid) && existingMode.creatorId !== uid)
+        return safeReply(interaction,{content:"❌ You can only edit your own modes.",ephemeral:true});
+
+      const emoji          = interaction.fields.getTextInputValue("cb_emoji").trim();
+      const displayNameFmt = interaction.fields.getTextInputValue("cb_display").trim() || "{name}";
+      const wordsRaw       = interaction.fields.getTextInputValue("cb_words").trim();
+      const signoffsRaw    = interaction.fields.getTextInputValue("cb_signoffs").trim();
+      const messageStart   = cid.startsWith("clankerbuild_modal_EDIT_")
+        ? (interaction.fields.getTextInputValue("cb_start").trim())
+        : "";
+
+      const words = wordsRaw
+        ? wordsRaw.split(";").map(p=>p.trim()).filter(Boolean).map(p=>{
+            const [from,...rest]=p.split(">"); return [from?.trim(), rest.join(">").trim()];
+          }).filter(([f,t])=>f&&t)
+        : [];
+      const signoffs = signoffsRaw ? signoffsRaw.split(";").map(s=>s.trim()).filter(Boolean) : [];
+
+      const creatorId   = (existingMode?.creatorId)   || uid;
+      const creatorName = (existingMode?.creatorName) || (interaction.user.globalName || interaction.user.username);
+
+      customClankerModes.set(modeName, { emoji, displayNameFormat: displayNameFmt, words, signoffs, messageStart, creatorId, creatorName });
+      saveData();
+
+      return safeReply(interaction,{
+        content:[
+          `${existingMode?"✏️ Updated":"✅ Created"} custom clanker mode \`${modeName}\`!`,
+          `${emoji||"⭐"} **Display:** \`${displayNameFmt}\``,
+          words.length    ? `🔁 **Word swaps:** ${words.map(([f,t])=>`${f}>${t}`).join("; ")}` : "",
+          signoffs.length ? `✍️ **Signoffs:** ${signoffs.join(" ; ")}` : "",
+          messageStart    ? `📝 **Start prefix:** \`${messageStart}\`` : "",
+          `👤 **Creator:** ${creatorName}`,
+        ].filter(Boolean).join("\n"),
+        ephemeral:true,
+      });
+    }
+
+    // ── Tomato This modal ─────────────────────────────────────────────────────
+    if(cid.startsWith("tomato_modal_")){
+      const msgId = cid.slice("tomato_modal_".length);
+      const pending = tomatoPending.get(msgId);
+      if(!pending){
+        return safeReply(interaction,{content:"❌ Session expired, right click the message again.",ephemeral:true});
+      }
+
+      const parsedCount    = parseInt(interaction.fields.getTextInputValue("tomato_count"));
+      const parsedSpeedMin = parseInt(interaction.fields.getTextInputValue("tomato_speed_min"));
+      const parsedSpeedMax = parseInt(interaction.fields.getTextInputValue("tomato_speed_max"));
+      const rawCount    = Number.isNaN(parsedCount)    ? 1   : parsedCount;
+      const rawSpeedMin = Number.isNaN(parsedSpeedMin) ? 50  : parsedSpeedMin;
+      const rawSpeedMax = Number.isNaN(parsedSpeedMax) ? 100 : parsedSpeedMax;
+      const count    = Math.min(50, Math.max(1, rawCount));
+      const speedMin = Math.min(1000, Math.max(0, rawSpeedMin));
+      const speedMax = Math.min(1000, Math.max(speedMin, rawSpeedMax));
+
+      await interaction.deferReply({ephemeral:true});
+      try{
+        const gifBuf = await buildTomatoGif(pending.msgContent, pending.authorTag, count, speedMin, speedMax, pending.avatarURL, pending.usernameColor);
+        tomatoPending.delete(msgId);
+        const ch = interaction.channel;
+        if(!ch) throw new Error("Could not find the channel to send the GIF in");
+        await ch.send({ files:[{ attachment: gifBuf, name:"tomato.gif" }] });
+        await interaction.editReply({ content:`🍅 Tomatoed! (${count} tomato${count!==1?"s":""}, speed ${speedMin}–${speedMax}%)` }).catch(()=>{});
+      }catch(e){
+        console.error("tomato modal fire error:", e);
+        await interaction.editReply({content:`❌ Failed to make GIF: ${e.message}\n\`\`\`${e.stack?.slice(0,500)||""}\`\`\``}).catch(()=>{});
+      }
+      return;
+    }
+
+    return;
+  }
+
+  // ── Message context menu commands ──────────────────────────────────────────────
+  if(interaction.isMessageContextMenu()){
+    const uid = interaction.user.id;
+    const targetMsg = interaction.targetMessage;
+    const cmd = interaction.commandName;
+
+    // ── Reaction Bomb (owner only) ───────────────────────────────────────────────
+    if(cmd === "Reaction Bomb"){
+      if(!OWNER_IDS.includes(uid) && !hasTempOwnerFeature(uid,"reaction_bomb")) return safeReply(interaction,{content:"Owner only.",ephemeral:true});
+      const BOMB_EMOJIS = ["✅","👍","🔥","💀","😂","❤️","👑","💯","🎉","⚡","🏆","😈","🤣","💪","🌟"];
+      try {
+        await interaction.deferReply({ephemeral:true});
+        for(const emoji of BOMB_EMOJIS){
+          await targetMsg.react(emoji).catch(()=>{});
+        }
+        await interaction.editReply({content:"💣 Bombed."});
+      } catch(e) { await interaction.editReply({content:`❌ Failed: ${e.message}`}).catch(()=>{}); }
+      return;
+    }
+
+    // ── Clank This (owner only) ─────────────────────────────────────────────────
+    if(cmd === "Clank This"){
+      if(!OWNER_IDS.includes(uid) && !hasTempOwnerFeature(uid,"clank_this")) return safeReply(interaction,{content:"Owner only.",ephemeral:true});
+      const target = targetMsg.author;
+      if(target.bot) return safeReply(interaction,{content:"Can't clankerify a bot.",ephemeral:true});
+      const ctKey = scopedKey(interaction.guildId, target.id);
+      clankerify.set(ctKey, { expiresAt: Date.now() + 10 * 60_000, mode: null, ownerClanked: true });
+      saveData();
+      setTimeout(() => { clankerify.delete(ctKey); saveData(); }, 10 * 60_000);
+      return safeReply(interaction,{content:`🤖 <@${target.id}> has been clankerified for 10 minutes in this server.`,ephemeral:true});
+    }
+
+    // ── Expose (owner only) ─────────────────────────────────────────────────────
+    if(cmd === "Expose"){
+      if(!OWNER_IDS.includes(uid) && !hasTempOwnerFeature(uid,"expose")) return safeReply(interaction,{content:"Owner only.",ephemeral:true});
+      const content = targetMsg.content || "(no text)";
+      const author = targetMsg.author;
+      const exposePrefixes = [
+        "🚨 CAUGHT IN 4K:",
+        "📢 ATTENTION EVERYONE:",
+        "🔍 EXPOSE THREAD:",
+        "📸 SCREENSHOT THIS:",
+        "⚠️ EVIDENCE:",
+      ];
+      const prefix = exposePrefixes[Math.floor(Math.random() * exposePrefixes.length)];
+      await safeReply(interaction,{content:`${prefix}
+> ${content}
+by <@${author.id}>`});
+      return;
+    }
+
+    // ── Tomato This (everyone) ──────────────────────────────────────────────────
+    if(cmd === "Tomato This"){
+      const msgContent    = targetMsg.content || "";
+      const authorTag     = targetMsg.member?.displayName || targetMsg.author.globalName || targetMsg.author.username;
+      const avatarURL     = targetMsg.author.displayAvatarURL({ size: 128, dynamic: false, format: "png" });
+      const rawColor      = targetMsg.member?.displayHexColor;
+      const usernameColor = (rawColor && rawColor !== "#000000") ? rawColor : "#FFFFFF";
+
+      tomatoPending.set(targetMsg.id, { authorTag, msgContent, avatarURL, usernameColor });
+
+      try {
+        await interaction.showModal({
+          title: "🍅 Tomato Settings",
+          custom_id: `tomato_modal_${targetMsg.id}`,
+          components: [
+            {
+              type: 1,
+              components: [{
+                type: 4,
+                custom_id: "tomato_count",
+                label: "Number of tomatoes (1–50)",
+                style: 1,
+                placeholder: "1",
+                value: "1",
+                min_length: 1, max_length: 2, required: true,
+              }]
+            },
+            {
+              type: 1,
+              components: [{
+                type: 4,
+                custom_id: "tomato_speed_min",
+                label: "Min speed % per tomato (0–1000)",
+                style: 1,
+                placeholder: "50",
+                value: "50",
+                min_length: 1, max_length: 4, required: true,
+              }]
+            },
+            {
+              type: 1,
+              components: [{
+                type: 4,
+                custom_id: "tomato_speed_max",
+                label: "Max speed % per tomato (0–1000)",
+                style: 1,
+                placeholder: "100",
+                value: "100",
+                min_length: 1, max_length: 4, required: true,
+              }]
+            },
+          ]
+        });
+      } catch(e) {
+        console.error("Tomato This modal error:", e.message);
+      }
+      return;
+    }
+
+    // ── Vibe Check (everyone) ───────────────────────────────────────────────────
+    if(cmd === "Vibe Check"){
+      const vibes = [
+        "✅ Vibe check passed. Immaculate.",
+        "✅ Vibe check passed. Barely, but still.",
+        "❌ Vibe check FAILED. Touch grass immediately.",
+        "❌ Vibe check FAILED. This message should not exist.",
+        "⚠️ Vibe check inconclusive. The council is divided.",
+        "💀 Vibe check so bad it killed the vibe in a 5 mile radius.",
+        "🔥 Vibe check passed with honours. Legend.",
+        "😐 Vibe check: mediocre. Could be worse. Could be better. It's this.",
+        "👑 Vibe check passed. This person is built different.",
+        "🤣 Vibe check: unhinged. Pass.",
+      ];
+      const result = vibes[Math.floor(Math.random() * vibes.length)];
+      await safeReply(interaction,{content:`${result}
+(checking <@${targetMsg.author.id}>'s message)`});
+      return;
+    }
+
+    // ── Uwu-ify (everyone) ──────────────────────────────────────────────────────
+    if(cmd === "Uwu-ify"){
+      const text = targetMsg.content;
+      if(!text) return safeReply(interaction,{content:"That message has no text to uwu ify.",ephemeral:true});
+      let uwu = text
+        .replace(/r|l/gi, m => m === m.toUpperCase() ? "W" : "w")
+        .replace(/n([aeiou])/gi, (m,v) => `ny${v}`)
+        .replace(/ove/gi,"uv")
+        .replace(/th/gi,"d")
+        .replace(/\!+/g,"! uwu")
+        .replace(/\?+/g,"? owo")
+        .replace(/no/gi,"nyo")
+        .replace(/you/gi,"yuwu")
+        .replace(/the/gi,"da")
+        .replace(/my/gi,"mwy")
+        .replace(/what/gi,"wat");
+      const faces = ["uwu","owo","(つ✿╥‿╥)つ",">w<","(っ˘ω˘ς)","^w^","rawr x3","*nuzzles*"];
+      uwu = uwu + " " + faces[Math.floor(Math.random()*faces.length)];
+      await safeReply(interaction,{content:`**Uwu-ified** <@${targetMsg.author.id}>'s message:
+> ${uwu}`});
+      return;
+    }
+
+    // ── Quote This (everyone) ───────────────────────────────────────────────────
+    if(cmd === "Quote This"){
+      const text = targetMsg.content;
+      if(!text) return safeReply(interaction,{content:"That message has no text to quote.",ephemeral:true});
+      const author = targetMsg.author;
+      const displayName = targetMsg.member?.displayName || author.globalName || author.username;
+      await safeReply(interaction,{content:`\u201c${text}\u201d
+by **${displayName}**`});
+      return;
+    }
+
+    // ── Make it a quote (everyone, real data only, no editing) ──────────────────
+    if(cmd === "Make it a quote"){
+      const text = targetMsg.content;
+      if(!text) return safeReply(interaction,{content:"That message has no text to quote.",ephemeral:true});
+      const author = targetMsg.author;
+      if(author.bot) return safeReply(interaction,{content:"Can't quote a bot message.",ephemeral:true});
+      await interaction.deferReply();
+      try{
+        const displayName = author.globalName || author.username;
+        const username = author.username;
+        const avatarURL = author.displayAvatarURL({ size:512, dynamic:false, extension:"png" });
+        const avatarRes = await fetch(avatarURL);
+        if(!avatarRes.ok) throw new Error(`Couldn't fetch avatar (HTTP ${avatarRes.status})`);
+        const avatarBuffer = Buffer.from(await avatarRes.arrayBuffer());
+        const cardBuffer = await buildFakeQuoteCard({ avatarBuffer, quoteText: text, displayName, username });
+        return safeReply(interaction,{ files:[{ attachment: cardBuffer, name:`quote_${targetMsg.id}.png` }] });
+      }catch(e){
+        console.error("Make it a quote error:", e.message);
+        return safeReply(interaction,{content:`Failed to generate quote card: ${e.message}`,ephemeral:true});
+      }
+    }
+
+    // ── Fetch Emoji (everyone) ─────────────────────────────────────────────────
+    if(cmd === "Steal Emojis"){
+      if(!OWNER_IDS.includes(uid)) return safeReply(interaction,{content:"Owner only.",ephemeral:true});
+      const destG = emojiStealDestGuildId ? client.guilds.cache.get(emojiStealDestGuildId) : null;
+      if(!destG) return safeReply(interaction,{content:"❌ No destination server set. Run `/emojisteal server:` first.",ephemeral:true});
+      await interaction.deferReply({ephemeral:true});
+      const parts = [await stealEmojisToGuild(destG, targetMsg.content)];
+      const stickerPart = await stealStickersToGuild(destG, targetMsg.stickers);
+      if(stickerPart) parts.push(stickerPart);
+      const out = parts.join("\n\n");
+      return safeReply(interaction,{content: out.length <= 1900 ? out : out.slice(0,1900)+"…", ephemeral:true});
+    }
+
+    if(cmd === "Fetch Emoji"){
+      const text = targetMsg.content;
+      const emojiRegex = /<a?:[a-zA-Z0-9_]+:(\d+)>/g;
+      const matches = [...text.matchAll(emojiRegex)];
+      if(!matches.length)
+        return safeReply(interaction,{content:"❌ No custom emojis found in that message. (Built in emojis can\'t be fetched as links.)",ephemeral:true});
+      const seen = new Set();
+      const links = [];
+      for(const m of matches){
+        const id = m[1];
+        if(seen.has(id)) continue;
+        seen.add(id);
+        const isAnimated = m[0].startsWith("<a:");
+        const ext = isAnimated ? "gif" : "webp";
+        links.push(`https://cdn.discordapp.com/emojis/${id}.${ext}?size=40&quality=lossless`);
+      }
+      const header = `🔗 **${links.length} emoji link${links.length!==1?"s":""}** from that message:`;
+      const body = links.join("\n");
+      const full = `${header}\n${body}`;
+      if(full.length <= 2000){
+        return safeReply(interaction,{content:full,ephemeral:true});
+      }
+      await safeReply(interaction,{content:header,ephemeral:true});
+      let chunk = "";
+      for(const link of links){
+        if((chunk + link + "\n").length > 1900){
+          await interaction.followUp({content:chunk.trim(),ephemeral:true}).catch(()=>{});
+          chunk = "";
+        }
+        chunk += link + "\n";
+      }
+      if(chunk.trim()) await interaction.followUp({content:chunk.trim(),ephemeral:true}).catch(()=>{});
+      return;
+    }
+
+    return;
+  }   // ── end if(isButton || isSelectMenu) ─────────────────────────────────────
+
+  if(!interaction.isCommand())return;
+  const cmd=interaction.commandName;
+  const inGuild=!!interaction.guildId;
+
+  const ownerOnly=["servers","requester","deleter","emojisteal","announcementsync","dmconfig","leaveserver","restart","refreshcmds","botstats","setstatus","adminconfig","echo","shadowdelete","clankerify","impersonation","thecount","send","fakemessage","fakequote","forcemarry","forcedivorce","paranoia","tempowner","blacklist","theremnant","jarvisenhance","quotesetup","requestedquotes","deletedquotes","globaltoggle","quotemoderator","sotd","sotd-playlist","bansync","deactivatetoggle"];
+  if(ownerOnly.includes(cmd)){
+    if(SERVER_OWNER_CMDS.has(cmd) && !inGuild) return safeReply(interaction,{content:"❌ Server only.",ephemeral:true});
+    if(!canUseOwnerCmd(interaction, cmd)) return safeReply(interaction,{content:"Owner only.",ephemeral:true});
+  }
+
+  const manageServerCmds=["channelpicker","counting","xpconfig","setwelcome","setleave","setwelcomemsg","setleavemsg","disableownermsg","serverconfig","autorole","setboostmsg","invitecomp","purge","reactionrole","dropdownroles","ticketsetup","ytsetup","subgoal","subcount","milestones","dailyquote","serverstats","extrachannels","limitedrole"];
+  if(manageServerCmds.includes(cmd)){
+    if(!inGuild)return safeReply(interaction,{content:"Server only.",ephemeral:true});
+    if(!OWNER_IDS.includes(interaction.user.id)&&!interaction.member?.permissions?.has?.("MANAGE_GUILD"))
+      return safeReply(interaction,{content:"❌ You need **Manage Server** permission.",ephemeral:true});
+  }
+
+  // ── Granular blacklist: per command block (full blacklist already handled above) ──
+  if(isFeatureBlacklisted(interaction.user.id, cmd)){
+    if(!isSilentBlacklisted(interaction.user.id)) return safeReply(interaction,{content:`❌ You've been blocked from using \`/${cmd}\`.`,ephemeral:true});
+    return;
+  }
+
+  // ── Auto defer safety net ────────────────────────────────────────────────────
+  let _autoDeferTimer = setTimeout(async () => {
+    if(!interaction.replied && !interaction.deferred){
+      console.warn(`[auto-defer] /${cmd} exceeded 2.5s: autodeferring`);
+      await interaction.deferReply().catch(()=>{});
+    }
+  }, 2500);
+  const _clearAutoDefer = () => clearTimeout(_autoDeferTimer);
+
+  try{
+    const uid     = interaction.user.id;
+    const au=()=>`<@${interaction.user.id}>`;
+    const bu=()=>`<@${interaction.options.getUser("user").id}>`;
+
+    if(cmd==="ping"){_clearAutoDefer();return safeReply(interaction,`🏓 Pong! Latency: **${client.ws.ping}ms**`);}
+    if(cmd==="avatar"){await interaction.deferReply();_clearAutoDefer();const u=await client.users.fetch(interaction.options.getUser("user").id);return safeReply(interaction,u.displayAvatarURL({size:1024,dynamic:true}));}
+
+    // ── /marry: persistent proposal stored in botdata.json ──────────────────
+    if(cmd==="marry"){
+      const target=interaction.options.getUser("user");
+      if(target.id===interaction.user.id)return safeReply(interaction,{content:"You can't marry yourself.",ephemeral:true});
+      if(target.bot)return safeReply(interaction,{content:"You can't marry a bot.",ephemeral:true});
+
+      const s  = getScore(interaction.user.id, interaction.user.username);
+      const t  = getScore(target.id, target.username);
+
+      // ── Case 1: target already proposed to ME: this is an acceptance ──────
+      if(s.pendingProposal === target.id){
+        if(s.marriedTo) return safeReply(interaction,{content:`You're already married to <@${s.marriedTo}>! Use /divorce first.`,ephemeral:true});
+        if(t.marriedTo) return safeReply(interaction,{content:`<@${target.id}> is already married to someone else!`,ephemeral:true});
+        s.marriedTo = target.id;
+        t.marriedTo = interaction.user.id;
+        s.pendingProposal = null;
+        saveData();
+        return safeReply(interaction,`💍 **${interaction.user.username}** accepted! 🎉\n<@${interaction.user.id}> and <@${target.id}> are now married! Congratulations! 💕`);
+      }
+
+      // ── Case 2: I'm proposing ─────────────────────────────────────────────
+      if(s.marriedTo) return safeReply(interaction,{content:`You're already married to <@${s.marriedTo}>! Use /divorce first.`,ephemeral:true});
+      if(t.marriedTo) return safeReply(interaction,{content:`<@${target.id}> is already married!`,ephemeral:true});
+      if(t.pendingProposal && t.pendingProposal !== interaction.user.id){
+        return safeReply(interaction,{content:`<@${target.id}> already has a pending proposal from someone else.`,ephemeral:true});
+      }
+      if(t.pendingProposal === interaction.user.id){
+        return safeReply(interaction,{content:`You already proposed to <@${target.id}>! They need to run \`/marry @${interaction.user.username}\` to accept.`,ephemeral:true});
+      }
+      t.pendingProposal = interaction.user.id;
+      saveData();
+      const propRow = new MessageActionRow().addComponents(
+        new MessageButton()
+          .setCustomId(`marry_accept_${interaction.user.id}_${target.id}`)
+          .setLabel("💍 Accept")
+          .setStyle("SUCCESS"),
+        new MessageButton()
+          .setCustomId(`marry_decline_${interaction.user.id}_${target.id}`)
+          .setLabel("💔 Decline")
+          .setStyle("DANGER"),
+      );
+      return safeReply(interaction, {
+        content: `💍 **Marriage Proposal!**\n\n<@${interaction.user.id}> has proposed to <@${target.id}>! 🌹\n\n<@${target.id}>, do you accept?`,
+        components: [propRow],
+      });
+    }
+    
+    if(cmd==="forcemarry"){
+  const u1=interaction.options.getUser("user1");
+  const u2=interaction.options.getUser("user2");
+  if(u1.id===u2.id)return safeReply(interaction,{content:"Can't marry someone to themselves.",ephemeral:true});
+  if(!isEffectiveOwner(interaction.user.id,"forcemarry")){
+    const m1=await interaction.guild.members.fetch(u1.id).catch(()=>null);
+    const m2=await interaction.guild.members.fetch(u2.id).catch(()=>null);
+    if(!m1||!m2) return safeReply(interaction,{content:"❌ Both users must be members of this server.",ephemeral:true});
+  }
+  const s1=getScore(u1.id,u1.username);
+  const s2=getScore(u2.id,u2.username);
+  if(s1.marriedTo)return safeReply(interaction,{content:`❌ <@${u1.id}> is already married to <@${s1.marriedTo}>.`,ephemeral:true});
+  if(s2.marriedTo)return safeReply(interaction,{content:`❌ <@${u2.id}> is already married to <@${s2.marriedTo}>.`,ephemeral:true});
+  s1.marriedTo=u2.id; s1.pendingProposal=null; s1.forceMarried=true;
+  s2.marriedTo=u1.id; s2.pendingProposal=null; s2.forceMarried=true;
+  saveData();
+  return safeReply(interaction,{content:`💍 **Force married!** <@${u1.id}> and <@${u2.id}> are now married. Congrats (whether they like it or not). 💕`,ephemeral:true});
+}
+    if(cmd==="forcedivorce"){
+  const u=interaction.options.getUser("user");
+  if(!isEffectiveOwner(interaction.user.id,"forcedivorce")){
+    const m=await interaction.guild.members.fetch(u.id).catch(()=>null);
+    if(!m) return safeReply(interaction,{content:"❌ That user must be a member of this server.",ephemeral:true});
+  }
+  const s=getScore(u.id,u.username);
+  if(!s.marriedTo)return safeReply(interaction,{content:`❌ <@${u.id}> is not married.`,ephemeral:true});
+  const partnerId=s.marriedTo;
+  const partner=scores.get(partnerId);
+  if(partner){
+    partner.marriedTo=null;
+    partner.pendingProposal=null;
+    partner.forceMarried=false;
+  }
+  s.marriedTo=null;
+  s.pendingProposal=null;
+  s.forceMarried=false;
+  saveData();
+  return safeReply(interaction,{content:`💔 **Force divorced!** <@${u.id}> and <@${partnerId}> are no longer married.`,ephemeral:true});
+}
+    if(cmd==="shadowdelete"){
+  const target = interaction.options.getUser("user");
+  const pct = interaction.options.getInteger("percentage");
+  const sdKey = scopedKey(interaction.guildId, target.id);
+  if(pct < 0 || pct > 100) return safeReply(interaction,{content:"❌ Percentage must be 0–100.",ephemeral:true});
+  if(pct === 0){
+    shadowDelete.delete(sdKey);
+    saveData();
+    return safeReply(interaction,{content:`✅ Shadow delete **disabled** for <@${target.id}> in this server.`,ephemeral:true});
+  }
+  shadowDelete.set(sdKey, pct);
+  saveData();
+  return safeReply(interaction,{content:`👻 Shadow delete set to **${pct}%** for <@${target.id}> in this server.`,ephemeral:true});
+}
+
+// ── /clankerbuild ─────────────────────────────────────────────────────────────
+if(cmd==="clankerbuild"){
+  const callerId = interaction.user.id;
+  const action   = interaction.options.getString("action");
+  const isOwner  = OWNER_IDS.includes(callerId);
+
+  const visibleModes = [...customClankerModes.entries()].filter(([,m]) => isOwner || m.creatorId === callerId);
+
+  // ── list ──────────────────────────────────────────────────────────────────
+  if(action==="list"){
+    if(!visibleModes.length)
+      return safeReply(interaction,{content:"No custom clanker modes yet. Use `/clankerbuild action:create` to make one.",ephemeral:true});
+    const lines = visibleModes.map(([id, m]) =>
+      `**${m.emoji||"⭐"} ${id}**: display: \`${m.displayNameFormat||"{name}"}\`, words: ${(m.words||[]).length}, signoffs: ${(m.signoffs||[]).length}, by: **${m.creatorName||"?"}**`
+    );
+    return safeReply(interaction,{content:`**Custom Clanker Modes (${visibleModes.length})**\n${lines.join("\n")}`,ephemeral:true});
+  }
+
+  // ── create/edit: show user's modes + "New Mode" button ───────────────────
+  if(action==="create"){
+    const components = [];
+    if(visibleModes.length){
+      const opts = visibleModes.map(([id, m]) => ({
+        label: `${m.emoji||"⭐"} ${id}`,
+        value: id,
+        description: `by ${m.creatorName||"?"} - ${(m.words||[]).length} word swaps`,
+      }));
+      components.push(new MessageActionRow().addComponents(
+        new MessageSelectMenu()
+          .setCustomId(`clankerbuild_pick_edit_${callerId}`)
+          .setPlaceholder("✏️ Edit an existing mode…")
+          .addOptions(opts.slice(0,25))
+      ));
+    }
+    components.push(new MessageActionRow().addComponents(
+      new MessageButton().setCustomId("clankerbuild_new").setLabel("➕ New Mode").setStyle("SUCCESS"),
+    ));
+    return safeReply(interaction,{
+      content: visibleModes.length
+        ? `**🛠️ Your Custom Clanker Modes (${visibleModes.length})**\nSelect one to edit, or create a new one:`
+        : "**🛠️ No custom modes yet!** Click below to build one:",
+      components,
+      ephemeral: true,
+    });
+  }
+
+  // ── delete: show user's modes in a select ────────────────────────────────
+  if(action==="delete"){
+    if(!visibleModes.length)
+      return safeReply(interaction,{content:"You have no custom modes to delete.",ephemeral:true});
+    const opts = visibleModes.map(([id, m]) => ({
+      label: `${m.emoji||"⭐"} ${id}`,
+      value: id,
+      description: `by ${m.creatorName||"?"} - ${(m.words||[]).length} word swaps`,
+    }));
+    return safeReply(interaction,{
+      content:"🗑️ **Delete a Custom Mode**: select one to remove:",
+      components:[new MessageActionRow().addComponents(
+        new MessageSelectMenu()
+          .setCustomId(`clankerbuild_pick_delete_${callerId}`)
+          .setPlaceholder("Select mode to delete…")
+          .addOptions(opts.slice(0,25))
+      )],
+      ephemeral:true,
+    });
+  }
+}
+
+// ── /tempowner ────────────────────────────────────────────────────────────────
+if(cmd==="tempowner"){
+  const targetUser = interaction.options.getUser("user");
+
+  if(!targetUser){
+    return safeReply(interaction,{
+      content:[`🔑 **Temporary Owner Access: Current Grants**`,``,formatGrantsList()].join("\n"),
+      ephemeral:true,
+    });
+  }
+  if(OWNER_IDS.includes(targetUser.id))
+    return safeReply(interaction,{content:"❌ That user is already a permanent owner.",ephemeral:true});
+
+  const token = `${interaction.user.id.slice(-6)}${Date.now().toString(36)}`;
+  const existing = tempOwnerGrants.get(targetUser.id);
+  tempOwnerBuilders.set(token, {
+    ownerId: interaction.user.id,
+    targetUserId: targetUser.id,
+    commands: new Set(existing && !existing.commands.has("all") ? existing.commands : []),
+    features: new Set(existing?.features ?? []),
+    duration: existing ? (existing.expiresAt === null ? "permanent" : null) : null,
+  });
+  setTimeout(()=>tempOwnerBuilders.delete(token), 10*60*1000);
+
+  return safeReply(interaction,{...buildTempOwnerPanel(token), ephemeral:true});
+}
+
+if(cmd==="blacklist"){
+  const targetUser = interaction.options.getUser("user");
+
+  if(!targetUser){
+    return safeReply(interaction,{
+      content:[`🚫 **Blacklist: Current Entries**`,``,formatBlacklistList()].join("\n"),
+      ephemeral:true,
+    });
+  }
+  if(OWNER_IDS.includes(targetUser.id))
+    return safeReply(interaction,{content:"❌ Can't blacklist an owner.",ephemeral:true});
+
+  const token = `${interaction.user.id.slice(-6)}${Date.now().toString(36)}`;
+  const existing = featureBlacklist.get(targetUser.id);
+  blacklistBuilders.set(token, {
+    ownerId: interaction.user.id,
+    targetUserId: targetUser.id,
+    features: new Set(existing?.features ?? []),
+    silent: existing?.silent ?? false,
+  });
+  setTimeout(()=>blacklistBuilders.delete(token), 10*60*1000);
+
+  return safeReply(interaction,{...buildBlacklistPanel(token), ephemeral:true});
+}
+
+if(cmd==="jarvisenhance"){
+  const uid = interaction.user.id;
+  const action = interaction.options.getString("action");
+  const name = (interaction.options.getString("name")||"").trim().toLowerCase().replace(/\s+/g,"_");
+
+  if(action==="list"){
+    if(!jarvisEnhanceProfiles.size)
+      return safeReply(interaction,{content:"No Jarvis Enhance profiles yet. Use `/jarvisenhance action:create name:<id>` to make one.",ephemeral:true});
+
+    const blocks = [...jarvisEnhanceProfiles.entries()].map(([id,p]) =>
+      `**${id}** ${p.ownerLocked===false ? "🔓" : "🔒"}: trigger word(s): ${p.triggers.map(t=>`\`${t}\``).join(" ")}\n${formatJarvisActionsList(p.actions)}`
+    );
+
+    const pages = [];
+    let current = [];
+    let currentLen = 0;
+    for(const block of blocks){
+      if(current.length && currentLen + block.length + 2 > 3800){
+        pages.push(current);
+        current = [];
+        currentLen = 0;
+      }
+      current.push(block);
+      currentLen += block.length + 2;
+    }
+    if(current.length) pages.push(current);
+
+    const embeds = pages.map((page, i) => ({
+      title: `🧠 Jarvis Enhance Profiles (${jarvisEnhanceProfiles.size})${pages.length>1?` — Page ${i+1}/${pages.length}`:""}`,
+      description: page.join("\n\n"),
+      color: 0x5865F2,
+    }));
+
+    await safeReply(interaction,{embeds:[embeds[0]],ephemeral:true});
+    for(let i=1;i<embeds.length;i++){
+      await interaction.followUp({embeds:[embeds[i]],ephemeral:true}).catch(e=>console.error("[jarvisenhance list followUp]",e.message));
+    }
+    return;
+  }
+
+  if(action==="delete"){
+    if(!name) return safeReply(interaction,{content:"❌ Provide a `name`.",ephemeral:true});
+    if(!jarvisEnhanceProfiles.has(name)) return safeReply(interaction,{content:`❌ No profile named \`${name}\`.`,ephemeral:true});
+    return safeReply(interaction,{
+      content:`🗑️ Delete Jarvis Enhance profile \`${name}\`?`,
+      components:[new MessageActionRow().addComponents(
+        new MessageButton().setCustomId(`je_delconfirm_${name}`).setLabel("Delete").setStyle("DANGER"),
+        new MessageButton().setCustomId("je_delcancel").setLabel("Cancel").setStyle("SECONDARY"),
+      )],
+      ephemeral:true,
+    });
+  }
+
+  if(!name) return safeReply(interaction,{content:"❌ Provide a `name` for this profile.",ephemeral:true});
+  const existing = jarvisEnhanceProfiles.get(name);
+  if(action==="create" && existing)
+    return safeReply(interaction,{content:`❌ A profile named \`${name}\` already exists: use \`action:edit\` to modify it.`,ephemeral:true});
+  if(action==="edit" && !existing)
+    return safeReply(interaction,{content:`❌ No profile named \`${name}\`: use \`action:create\` to make it.`,ephemeral:true});
+
+  const token = `${uid.slice(-6)}${Date.now().toString(36)}`;
+  jarvisEnhanceBuilders.set(token, {
+    ownerId: uid,
+    name,
+    triggers: existing ? [...existing.triggers] : [],
+    actions: existing ? existing.actions.map(a => ({ type:a.type, params:{...a.params} })) : [],
+    ownerLocked: existing ? existing.ownerLocked !== false : true,
+    category: null,
+    selectedStep: null,
+    pendingActionType: null,
+    pendingMode: null,
+    pendingParams: null,
+  });
+  setTimeout(()=>jarvisEnhanceBuilders.delete(token), 15*60*1000);
+
+  return safeReply(interaction,{...buildJarvisEnhancePanel(token), ephemeral:true});
+}
+
+if(cmd==="jarvislist"){
+  await interaction.deferReply({ephemeral:true}).catch(()=>{});
+  const images = await getJarvisImages();
+  if(!images.length) return safeReply(interaction,"No images found in the Jarvis folder.");
+  return safeReply(interaction, buildJarvisListPage(images, 0));
+}
+
+if(cmd==="userprofile"){
+  if(!(await isPatreonMember(interaction.user.id)))
+    return safeReply(interaction,{content:`Oops, this is a patreon exclusive feature! Try to support RoyalBot here if you wish (pls) ${PATREON_LINK}`,ephemeral:true});
+
+  const puid = interaction.user.id;
+  const s = getScore(puid, interaction.user.username);
+  const marriedText = s.marriedTo ? `💍 <@${s.marriedTo}>` : "💔 Not married";
+
+  let highestRoleText = "_No roles_";
+  if(interaction.inGuild() && interaction.member){
+    const hr = interaction.member.roles.highest;
+    if(hr && hr.id !== interaction.guild.id) highestRoleText = `${hr}`;
+  }
+
+  const allQuoteFiles = (await fetchAllQuoteFiles()).filter(f => /\.(png|jpe?g|gif|webp)$/i.test(f.name));
+  const totalQuoteCount = allQuoteFiles.length || 1;
+  const vStats = userVoteStats.get(puid) || { up:0, down:0 };
+  const likedPct = (vStats.up/totalQuoteCount)*100;
+  const dislikedPct = (vStats.down/totalQuoteCount)*100;
+
+  const fStats = userFlagStats.get(puid) || { flagged:0, deleted:0 };
+  const flagAccuracyPct = fStats.flagged ? (fStats.deleted/fStats.flagged*100) : 0;
+
+  const favCount = favoritedQuotes.get(puid)?.size || 0;
+
+  const embed = {
+    color: 0xFFD700,
+    author: { name: `👑 ${interaction.user.username}: Patreon Supporter`, icon_url: interaction.user.displayAvatarURL({dynamic:true}) },
+    title: "✨ Supporter Profile ✨",
+    thumbnail: { url: interaction.user.displayAvatarURL({ size:512, dynamic:true }) },
+    fields: [
+      { name: "💍 Relationship Status", value: marriedText, inline:true },
+      { name: "🏅 Highest Role", value: highestRoleText, inline:true },
+      { name: "⭐ Favorited Quotes", value: `${favCount}`, inline:true },
+      { name: "👍 Liked Quotes", value: renderStatBar(likedPct), inline:false },
+      { name: "👎 Disliked Quotes", value: renderStatBar(dislikedPct), inline:false },
+      { name: "🗑️ Flag Accuracy", value: `${renderStatBar(flagAccuracyPct)}\n${fStats.deleted}/${fStats.flagged}`, inline:false },
+    ],
+    footer: { text: "Thank you for supporting RoyalBot! 🧡🍔" },
+    timestamp: new Date().toISOString(),
+  };
+
+  return safeReply(interaction, { embeds:[embed] });
+}
+
+if(cmd==="theremnant"){
+  const text    = interaction.options.getString("message");
+  const channel = interaction.channel;
+  if(!channel) return safeReply(interaction,{content:"❌ Couldn't resolve this channel.",ephemeral:true});
+
+  await safeReply(interaction,{content:"📡 Transmission initiated…",ephemeral:true});
+
+  (async () => {
+    try{
+      const beat = (ms) => new Promise(res=>setTimeout(res,ms));
+
+      await channel.sendTyping().catch(()=>{});
+      await beat(1800);
+      await channel.send("*Capturing stray dimensional data…*").catch(()=>{});
+
+      await channel.sendTyping().catch(()=>{});
+      await beat(1800);
+      await channel.send("*Data successfully captured!*").catch(()=>{});
+
+      await channel.sendTyping().catch(()=>{});
+      await beat(1600);
+      await channel.send("*Translating…*").catch(()=>{});
+
+      await channel.sendTyping().catch(()=>{});
+      await beat(2200);
+
+      const row = new MessageActionRow().addComponents(
+        new MessageButton().setCustomId("theremnant_respond").setLabel("📡 Respond").setStyle("PRIMARY")
+      );
+
+      await channel.send({
+        embeds:[{
+          title:"👁️ The Remnant",
+          description: text,
+          color: 0x8E44AD,
+          footer:{text:"A signal from somewhere else…"},
+          timestamp: new Date().toISOString(),
+        }],
+        components:[row],
+      }).catch(()=>{});
+    } catch(e){
+      console.error("[theremnant] sequence error:", e.message);
+    }
+  })();
+
+  return;
+}
+
+if(cmd==="clankerify"){
+  const target   = interaction.options.getUser("user");
+  const duration = interaction.options.getInteger("duration") ?? null;
+  const guildId  = interaction.guildId;
+  const cKey     = scopedKey(guildId, target.id);
+
+  if(duration === 0){
+    clankerify.delete(cKey);
+    saveData();
+    return safeReply(interaction,{content:`✅ Clankerify **disabled** for <@${target.id}> in this server.`,ephemeral:true});
+  }
+
+  const durKey = duration ? String(duration) : "perm";
+  const builtInOptions = [
+    {label:"No mode (plain)",  value:"none",        emoji:"🤖"},
+    {label:"Evil",             value:"evil",        emoji:"😈"},
+    {label:"Freaky",           value:"freaky",      emoji:"😏"},
+    {label:"American",         value:"american",    emoji:"🦅"},
+    {label:"British",          value:"british",     emoji:"🫖"},
+    {label:"Stupid",           value:"stupid",      emoji:"🪖"},
+    {label:"Boomer",           value:"boomer",      emoji:"📰"},
+    {label:"Conspiracy",       value:"conspiracy",  emoji:"🔺"},
+    {label:"NPC",              value:"npc",         emoji:"🗺️"},
+    {label:"Sigma",            value:"sigma",       emoji:"😤"},
+    {label:"Medieval",         value:"medieval",    emoji:"⚔️"},
+    {label:"Ghost",            value:"ghost",       emoji:"👻"},
+    {label:"Pirate",           value:"pirate",      emoji:"🏴‍☠️"},
+    {label:"RespawnRaccoon Propaganda", value:"rr_propaganda", emoji:"🦝"},
+    {label:"French",                    value:"french",       emoji:"🇫🇷"},
+    {label:"UWU / LOLCAT",              value:"uwu",          emoji:"🐱"},
+    {label:"Random (picks a random mode each message)", value:"random", emoji:"🎲"},
+  ];
+  const modeRow = new MessageActionRow().addComponents(
+    new MessageSelectMenu()
+      .setCustomId(`clankerify_mode_${guildId}_${target.id}_${durKey}`)
+      .setPlaceholder("Pick a built in personality mode…")
+      .addOptions(builtInOptions)
+  );
+  const clankerifyComponents = [modeRow];
+  const communityOpts = [...customClankerModes.entries()].map(([id, m]) => ({
+    label: `${m.emoji||"⭐"} ${id}`,
+    value: id,
+    description: `by ${m.creatorName||"?"}`,
+  }));
+  if(communityOpts.length){
+    clankerifyComponents.push(new MessageActionRow().addComponents(
+      new MessageSelectMenu()
+        .setCustomId(`clankerify_community_${guildId}_${target.id}_${durKey}`)
+        .setPlaceholder("🤖 Community modes…")
+        .addOptions(communityOpts.slice(0,25))
+    ));
+  }
+  const durationStr = duration ? `**${duration} minute(s)**` : "**permanently**";
+  return safeReply(interaction,{
+    content:`🤖 Clankerifying <@${target.id}> ${durationStr} in this server. Pick a mode:`,
+    components: clankerifyComponents,
+    ephemeral:true
+  });
+}
+
+if(cmd==="impersonation"){
+  const target   = interaction.options.getUser("user");
+  const asUser   = interaction.options.getUser("as_user");
+  const pfp      = interaction.options.getAttachment("pfp");
+  const name     = interaction.options.getString("name");
+  const modeOpt  = interaction.options.getString("mode");
+  const duration = interaction.options.getInteger("duration") ?? null;
+  const iKey     = scopedKey(interaction.guildId, target.id);
+
+  if(target.bot) return safeReply(interaction,{content:"❌ Can't impersonate a bot's messages.",ephemeral:true});
+  if(asUser && (pfp || name))
+    return safeReply(interaction,{content:"❌ `as_user` can't be combined with `pfp`/`name`: pick one approach.",ephemeral:true});
+
+  if(duration === 0){
+    clankerify.delete(iKey);
+    saveData();
+    return safeReply(interaction,{content:`✅ Impersonation **disabled** for <@${target.id}> in this server.`,ephemeral:true});
+  }
+
+  const mode = (modeOpt && modeOpt !== "none") ? modeOpt : null;
+  const expiresAt = duration ? Date.now() + duration*60000 : null;
+
+  clankerify.set(iKey, {
+    expiresAt,
+    mode,
+    ownerClanked: true,
+    impersonateAsUserId: asUser ? asUser.id : null,
+    impersonateName: name || null,
+    impersonateAvatarURL: pfp ? pfp.url : null,
+  });
+  saveData();
+
+  const personaDesc = asUser
+    ? `as <@${asUser.id}>`
+    : (name || pfp) ? `as **${name || "(their own name)"}**${pfp ? " with a custom pfp" : ""}` : "as themselves (no persona set)";
+  const durationStr2 = duration ? `**${duration} minute(s)**` : "**permanently**";
+  return safeReply(interaction,{
+    content:`🎭 Impersonating <@${target.id}>'s messages ${personaDesc} for ${durationStr2}${mode?` (mode: **${mode}**)`:""} in this server.`,
+    ephemeral:true,
+  });
+}
+
+if(cmd==="thecount"){
+  const target = interaction.options.getUser("user");
+  if(target.bot) return safeReply(interaction,{content:"❌ Can't open a queue channel for a bot.",ephemeral:true});
+  if(!dmRelayGuildId) return safeReply(interaction,{content:"❌ No DM hub server configured yet: run `/dmconfig` first.",ephemeral:true});
+
+  const channel = await ensureTheCountChannel(target);
+  if(!channel) return safeReply(interaction,{content:"❌ Couldn't create/open the queue channel: check the hub server still exists and the bot has permission there.",ephemeral:true});
+
+  return safeReply(interaction,{content:`📥 Queue channel ready: <#${channel.id}>. Anything sent there waits until \`/send\` is run.`,ephemeral:true});
+}
+
+if(cmd==="send"){
+  await interaction.deferReply({ephemeral:true});
+  if(!dmRelayGuildId) return safeReply(interaction,{content:"❌ No DM hub server configured.",ephemeral:true});
+  const hubGuild = client.guilds.cache.get(dmRelayGuildId);
+  if(!hubGuild) return safeReply(interaction,{content:"❌ Hub server not found.",ephemeral:true});
+  if(theCountChannels.size===0) return safeReply(interaction,{content:"Nothing queued: no `/thecount` channels exist yet.",ephemeral:true});
+
+  let totalSent=0, totalFailed=0, channelsProcessed=0;
+  const summary=[];
+
+  for(const [userId, entry] of theCountChannels.entries()){
+    const channel = hubGuild.channels.cache.get(entry.channelId);
+    if(!channel) continue;
+
+    let fetched;
+    try{
+      fetched = entry.lastSentMessageId
+        ? await channel.messages.fetch({ after: entry.lastSentMessageId, limit: 100 })
+        : await channel.messages.fetch({ limit: 100 });
+    }catch(e){ console.error("[send] fetch error:", e.message); continue; }
+
+    const pending = [...fetched.values()]
+      .filter(m => !m.author.bot)
+      .sort((a,b) => a.createdTimestamp - b.createdTimestamp);
+
+    if(pending.length===0) continue;
+
+    const targetUser = await client.users.fetch(userId).catch(()=>null);
+    let sentHere=0, failedHere=0, newestId=entry.lastSentMessageId;
+
+    for(const m of pending){
+      newestId = m.id;
+      const files = m.attachments.size > 0 ? [...m.attachments.values()].map(a=>a.url) : undefined;
+      if(!m.content && !files) continue;
+      try{
+        if(!targetUser) throw new Error("user not found");
+        const dm = await targetUser.createDM();
+        await dm.send({ content: m.content || undefined, files });
+        await m.react("✅").catch(()=>{});
+        sentHere++;
+      }catch(e){
+        await m.react("❌").catch(()=>{});
+        failedHere++;
+      }
+    }
+
+    entry.lastSentMessageId = newestId;
+    totalSent += sentHere;
+    totalFailed += failedHere;
+    if(sentHere || failedHere){ channelsProcessed++; summary.push(`<#${channel.id}> → <@${userId}>: ${sentHere} sent${failedHere?`, ${failedHere} failed`:""}`); }
+  }
+
+  saveData();
+
+  if(channelsProcessed===0) return safeReply(interaction,{content:"Nothing new to send: every queue channel is already flushed.",ephemeral:true});
+
+  return safeReply(interaction,{
+    content:[`📤 **Sent.** ${totalSent} message(s) delivered${totalFailed?`, ${totalFailed} failed (DMs likely closed)`:""} across ${channelsProcessed} channel(s).`,``,...summary].join("\n").slice(0,1900),
+    ephemeral:true,
+  });
+}
+
+if(cmd==="divorce"){
+  const s=getScore(interaction.user.id,interaction.user.username);
+  if(!s.marriedTo)return safeReply(interaction,{content:"You're not married.",ephemeral:true});
+  if(s.forceMarried)return safeReply(interaction,{content:"💀 Your marriage was **force ordained**. There is no escape.",ephemeral:true});
+  const t=scores.get(s.marriedTo);
+  if(t){ t.marriedTo=null; t.pendingProposal=null; }
+  s.marriedTo=null;
+  s.pendingProposal=null;
+  saveData();
+  return safeReply(interaction,`💔 **${interaction.user.username}** filed for divorce. It's over.`);
+}
+    if(cmd==="partner"){
+      const u=interaction.options.getUser("user")||interaction.user;
+      const s=getScore(u.id,u.username);
+      if(!s.marriedTo)return safeReply(interaction,`💔 **${u.username}** is single.`);
+      return safeReply(interaction,`💑 **${u.username}** is married to <@${s.marriedTo}>.`);
+    }
+
+    if(cmd==="quote"){
+      const now_q = Date.now();
+      const last_q = quoteCooldown.get(interaction.user.id) || 0;
+      if (now_q - last_q < 1500) {
+        return safeReply(interaction, { content: "⏳ Slow down! You can only use `/quote` once every 1.5 seconds.", ephemeral: true });
+      }
+      quoteCooldown.set(interaction.user.id, now_q);
+      try { await interaction.deferReply(); } catch { }
+      try {
+        const chosen = await postRandomQuoteCard(nextQuoteImage, "quote", async (payload) => {
+          const sent = await safeReply(interaction, payload);
+          return sent?.id ? sent : await interaction.fetchReply().catch(()=>null);
+        }, interaction.guildId);
+        if(!chosen) return safeReply(interaction, "Couldn't load quotes right now.");
+        return;
+      } catch(e) {
+        return safeReply(interaction, "Something went wrong fetching a quote.");
+      }
+    }
+
+    // ── /goodquote: higher rated quote ──────────────────────────────────────
+    if(cmd==="goodquote"){
+      const now_q = Date.now();
+      const last_q = quoteCooldown.get(interaction.user.id) || 0;
+      if (now_q - last_q < 1500) {
+        return safeReply(interaction, { content: "⏳ Slow down! You can only use `/goodquote` once every 1.5 seconds.", ephemeral: true });
+      }
+      quoteCooldown.set(interaction.user.id, now_q);
+      try { await interaction.deferReply(); } catch {}
+      try {
+        const chosen = await postRandomQuoteCard(nextGoodQuoteImage, "good", async (payload) => {
+          const sent = await safeReply(interaction, payload);
+          return sent?.id ? sent : await interaction.fetchReply().catch(()=>null);
+        }, interaction.guildId);
+        if(!chosen) return safeReply(interaction, "Couldn't load quotes right now.");
+        return;
+      } catch(e) {
+        return safeReply(interaction, "Something went wrong fetching a good quote.");
+      }
+    }
+
+    // ── /badquote: lower rated quote ────────────────────────────────────────
+    if(cmd==="badquote"){
+      const now_q = Date.now();
+      const last_q = quoteCooldown.get(interaction.user.id) || 0;
+      if (now_q - last_q < 1500) {
+        return safeReply(interaction, { content: "⏳ Slow down! You can only use `/badquote` once every 1.5 seconds.", ephemeral: true });
+      }
+      quoteCooldown.set(interaction.user.id, now_q);
+      try { await interaction.deferReply(); } catch {}
+      try {
+        const chosen = await postRandomQuoteCard(nextBadQuoteImage, "bad", async (payload) => {
+          const sent = await safeReply(interaction, payload);
+          return sent?.id ? sent : await interaction.fetchReply().catch(()=>null);
+        }, interaction.guildId);
+        if(!chosen) return safeReply(interaction, "Couldn't load quotes right now.");
+        return;
+      } catch(e) {
+        return safeReply(interaction, "Something went wrong fetching a bad quote.");
+      }
+    }
+    if(cmd==="echo"){
+  const text      = interaction.options.getString("message")||"";
+  const useEmbed  = interaction.options.getBoolean("embed")||false;
+  const attachment= interaction.options.getAttachment("image")||null;
+  const embedTitle= interaction.options.getString("title")||null;
+  const colorHex  = interaction.options.getString("color")||null;
+  const replyToId = interaction.options.getString("replyto")||null;
+  if(!text&&!attachment&&!embedTitle)return safeReply(interaction,{content:"❌ Provide at least a message, image, or title.",ephemeral:true});
+  await safeReply(interaction,{content:"✅",ephemeral:true});
+  const targetCh = interaction.channel;
+  let replyTarget = null;
+  if(replyToId){
+    replyTarget = await targetCh.messages.fetch(replyToId).catch(()=>null);
+    if(!replyTarget) await interaction.followUp({content:`⚠️ Message ID \`${replyToId}\` not found: sending normally.`,ephemeral:true});
+  }
+  let resolvedColor = 0x5865F2;
+  if(colorHex){const cleaned=colorHex.replace(/^#/,"");const parsed=parseInt(cleaned,16);if(!isNaN(parsed))resolvedColor=parsed;}
+  let payload;
+  if(useEmbed||attachment||embedTitle){
+    const embed={description:text||null,title:embedTitle||null,color:resolvedColor,image:attachment?{url:attachment.url}:undefined};
+    if(!embed.description)delete embed.description;
+    if(!embed.title)delete embed.title;
+    if(!embed.image)delete embed.image;
+    payload={embeds:[embed]};
+  }else{payload={content:text};}
+  try{
+    if(replyTarget){await replyTarget.reply(payload);}
+    else{await safeSend(targetCh,payload);}
+  }catch(e){await interaction.followUp({content:`❌ Failed to send: ${e.message}`,ephemeral:true}).catch(()=>{});}
+  return;
+}
+
+    if(cmd==="remind"){
+      const minutes=interaction.options.getInteger("time");
+      const message=interaction.options.getString("message");
+      if(minutes<1||minutes>10080)return safeReply(interaction,{content:"Time must be between 1 and 10080 minutes.",ephemeral:true});
+      reminders.push({userId:interaction.user.id,channelId:interaction.channelId,time:Date.now()+minutes*60000,message});
+      return safeReply(interaction,{content:`⏰ Reminder set! I'll remind you in **${minutes} minute(s)**: **${message}**`,ephemeral:true});
+    }
+
+    if(cmd==="messageschedule"){
+      const MAX_PENDING_PER_USER = 25;
+      const timeStr = interaction.options.getString("time");
+      const content = (interaction.options.getString("message")||"").trim();
+      const channel = interaction.channel;
+
+      const parsed = parseScheduleTime(timeStr);
+      if(!parsed)return safeReply(interaction,{content:"❌ Couldn't understand that time: try something like `5 hours`, `2 days`, `1 week`, or `1 month`.",ephemeral:true});
+      if(!content)return safeReply(interaction,{content:"❌ Provide a message to send later.",ephemeral:true});
+      if(content.length>1900)return safeReply(interaction,{content:"❌ Message is too long: please keep it under 1900 characters.",ephemeral:true});
+      if(inGuild){
+        const perms=channel.permissionsFor?.(interaction.guild.members.me);
+        if(perms && (!perms.has("MANAGE_WEBHOOKS")||!perms.has("VIEW_CHANNEL")))
+          return safeReply(interaction,{content:`❌ I need **Manage Webhooks** permission in ${channel} to schedule messages there.`,ephemeral:true});
+      }
+
+      const myPending=[...scheduledMessages.values()].filter(sm=>sm.userId===uid).length;
+      if(myPending>=MAX_PENDING_PER_USER)return safeReply(interaction,{content:`❌ You already have ${MAX_PENDING_PER_USER} scheduled messages pending.`,ephemeral:true});
+
+      const delayMs = parsed.ms;
+      if(delayMs < 60000)return safeReply(interaction,{content:"❌ Scheduled time must be at least 1 minute from now.",ephemeral:true});
+      if(delayMs > 366*86400000)return safeReply(interaction,{content:"❌ Scheduled time can't be more than a year out.",ephemeral:true});
+
+      const id = genScheduleId();
+      const sendAt = Date.now()+delayMs;
+      scheduledMessages.set(id, {
+        id, userId:uid, guildId:interaction.guildId||null, channelId:channel.id,
+        content, sendAt, createdAt: Date.now(), imageURL:null, imageName:null,
+      });
+      saveData();
+
+      const ts = Math.floor(sendAt/1000);
+      return safeReply(interaction,{
+        content: [
+          `📨 **Message scheduled!**`,
+          `**When:** <t:${ts}:F> (<t:${ts}:R>, in ${fmtScheduleUnit(parsed.amount,parsed.unit)})`,
+          `**Where:** ${channel}`,
+          `**As:** you, via webhook`,
+          `**Message:** ${content}`,
+        ].join("\n"),
+        ephemeral:true,
+      });
+    }
+
+    if(cmd==="premiere"){
+      const hours   = interaction.options.getNumber("hours");
+      const channel = interaction.options.getChannel("channel");
+      const title   = interaction.options.getString("title") || "Upcoming Video";
+      if(hours<=0||hours>720)return safeReply(interaction,{content:"❌ Hours must be between 0 and 720.",ephemeral:true});
+      const perms=channel.permissionsFor(interaction.guild.me);
+      if(!perms||!perms.has("SEND_MESSAGES")||!perms.has("EMBED_LINKS"))
+        return safeReply(interaction,{content:`❌ I don't have permission to send embeds in <#${channel.id}>.`,ephemeral:true});
+
+      const now      = Date.now();
+      const endsAt   = now + Math.round(hours * 3600000);
+      const id       = `${interaction.user.id}_${now}`;
+      const premiere = { title, endsAt, startedAt:now, channelId:channel.id, userId:interaction.user.id, messageId:null, guildId:interaction.guildId };
+
+      const embed = buildPremiereEmbed(premiere);
+      const sent  = await channel.send(embed).catch(()=>null);
+      if(!sent)return safeReply(interaction,{content:"❌ Failed to send the countdown message.",ephemeral:true});
+
+      premiere.messageId = sent.id;
+      premieres.set(id, premiere);
+      saveData();
+
+      const hrsLabel = hours === Math.floor(hours) ? `${hours}h` : `${hours}h`;
+      return safeReply(interaction,{content:`🎬 Premiere countdown started in <#${channel.id}>!\n**${title}** drops in **${hrsLabel}**: the bar updates every 30 minutes.`,ephemeral:true});
+    }
+
+    if(cmd==="serverinfo"){
+      if(!inGuild)return safeReply(interaction,{content:"Server only.",ephemeral:true});
+      await interaction.deferReply(); _clearAutoDefer();
+      const g=interaction.guild;
+      await g.members.fetch();
+      const bots=g.members.cache.filter(m=>m.user.bot).size;
+      return safeReply(interaction,`🏠 **${g.name}**\n👑 Owner: <@${g.ownerId}>\n👥 Members: **${g.memberCount}** (${g.memberCount-bots} humans, ${bots} bots)\n📅 Created: <t:${Math.floor(g.createdTimestamp/1000)}:R>\n💬 Channels: **${g.channels.cache.filter(c=>c.type==="GUILD_TEXT").size}** text, **${g.channels.cache.filter(c=>c.type==="GUILD_VOICE").size}** voice\n🎭 Roles: **${g.roles.cache.size}**`);
+    }
+
+    if(cmd==="botinfo"){
+      const guilds=client.guilds.cache.size;
+      let totalUsers=0;client.guilds.cache.forEach(g=>totalUsers+=g.memberCount);
+      return safeReply(interaction,`🤖 **RoyalBot**\n📡 Servers: **${guilds}**\n👥 Total Users: **${totalUsers.toLocaleString()}**\n⏱️ Uptime: **${Math.floor(process.uptime()/3600)}h ${Math.floor((process.uptime()%3600)/60)}m**\n🏓 Ping: **${client.ws.ping}ms**\n📦 Node.js ${process.version}`);
+    }
+
+    if(cmd==="help"){
+      const HELP_PAGES=[
+        {title:"🎉 Social & Utility :  Page 1 / 8",description:["**Romance**","`/marry user:…`: Propose 💍: target gets Accept/Decline buttons","`/divorce`: End the marriage 💔","`/partner [user]`: See who someone is married to","","**Media**","`/quote`: Inspirational quote image ✨","`/goodquote`: Top rated quote image ⭐","`/badquote`: Bottom rated quote image 💀","`/avatar user:…`: Get someone's avatar","","**Utility**","`/ping`: Bot latency 🏓","`/echo [message] [embed] [image] [title] [color] [replyto]`: Make the bot say something","`/remind time:… message:…`: Set a reminder (1 min – 1 week)","`/messageschedule time:… message:…`: Schedule a message to send later, as you, via webhook 📨 (e.g. `5 hours`, `2 days`, `1 week`, `1 month`)","`/premiere hours:… channel:… [title]`: Countdown to a video upload 🎬","`/upload source|link:…`: Upload an image/audio/video to the quotes folder 🖼️🔊🎬 *(authorized users)*","","**Info**","`/botinfo`: Bot stats","`/serverinfo`: Server member/channel/role info"].join("\n")},
+        {title:"📈 XP & Leaderboards :  Page 2 / 8",description:["**XP**","You earn XP by sending messages (1 min cooldown). 5–15 XP per message.","Level formula: `floor(50 × level^1.5)` XP per level","","`/xp [user]`: Check XP, level, and progress bar","`/xpleaderboard [scope:global|server]`: Top 10 by XP","","**Stats & Leaderboards**","`/score [user]`: Wins, losses, win rate, streak","`/leaderboard [type]`: Global top 10","`/serverleaderboard [type]`: Server top 10","> Types: `wins` `coins` `streak` `beststreak` `games` `winrate` `images`"].join("\n")},
+        {title:"⚙️ Server Config :  Page 3 / 8",description:["Most commands here require **Manage Server** permission.","","**Channels & Messages**","`/channelpicker channel:… [levelup]`: Set the bot's main channel","`/xpconfig setting:…`: Level up messages (on/off, ping toggle, channel)","`/setwelcome channel:… [message]`: Welcome message (`{user}` `{server}` `{count}`)","`/setleave channel:… [message]`: Leave message","`/setboostmsg channel:… [message]`: Boost announcement","`/disableownermsg enabled:…`: Toggle bot owner broadcasts","`/purge amount:…`: Bulk delete (needs Manage Messages)","`/counting action:set|remove|status`: Set a permanent counting channel","","**Roles**","`/autorole [role]`: Auto assign role on join (blank to disable)","`/reactionrole action:add|remove|list …`: Emoji reaction roles","`/dropdownroles action:build`: Dropdown-menu roles (upgrade to reaction roles)","`/rolespingfix`: List & fix roles that can @everyone","","**Competitions & Tickets**","`/invitecomp hours:…`: Invite competition with coin rewards","`/ticketsetup` · `/closeticket` · `/addtoticket` · `/removefromticket`","","**Overview**","`/serverconfig`: View all current settings"].join("\n")},
+        {title:"🛡️ Activity & RA/LOA :  Page 4 / 8",description:["**Activity Checks** *(Manage Server)*","`/activity-check channel:… [deadline] [message] [ping] [schedule]` - Send a check-in to staff","> Specify which roles must respond and who is excluded","> Auto closes after the deadline and reports who didn't check in","> Add `schedule:Monday 09:00` (UTC) to repeat it weekly automatically","","**RA / LOA Setup** *(Manage Server)*","`/raconfig action:create`: Auto create Reduced Activity + LOA roles","`/raconfig action:set_ra|set_loa role:…`: Use existing roles","`/raconfig action:view`: See current config","","**Assigning Roles**","`/staffrole type:ra|loa user:… action:give|remove [duration]`: Give/remove RA or LOA role","> `duration` is in hours: omit for permanent"].join("\n")},
+        {title:"📺 YouTube Tracking :  Page 5 / 8",description:["Track a YouTube channel's subscriber count live in Discord.","All commands require **Manage Server** permission.","","**Setup (do this first)**","`/ytsetup channel:… discord_channel:… [apikey:…]`: Connect a YouTube channel","> Accepts `@handle`, full URL, or channel ID starting with UC","> Provide your YouTube Data API v3 key on first use: it's saved to botdata","> Get a free key at console.cloud.google.com → enable YouTube Data API v3","","**Live Sub Count**","`/subcount threshold:1K|10K`: Post an embed that edits itself every 5 min","","**Sub Goal**","`/subgoal goal:N [message]`: Live progress bar towards a target sub count","> Fires a custom or default message when the goal is reached","","**Milestones**","`/milestones action:add subs:N [message]`: Announce when a sub count is crossed","`/milestones action:remove subs:N`: Remove a milestone","`/milestones action:list`: View all milestones and their status"].join("\n")},
+        {title:"🤖 Community Modes :  Page 6 / 8",description:["Clankerify replaces a user's messages with a webhook impersonating them in a chosen personality.","","**For Everyone**","`/selfclank duration:1 to 5`: Clankerify yourself for 1–5 min with any mode","> Choose from built in modes or any custom modes players have built","> Max 2 selfclanked users per server at once","> `/selfclank duration:0` to cancel early","","**Built-in Modes**","🤖 No mode (plain) · 😈 Evil · 😏 Freaky · 🦅 American · 🫖 British","🪖 Stupid · 📰 Boomer · 🔺 Conspiracy · 🗺️ NPC · 😤 Sigma","⚔️ Medieval · 👻 Ghost · 🏴‍☠️ Pirate · 🦝 RespawnRaccoon Propaganda","🇫🇷 French · 🐱 UWU/LOLCAT · 🎲 Random","","**Custom Modes**: anyone can build one with `/clankerbuild`","`/clankerbuild action:create name:<id>`: Opens a builder modal with:","  • Display name format (`{name}` = the user's name)","  • Word replacements (`Test>Test2; friend>pardner, …`)","  • Signoffs (`yeehaw!;much obliged;git along now`)","  • Message start prefix","  • Emoji shown in the mode selector","`/clankerbuild action:list`: View all custom modes","`/clankerbuild action:delete name:<id>`: Remove a custom mode","","Custom modes appear automatically in the `/clankerify` and `/selfclank` dropdowns."].join("\n")},
+        {title:"🖼️ Media & Quotes :  Page 7 / 8",description:["**Quotes Folder**","`/upload source|link:…`: Upload an image/audio/video *(authorized users)*","`/requestupload source:…`: Submit a file to be reviewed for the quotes folder","`/managememers action:add|remove|list [user]`: [Owner] Manage the upload allowlist","`/quotemanage …`: [Owner] Browse, delete, and configure the quotes folder","`/dailyquote action:set|disable|status [channel] [hour]`: Auto post a daily quote (Manage Server)","`/library user:… [page]`: Browse a user's uploaded quotes","","**Other Media Tools**","`/pixeltxt action:structure|destructure file:…`: Convert an image to/from a compressed text format","`/jarvisdatabase source:… name:…`: Upload a trigger image/gif/video straight to the Jarvis folder","`/download url:… [format] [resolution]`: Download a YouTube video as MP4 or MP3"].join("\n")},
+        {title:"🔒 Owner Tools :  Page 8 / 8",description:["**Bot Management**","`/servers`: List servers & invite links","`/botstats`: Bot stats","`/setstatus text:… [type]`: Set bot presence","`/restart`: Restart the bot","`/refreshcmds`: Force reregister slash commands in this guild","`/adminconfig [key] [value]`: View/edit global config values","","**User & Server Actions**","`/forcemarry user1:… user2:…`: Force marry two users","`/forcedivorce user:…`: Force divorce a user","`/leaveserver server:…`: Leave a server","`/blacklist [user]`: Interactive picker: block a user from specific commands, or Full Blacklist","`/shadowdelete user:… percentage:…`: Randomly delete a % of a user's messages","`/clankerify user:… [duration]`: Resend a user's messages as a webhook impersonating them","`/impersonation user:… [as_user] [pfp] [name] [mode] [duration]`: Like clankerify, but resend as someone/something else","`/thecount user:…`: Open a queue channel for a user; messages sent there wait until /send","`/send`: Deliver everything queued in every /thecount channel to their respective users","`/paranoia user:… [chance]`: DM a user creepy paranoia messages","`/fakemessage user:… [message] [file] [mode]`: Send a message as another user via webhook","`/fakequote user:… text:… [displayname] [username]`: Generate a 'Make it a Quote' style card","`/theremnant message:…`: Send a mysterious dimensional transmission","`/jarvisenhance action:… name:…`: Build a custom Jarvis trigger word (categorized: Clankerify, Moderation, Messaging, Broadcast): say it while replying to run a chain of actions in order, mode/duration picked with no typing, and blank text fields autofill from whatever you say after the trigger word","","**Access & Relay**","`/tempowner user:… duration:… [commands]`: Grant a user temporary owner access","`/dmconfig [server] [user]`: Set up the DM relay hub or open a relay channel"].join("\n")},
+      ];
+      const TOTAL=HELP_PAGES.length;
+      function buildHelpEmbed(page){
+        const p=HELP_PAGES[page];
+        return{
+          embeds:[{title:p.title,description:p.description,color:0x5865F2,footer:{text:`Use the buttons to navigate • Page ${page+1} of ${TOTAL}`}}],
+          components:[new MessageActionRow().addComponents(
+            new MessageButton().setCustomId(`help_page_${page-1}`).setLabel("◀ Prev").setStyle("SECONDARY").setDisabled(page===0),
+            new MessageButton().setCustomId(`help_page_${page+1}`).setLabel("Next ▶").setStyle("SECONDARY").setDisabled(page>=TOTAL-1),
+          )],
+          ephemeral:true,
+        };
+      }
+      return safeReply(interaction,buildHelpEmbed(0));
+    }
+
+    if(cmd==="xp"){
+      const u=interaction.options.getUser("user")||interaction.user;
+      const s=getScore(u.id,u.username);const{level,xp,needed}=xpInfo(s);
+      const filled=Math.floor((xp/needed)*20);
+      return safeReply(interaction,`📈 **${u.username}'s XP**\n🏅 Level: **${level}**\n✨ XP: **${xp}** / **${needed}**\n[${"█".repeat(filled)}${"░".repeat(20-filled)}]`);
+    }
+    if(cmd==="xpleaderboard"){
+      const scope=interaction.options.getString("scope")||"global";
+      let entries=[...scores.entries()];
+      if(scope==="server"){if(!inGuild)return safeReply(interaction,{content:"Server only.",ephemeral:true});await interaction.deferReply();_clearAutoDefer();await interaction.guild.members.fetch();const mids=new Set(interaction.guild.members.cache.filter(m=>!m.user.bot).map(m=>m.id));entries=entries.filter(([id])=>mids.has(id));}
+      if(!entries.length)return safeReply(interaction,"No XP data yet!");
+      const totalXP=([,s])=>{let t=0,lv=s.level||1;for(let i=1;i<lv;i++)t+=Math.floor(50*Math.pow(i,1.5));return t+(s.xp||0);};
+      const sorted=[...entries].sort((a,b)=>totalXP(b)-totalXP(a)).slice(0,10);
+      const medals=["🥇","🥈","🥉"];
+      return safeReply(interaction,`**${scope==="server"?`🏠 ${interaction.guild?.name}`:"🌍 Global"}: XP Leaderboard**\n\n${sorted.map((e,i)=>`${medals[i]||`${i+1}.`} **${e[1].username}**: Level **${e[1].level||1}** (${e[1].xp||0} XP)`).join("\n")}`);
+    }
+
+    if(cmd==="score"){
+      const u=interaction.options.getUser("user")||interaction.user;
+      const s=getScore(u.id,u.username);const wr=s.gamesPlayed>0?Math.round(s.wins/s.gamesPlayed*100):0;const{level,xp,needed}=xpInfo(s);
+      return safeReply(interaction,`🏆 **${u.username}'s Stats**\n🎮 Games: **${s.gamesPlayed}** | Wins: **${s.wins}** | WR: **${wr}%**\n💰 Coins: **${s.coins}**\n🔥 Streak: **${s.dailyStreak}** | Best: **${s.bestStreak}**\n📈 Level: **${level}** | XP: **${xp}/${needed}**`);
+    }
+    function buildLeaderboard(entries,type,titlePrefix){
+      let sorted,title,fmt;
+      if(type==="coins"){sorted=[...entries].sort(([,a],[,b])=>b.coins-a.coins);title=`${titlePrefix}: Coins 💰`;fmt=([,s])=>`${s.coins} coins`;}
+      else if(type==="streak"){sorted=[...entries].sort(([,a],[,b])=>b.dailyStreak-a.dailyStreak);title=`${titlePrefix}: Daily Streak 🔥`;fmt=([,s])=>`${s.dailyStreak} day streak`;}
+      else if(type==="games"){sorted=[...entries].sort(([,a],[,b])=>b.gamesPlayed-a.gamesPlayed);title=`${titlePrefix}: Games Played 🎮`;fmt=([,s])=>`${s.gamesPlayed} games`;}
+      else if(type==="winrate"){sorted=entries.filter(([,s])=>s.gamesPlayed>=5).sort(([,a],[,b])=>(b.wins/b.gamesPlayed)-(a.wins/a.gamesPlayed));title=`${titlePrefix}: Win Rate % (min 5)`;fmt=([,s])=>`${Math.round(s.wins/s.gamesPlayed*100)}%`;}
+      else if(type==="beststreak"){sorted=[...entries].sort(([,a],[,b])=>b.bestStreak-a.bestStreak);title=`${titlePrefix}: Best Streak 🏅`;fmt=([,s])=>`${s.bestStreak} day best`;}
+      else if(type==="images"){sorted=[...entries].sort(([,a],[,b])=>(b.imagesUploaded||0)-(a.imagesUploaded||0));title=`${titlePrefix}: Images Uploaded 🖼️`;fmt=([,s])=>`${s.imagesUploaded||0} image${(s.imagesUploaded||0)!==1?"s":""}`;}
+      else{sorted=[...entries].sort(([,a],[,b])=>b.wins-a.wins);title=`${titlePrefix} - Wins`;fmt=([,s])=>`${s.wins} wins (${s.gamesPlayed} played)`;}
+      const medals=["🥇","🥈","🥉"],top=sorted.slice(0,10);
+      if(!top.length)return"Not enough data yet.";
+      return`**${title}**\n\n${top.map((e,i)=>`${medals[i]||`${i+1}.`} **${e[1].username}** - ${fmt(e)}`).join("\n")}`;
+    }
+    if(cmd==="leaderboard"){const type=interaction.options.getString("type")||"wins";const entries=[...scores.entries()];if(!entries.length)return safeReply(interaction,"No scores yet!");return safeReply(interaction,buildLeaderboard(entries,type,"🌍 Global"));}
+    if(cmd==="serverleaderboard"){
+      if(!inGuild)return safeReply(interaction,{content:"Server only.",ephemeral:true});
+      await interaction.deferReply(); _clearAutoDefer();
+      await interaction.guild.members.fetch();
+      const mids=new Set(interaction.guild.members.cache.filter(m=>!m.user.bot).map(m=>m.id));
+      const entries=[...scores.entries()].filter(([id])=>mids.has(id));
+      if(!entries.length)return safeReply(interaction,"No scores in this server yet!");
+      return safeReply(interaction,buildLeaderboard(entries,interaction.options.getString("type")||"wins",`🏠 ${interaction.guild.name}`));
+    }
+
+    if(cmd==="channelpicker"){
+      const ch=interaction.options.getChannel("channel");
+      if(ch.type!=="GUILD_TEXT")return safeReply(interaction,{content:"Select a text channel.",ephemeral:true});
+      guildChannels.set(interaction.guildId,ch.id);saveData();
+      const levelupOpt=interaction.options.getBoolean("levelup");
+      if(levelupOpt===false){disabledLevelUp.add(interaction.guildId);saveData();return safeReply(interaction,{content:`✅ Bot channel → <#${ch.id}>\n🔇 Level up notifications **disabled**.`,ephemeral:true});}
+      else{disabledLevelUp.delete(interaction.guildId);saveData();return safeReply(interaction,{content:`✅ Bot channel → <#${ch.id}>\n🔔 Level up notifications **enabled**.`,ephemeral:true});}
+    }
+
+    if(cmd==="counting"){
+      if(!inGuild)return safeReply(interaction,{content:"Server only.",ephemeral:true});
+      const action=interaction.options.getString("action");
+      const chId=interaction.channelId;
+      if(action==="set"){
+        if(countingChannels.has(chId)){
+          const cc=countingChannels.get(chId);
+          return safeReply(interaction,{content:`This channel is already a counting channel! Current count: **${cc.count}** | High score: **${cc.highScore||0}**`,ephemeral:true});
+        }
+        countingChannels.set(chId,{guildId:interaction.guildId,count:0,lastUserId:null,highScore:0});
+        saveData();
+        return safeReply(interaction,`🔢 **Counting channel activated!**\n\nThis channel is now a counting channel. Start counting from **1**!\n\n> Numbers only: count one at a time, no counting twice in a row.\n> Mess up and the count resets back to **0**.`);
+      }
+      if(action==="remove"){
+        if(!countingChannels.has(chId))return safeReply(interaction,{content:"This channel is not a counting channel.",ephemeral:true});
+        countingChannels.delete(chId);
+        saveData();
+        return safeReply(interaction,`✅ Counting channel removed from <#${chId}>.`);
+      }
+      if(action==="status"){
+        if(!countingChannels.has(chId))return safeReply(interaction,{content:"This channel is not a counting channel.",ephemeral:true});
+        const cc=countingChannels.get(chId);
+        return safeReply(interaction,`🔢 **Counting Channel Status**\nCurrent count: **${cc.count}**\nHigh score: **${cc.highScore||0}**\nNext number: **${cc.count+1}**`);
+      }
+    }
+
+    if(cmd==="xpconfig"){
+      if(!inGuild)return safeReply(interaction,{content:"Server only.",ephemeral:true});
+      const setting=interaction.options.getString("setting");
+      const guildId=interaction.guildId;
+
+      function getLUC(){
+        if(!levelUpConfig.has(guildId)){
+          levelUpConfig.set(guildId,{
+            enabled: !disabledLevelUp.has(guildId),
+            ping:    true,
+            channelId: null,
+          });
+        }
+        return levelUpConfig.get(guildId);
+      }
+
+      if(setting==="show"){
+        const c=getLUC();
+        const chStr=c.channelId
+          ?`<#${c.channelId}>`
+          :guildChannels.get(guildId)
+            ?`<#${guildChannels.get(guildId)}> *(bot channel fallback)*`
+            :"*(same channel as the levelled up message)*";
+        return safeReply(interaction,{
+          embeds:[{
+            title:"⚙️ Level up Notification Config",
+            description:[
+              `**Messages enabled:** ${c.enabled?"✅ Yes":"❌ No"}`,
+              `**@Mention ping:**    ${c.ping?"✅ Yes":"❌ No: shows username only"}`,
+              `**Channel:**          ${chStr}`,
+              ``,
+              "Use `/xpconfig setting:<option>` to change any setting.",
+            ].join("\n"),
+            color:0x5865F2,
+          }],
+          ephemeral:true,
+        });
+      }
+      if(setting==="enable"){
+        const c=getLUC();c.enabled=true;
+        disabledLevelUp.delete(guildId);saveData();
+        return safeReply(interaction,{content:"✅ Level up messages **enabled**.",ephemeral:true});
+      }
+      if(setting==="disable"){
+        const c=getLUC();c.enabled=false;
+        disabledLevelUp.add(guildId);saveData();
+        return safeReply(interaction,{content:"🔇 Level up messages **disabled**.",ephemeral:true});
+      }
+      if(setting==="ping_on"){
+        const c=getLUC();c.ping=true;saveData();
+        return safeReply(interaction,{content:"✅ Level up messages will now **@mention** the user.",ephemeral:true});
+      }
+      if(setting==="ping_off"){
+        const c=getLUC();c.ping=false;saveData();
+        return safeReply(interaction,{content:"✅ Level up messages will now show the **username without pinging**.",ephemeral:true});
+      }
+      if(setting==="set_channel"){
+        const ch=interaction.options.getChannel("channel");
+        if(!ch)return safeReply(interaction,{content:"❌ Please also select a `channel`.",ephemeral:true});
+        if(ch.type!=="GUILD_TEXT")return safeReply(interaction,{content:"❌ Must be a text channel.",ephemeral:true});
+        const c=getLUC();c.channelId=ch.id;saveData();
+        return safeReply(interaction,{content:`✅ Level up messages will be sent to <#${ch.id}>.`,ephemeral:true});
+      }
+      if(setting==="reset_channel"){
+        const c=getLUC();c.channelId=null;saveData();
+        const fallback=guildChannels.get(guildId);
+        return safeReply(interaction,{
+          content:fallback
+            ?`✅ Channel reset: will fall back to <#${fallback}> (bot channel).`
+            :"✅ Channel reset: messages will be sent in the same channel as the levelled up message.",
+          ephemeral:true,
+        });
+      }
+      return safeReply(interaction,{content:"Unknown setting.",ephemeral:true});
+    }
+    if(cmd==="setwelcome"){
+      const ch=interaction.options.getChannel("channel");
+      if(ch.type!=="GUILD_TEXT")return safeReply(interaction,{content:"Select a text channel.",ephemeral:true});
+      const msg=interaction.options.getString("message")||null;
+      welcomeChannels.set(interaction.guildId,{channelId:ch.id,message:msg});saveData();
+      const preview=(msg||"Welcome to **{server}**, {user}! 🎉 You are member #{count}.").replace("{user}","@NewUser").replace("{server}",interaction.guild.name).replace("{count}","?");
+      return safeReply(interaction,{content:`✅ Welcome → <#${ch.id}>\n**Preview:** ${preview}`,ephemeral:true});
+    }
+    if(cmd==="setleave"){
+      const ch=interaction.options.getChannel("channel");
+      if(ch.type!=="GUILD_TEXT")return safeReply(interaction,{content:"Select a text channel.",ephemeral:true});
+      const msg=interaction.options.getString("message")||null;
+      leaveChannels.set(interaction.guildId,{channelId:ch.id,message:msg});saveData();
+      const preview=(msg||"**{user}** has left **{server}**. 👋").replace("{user}","Username").replace("{server}",interaction.guild.name);
+      return safeReply(interaction,{content:`✅ Leave → <#${ch.id}>\n**Preview:** ${preview}`,ephemeral:true});
+    }
+    if(cmd==="disableownermsg"){
+      const enabled=interaction.options.getBoolean("enabled");
+      if(enabled)disabledOwnerMsg.delete(interaction.guildId);else disabledOwnerMsg.add(interaction.guildId);saveData();
+      return safeReply(interaction,{content:enabled?"✅ Owner messages **enabled** in this server.":"🔇 Owner messages **disabled** in this server.",ephemeral:true});
+    }
+
+    if(cmd==="servers"){
+      await interaction.deferReply({ephemeral:true});let text="";
+      for(const g of client.guilds.cache.values()){try{const ch=g.channels.cache.find(c=>c.type==="GUILD_TEXT"&&g.members.me&&c.permissionsFor(g.members.me).has("CREATE_INSTANT_INVITE"));if(ch){const inv=await ch.createInvite({maxAge:0});text+=`${g.name} - ${inv.url}\n`;}else text+=`${g.name}: no invite perms\n`;}catch{text+=`${g.name} - error\n`;}if(text.length>1800){text+="…and more";break;}}
+      return safeReply(interaction,text||"No servers");
+    }
+    if(cmd==="botstats"){
+      await interaction.deferReply({ephemeral:true});
+      let totalUsers=0,serverList="";
+      for(const g of client.guilds.cache.values()){totalUsers+=g.memberCount;serverList+=`• ${g.name} (${g.memberCount.toLocaleString()})\n`;if(serverList.length>1500){serverList+="…and more\n";break;}}
+      const ui=await getUserAppInstalls();
+      const appUserCount=userInstalls.size;
+
+      let quotesCount = "?";
+      try {
+        const files = await fetchAllQuoteFiles();
+        quotesCount = files.length;
+      } catch(e){ console.error("botstats quotes fetch:",e.message); }
+
+      const content=`**Bot Stats**\nServers: **${client.guilds.cache.size.toLocaleString()}**\nTotal users (across servers): **${totalUsers.toLocaleString()}**\nApp installs (Discord estimate): **${typeof ui==="number"?ui.toLocaleString():ui}**\nTracked app users (interacted outside servers): **${appUserCount}**\n🖼️ Images in quotes folder: **${quotesCount}**\n\n${serverList}`;
+      const btn=new MessageActionRow().addComponents(new MessageButton().setCustomId("botstats_users").setLabel(`View App Users (${appUserCount})`).setStyle("SECONDARY").setDisabled(appUserCount===0));
+      return safeReply(interaction,{content,components:[btn]});
+    }
+    if(cmd==="dmconfig"){
+      await interaction.deferReply({ephemeral:true});
+      const serverId   = interaction.options.getString("server");
+      const targetUser = interaction.options.getUser("user");
+
+      if(!serverId && !targetUser){
+        return safeReply(interaction,{content:"❌ Provide either `server` (set the relay hub once) or `user` (open their relay channel).",ephemeral:true});
+      }
+
+      // ── Setup: point the relay at a hub server ─────────────────────────────
+      if(serverId){
+        const guild = client.guilds.cache.get(serverId);
+        if(!guild) return safeReply(interaction,{content:`❌ I'm not in a server with ID \`${serverId}\`.`,ephemeral:true});
+        dmRelayGuildId = serverId;
+        saveData();
+        return safeReply(interaction,{content:`✅ DM relay hub set to **${guild.name}**. Now run \`/dmconfig user:<someone>\` to open a relay channel for them.`,ephemeral:true});
+      }
+
+      // ── Open (or point back to) a user's relay channel ──────────────────────
+      if(!dmRelayGuildId) return safeReply(interaction,{content:"❌ No relay hub set yet: run `/dmconfig server:<id>` first.",ephemeral:true});
+      const hubGuild = client.guilds.cache.get(dmRelayGuildId);
+      if(!hubGuild) return safeReply(interaction,{content:`❌ I'm no longer in the configured hub server (\`${dmRelayGuildId}\`). Run \`/dmconfig server:<id>\` again.`,ephemeral:true});
+
+      const existingChannelId = dmRelayChannels.get(targetUser.id);
+      const existingChannel = existingChannelId ? hubGuild.channels.cache.get(existingChannelId) : null;
+      if(existingChannel){
+        return safeReply(interaction,{content:`📨 <@${targetUser.id}> already has a relay channel: <#${existingChannelId}>`,ephemeral:true});
+      }
+
+      const channel = await ensureDmRelayChannel(targetUser);
+      if(!channel) return safeReply(interaction,{content:"❌ Couldn't create a relay channel.",ephemeral:true});
+      return safeReply(interaction,{content:`✅ Opened relay channel for <@${targetUser.id}>: <#${channel.id}>`,ephemeral:true});
+    }
+    if(cmd==="fakemessage"){
+      if(!interaction.guildId)return safeReply(interaction,{content:"Server only.",ephemeral:true});
+      await interaction.deferReply({ephemeral:true});
+      const target=interaction.options.getUser("user");
+      const msgText=interaction.options.getString("message");
+      const fileAttach=interaction.options.getAttachment("file");
+      const fakeMode=interaction.options.getString("mode")||null;
+      if(!msgText&&!fileAttach)return safeReply(interaction,{content:"❌ Provide a message and/or a file.",ephemeral:true});
+      try{
+        const member=await interaction.guild.members.fetch(target.id).catch(()=>null);
+        let fakeDisplayName=member?.displayName||target.username;
+        const avatarURL=target.displayAvatarURL({size:256,dynamic:true});
+        let fakeContent=msgText||null;
+
+        // ── Apply clankerify mode transforms ──────────────────────────────────
+        const FAKE_ALL_MODES=["evil","freaky","american","british","stupid","boomer","conspiracy","npc","sigma","medieval","ghost","pirate","rr_propaganda","french","uwu"];
+        const resolvedFakeMode=(fakeMode==="random"||fakeMode==="none"||!fakeMode)
+          ? (fakeMode==="random" ? FAKE_ALL_MODES[Math.floor(Math.random()*FAKE_ALL_MODES.length)] : null)
+          : fakeMode;
+
+        if(resolvedFakeMode==="random") fakeDisplayName=`Randomized ${fakeDisplayName}`;
+
+        if(resolvedFakeMode==="evil"){ fakeDisplayName=`Evil ${fakeDisplayName}`; if(fakeContent) fakeContent=fakeContent+" I'M SO EVIL THOOO"; }
+        else if(resolvedFakeMode==="freaky"){ fakeDisplayName=`𝓕𝓻𝓮𝓪𝓴𝔂 ${fakeDisplayName}`; if(fakeContent) fakeContent=`𝓕𝓻𝓮𝓪𝓴𝔂 ${fakeContent}`; }
+        else if(resolvedFakeMode==="american"){ fakeDisplayName=`American ${fakeDisplayName}`; if(fakeContent) fakeContent=fakeContent.toUpperCase()+" LAWD BLESS MERICA 🦅🦅🦅🔥🔥🔥🇺🇸🇺🇸🇺🇸"; }
+        else if(resolvedFakeMode==="british"){ fakeDisplayName=`${fakeDisplayName} innit`; if(fakeContent){ const bs=[[/trash/gi,"rubbish"],[/elevator/gi,"lift"],[/apartment/gi,"flat"],[/cookies/gi,"biscuits"],[/candy/gi,"sweets"],[/chips/gi,"crisps"],[/fries/gi,"chips"],[/phone/gi,"mobile"],[/sidewalk/gi,"pavement"],[/gas/gi,"petrol"],[/vacation/gi,"holiday"],[/soccer/gi,"football"],[/store/gi,"shop"],[/pants/gi,"trousers"],[/beer/gi,"lager"],[/drunk/gi,"bladdered"],[/bar/gi,"pub"],[/friend/gi,"mate"],[/guy/gi,"bloke"],[/dude/gi,"geezer"],[/man/gi,"lad"],[/girl/gi,"lass"],[/okay/gi,"alright"],[/yes/gi,"aye"],[/yeah/gi,"aye"],[/no/gi,"nah"],[/thanks/gi,"cheers"],[/sorry/gi,"sorry mate"]]; let t=fakeContent; for(const [f,r] of bs) t=t.replace(f,r); fakeContent=t+" innit bruv"; } }
+        else if(resolvedFakeMode==="stupid"){ if(fakeContent){ const sl=[[/th/gi,"d"],[/ing/gi,"in"],[/you/gi,"u"],[/your/gi,"ur"],[/the/gi,"da"],[/that/gi,"dat"],[/this/gi,"dis"],[/what/gi,"wut"],[/because/gi,"cuz"],[/s/gi,"z"],[/I/g,"i"]]; let t=fakeContent; for(const [f,r] of sl) t=t.replace(f,r); fakeContent=t; } }
+        else if(resolvedFakeMode==="boomer"){ fakeDisplayName=`${fakeDisplayName} (Bob's dad)`; if(fakeContent){ const bo=[[/lol/gi,"LOL (laugh out loud)"],[/omg/gi,"OH MY GOD"],[/btw/gi,"by the way"],[/idk/gi,"I don't know"],[/tbh/gi,"to be honest"],[/smh/gi,"shaking my head"],[/fr/gi,"for real"],[/based/gi,"sensible"],[/cringe/gi,"embarrassing"],[/slay/gi,"good job"],[/vibe/gi,"feeling"],[/sus/gi,"suspicious"]]; let t=fakeContent; for(const [f,r] of bo) t=t.replace(f,r); const out=[" Anyway, have you tried turning it off and on again? 📧"," Back in MY day we didn't have this nonsense. 📰"," Is this the Reddit? 🖱️"," Make sure to LIKE and SUBSCRIBE!! 👍"]; fakeContent=t+out[Math.floor(Math.random()*out.length)]; } }
+        else if(resolvedFakeMode==="conspiracy"){ fakeDisplayName=`🔺 ${fakeDisplayName} [AWAKE]`; if(fakeContent){ const th=[" (the government doesn't want you to know this)",": wake up sheeple 🐑",": do your own research before they delete this"," (they're putting something in the water btw)",": the lizard people are FURIOUS about it"]; const pr=["okay so nobody is talking about this but ","THEY don't want you to know: ","i've been doing research and ","connect the dots people: "]; fakeContent=pr[Math.floor(Math.random()*pr.length)]+fakeContent+th[Math.floor(Math.random()*th.length)]; } }
+        else if(resolvedFakeMode==="npc"){ fakeDisplayName=`${fakeDisplayName} [NPC #${Math.floor(Math.random()*9999)+1}]`; if(fakeContent){ const np=["Ah, a traveler! Anyway: ","Quest updated: ","Strange things have been happening. Also, ","You didn't hear this from me, but "]; const ns=[" Have you tried the items at the general store?"," I don't want any trouble."," Good luck out there, traveler."," [NPC wanders off]"]; fakeContent=np[Math.floor(Math.random()*np.length)]+fakeContent+ns[Math.floor(Math.random()*ns.length)]; } else fakeContent="...*stares into the distance*"; }
+        else if(resolvedFakeMode==="sigma"){ fakeDisplayName=`Σ ${fakeDisplayName}`; if(fakeContent){ const ss=[[/i/gi,"the sigma"],[/me/gi,"the sigma"],[/my/gi,"the sigma's"],[/you/gi,"fellow grindset individual"],[/friend/gi,"business associate"],[/love/gi,"strategically value"],[/work/gi,"the grindset"],[/money/gi,"resources"]]; let t=fakeContent; for(const [f,r] of ss) t=t.replace(f,r); const so=[": no cap, stay sigma.",": the grindset never stops.",": lions don't lose sleep over sheep."]; fakeContent=t+so[Math.floor(Math.random()*so.length)]; } }
+        else if(resolvedFakeMode==="medieval"){ fakeDisplayName=`Sir ${fakeDisplayName} of the Realm`; if(fakeContent){ const ms=[[/you/gi,"thee"],[/your/gi,"thy"],[/the/gi,"ye"],[/are/gi,"art"],[/is/gi,"ist"],[/yes/gi,"verily"],[/no/gi,"nay"],[/hi/gi,"hail"],[/hello/gi,"good morrow"],[/sorry/gi,"I beseech thy forgiveness"],[/good/gi,"most virtuous"],[/bad/gi,"most foul"],[/friend/gi,"loyal companion"],[/omg/gi,"by the saints"]]; let t=fakeContent; for(const [f,r] of ms) t=t.replace(f,r); const mc=[": so it is written, so it shall be done. ⚔️",": hear ye, hear ye! 📯",": upon mine honour. 🛡️"]; fakeContent=t+mc[Math.floor(Math.random()*mc.length)]; } }
+        else if(resolvedFakeMode==="ghost"){ fakeDisplayName=`👻 ${fakeDisplayName}'s Ghost`; if(fakeContent){ const gh=["...you won't believe what happened to me. I died. anyway: ","speaking from beyond the grave: ","i have UNFINISHED BUSINESS and it is: "]; const go=[" ...tell my family i said hey 👻"," ...i keep moving the furniture and nobody notices."," ...RIP me btw 💀 (literally)"]; fakeContent=gh[Math.floor(Math.random()*gh.length)]+fakeContent+go[Math.floor(Math.random()*go.length)]; } else fakeContent="*rattles chains*"; }
+        else if(resolvedFakeMode==="pirate"){ fakeDisplayName=`🏴‍☠️ ${fakeDisplayName} (the Pirate)`; if(fakeContent){ const ps=[[/my/gi,"me"],[/you/gi,"ye"],[/your/gi,"yer"],[/the/gi,"th'"],[/is/gi,"be"],[/friend/gi,"matey"],[/hey/gi,"ahoy"],[/hi/gi,"ahoy"],[/hello/gi,"ahoy"],[/yes/gi,"aye"],[/yeah/gi,"aye"],[/no/gi,"nay"],[/man/gi,"landlubber"],[/good/gi,"fine"],[/bad/gi,"foul"]]; let t=fakeContent; for(const [f,r] of ps) t=t.replace(f,r); const pi=[" arr!"," shiver me timbers!"," by Davy Jones!"," yo ho!"]; if(Math.random()<0.7) t+=pi[Math.floor(Math.random()*pi.length)]; fakeContent=t; } else fakeContent="arr... *stares into the horizon*"; }
+        else if(resolvedFakeMode==="rr_propaganda"){ const rs=[" By the way, go sub to RespawnRaccoon!"," By the way, go sub to RespawnRaccoon! Here's his YouTube link: https://www.youtube.com/@respawnraccoon"," On my momma if you ain't subbed to RespawnRaccoon..."," By the way, do you know RespawnRaccoon?"]; fakeContent=(fakeContent||"")+rs[Math.floor(Math.random()*rs.length)]; }
+        else if(resolvedFakeMode==="french"){ fakeDisplayName=`${fakeDisplayName} 🇫🇷`; if(fakeContent){ const fs=[[/hello/gi,"bonjour"],[/hi/gi,"salut"],[/yes/gi,"oui"],[/yeah/gi,"oui oui"],[/no/gi,"non"],[/thanks/gi,"merci"],[/sorry/gi,"pardon"],[/good/gi,"magnifique"],[/friend/gi,"mon ami"],[/love/gi,"amour"],[/food/gi,"la cuisine"],[/wine/gi,"vin"]]; let t=fakeContent; for(const [f,r] of fs) t=t.replace(f,r); const fo=[": c'est la vie 🥐",": hon hon hon 🥖"," - sacré bleu!"," - voilà!"]; fakeContent=t+fo[Math.floor(Math.random()*fo.length)]; } else fakeContent="*shrugs elaborately* bof…"; }
+        else if(resolvedFakeMode==="uwu"){ fakeDisplayName=`${fakeDisplayName} :3`; if(fakeContent){ const uw=[[/r/gi,"w"],[/l/gi,"w"],[/no/gi,"nyo"],[/yes/gi,"yesh"],[/the/gi,"da"],[/you/gi,"ewe"],[/what/gi,"wat"],[/hello/gi,"hewwo"],[/hi/gi,"hewwo"],[/sorry/gi,"sowwy"],[/!/g,"! UwU"],[/\?/g,"? :3"]]; let t=fakeContent; for(const [f,r] of uw) t=t.replace(f,r); const uo=["mrrp","  :3","  meow meow :3","  Nyah~!"]; fakeContent=t+"  "+uo[Math.floor(Math.random()*uo.length)]; } else fakeContent="*purrs* mrrp :3"; }
+
+        const webhooks=await interaction.channel.fetchWebhooks();
+        let webhook=webhooks.find(w=>w.owner?.id===CLIENT_ID);
+        if(!webhook)webhook=await interaction.channel.createWebhook("RoyalBot Proxy",{avatar:avatarURL});
+        const sendOpts={username:fakeDisplayName,avatarURL,allowedMentions:{parse:[]}};
+        if(fakeContent)sendOpts.content=fakeContent;
+        if(fileAttach)sendOpts.files=[{attachment:fileAttach.url,name:fileAttach.name}];
+        await webhook.send(sendOpts);
+        const modeLabel=resolvedFakeMode?` in **${resolvedFakeMode}** mode`:"";
+        return safeReply(interaction,{content:`✅ Message sent as **${fakeDisplayName}**${modeLabel}.`,ephemeral:true});
+      }catch(e){return safeReply(interaction,{content:`❌ Failed: ${e.message}`,ephemeral:true});}
+    }
+    if(cmd==="fakequote"){
+      await interaction.deferReply({ephemeral:true});
+      const target = interaction.options.getUser("user");
+      const quoteText = interaction.options.getString("text");
+      const displayNameOverride = interaction.options.getString("displayname");
+      const usernameOverride = interaction.options.getString("username");
+      try{
+        const displayName = displayNameOverride || target.globalName || target.username;
+        const username = usernameOverride || target.username;
+
+        const avatarURL = target.displayAvatarURL({ size:512, dynamic:false, extension:"png" });
+        const avatarRes = await fetch(avatarURL);
+        if(!avatarRes.ok) throw new Error(`Couldn't fetch avatar (HTTP ${avatarRes.status})`);
+        const avatarBuffer = Buffer.from(await avatarRes.arrayBuffer());
+
+        const cardBuffer = await buildFakeQuoteCard({
+          avatarBuffer, quoteText, displayName, username
+        });
+
+        return safeReply(interaction,{
+          content:`✅ Generated quote card for **${displayName}**.`,
+          files:[{ attachment: cardBuffer, name: `quote_6660.png` }],
+          ephemeral:true
+        });
+      }catch(e){
+        console.error("fakequote error:",e.message);
+        return safeReply(interaction,{content:`❌ Failed to generate quote card: ${e.message}`,ephemeral:true});
+      }
+    }
+    if(cmd==="paranoia"){
+      const target  = interaction.options.getUser("user");
+      const chance  = Math.min(100, Math.max(1, interaction.options.getInteger("chance") ?? 100));
+      if(target.bot) return safeReply(interaction,{content:"❌ Can't haunt a bot.",ephemeral:true});
+      const pKey = scopedKey(interaction.guildId, target.id);
+
+      if(paranoiaWatchers.has(pKey)){
+        paranoiaWatchers.delete(pKey);
+        saveData();
+        return safeReply(interaction,{content:`🔕 Paranoia **disarmed** for <@${target.id}> in this server.`,ephemeral:true});
+      }
+
+      paranoiaWatchers.set(pKey, { chance, armed: true });
+      saveData();
+      return safeReply(interaction,{content:`👻 Now watching <@${target.id}> in this server: each message they send here has a **${chance}%** chance of getting a paranoia reply.\nRun \`/paranoia\` on them again (in this server) to disarm.`,ephemeral:true});
+    }
+    if(cmd==="leaveserver"){const guild=client.guilds.cache.get(interaction.options.getString("server"));if(!guild)return safeReply(interaction,{content:"Server not found.",ephemeral:true});const name=guild.name;await guild.leave();return safeReply(interaction,{content:`Left ${name}`,ephemeral:true});}
+    if(cmd==="restart"){await safeReply(interaction,{content:"Restarting…",ephemeral:true});await saveDataAndCommitNow();process.exit(0);}
+    if(cmd==="refreshcmds"){
+      if(!interaction.guildId) return safeReply(interaction,{content:"Server only.",ephemeral:true});
+      const canTouchGlobal = isEffectiveOwner(interaction.user.id, "refreshcmds");
+      await safeReply(interaction,{content: canTouchGlobal ? "🔄 Re registering slash commands (guild + global)…" : "🔄 Re registering slash commands for this server…", ephemeral:true});
+      try{
+        await registerGuildCommands(interaction.guildId, true);
+        if(canTouchGlobal){
+          await registerGlobalCommands(true);
+          return safeReply(interaction,{content:`✅ Commands reregistered for **${interaction.guild.name}** and globally. Guild commands update instantly; global (owner) commands may take up to 1hr to propagate.`,ephemeral:true});
+        }
+        return safeReply(interaction,{content:`✅ Commands reregistered for **${interaction.guild.name}**.`,ephemeral:true});
+      }catch(e){
+        return safeReply(interaction,{content:`❌ Failed to reregister: ${e.message}`,ephemeral:true});
+      }
+    }
+    if(cmd==="setstatus"){
+      const text=interaction.options.getString("text"),type=interaction.options.getString("type")||"PLAYING";
+      client.user.setActivity(text,{type});
+      botStatus = { text, type };
+      saveData();
+      return safeReply(interaction,{content:`Status → ${type}: ${text}\n💾 Saved: will persist across restarts.`,ephemeral:true});
+    }
+    if(cmd==="adminconfig"){
+      const key=interaction.options.getString("key"),value=interaction.options.getInteger("value");
+      if(!key){
+        const groups=[
+          ["📈 XP",["xp_per_msg_min","xp_per_msg_max","xp_cooldown_ms"]],
+          ["⏱️ Cooldowns (ms)",["work_cooldown_ms","beg_cooldown_ms","crime_cooldown_ms","rob_cooldown_ms"]],
+          ["💰 Economy",["daily_base_coins","daily_streak_bonus","daily_wrong_penalty","starting_coins"]],
+          ["🎲 Chances (%)",["beg_success_chance","crime_success_chance","rob_success_chance","coinbet_win_chance"]],
+          ["🔫 Rob",["rob_steal_pct_min","rob_steal_pct_max","rob_fine_pct_min","rob_fine_pct_max"]],
+          ["🎰 Slots",["slots_min_bet","slots_jackpot_mult","slots_bigwin_mult","slots_triple_mult","slots_pair_mult"]],
+          ["🃏 BJ & Effects",["blackjack_natural_mult","lucky_charm_bonus","xp_boost_mult","coin_magnet_mult"]],
+          ["🛍️ Shop prices",["shop_lucky_charm_price","shop_xp_boost_price","shop_shield_price","shop_coin_magnet_price","shop_mystery_box_price","shop_item_mystery_box_price","shop_rob_insurance_price"]],
+          ["📦 Mystery Box weights",["mb_coins_small","mb_coins_large","mb_lucky_charm","mb_xp_boost","mb_shield","mb_coin_magnet","mb_rob_insurance"]],
+          ["🎲 Item Box weights",["imb_coins_tiny","imb_coins_small","imb_lucky_charm","imb_xp_boost","imb_shield","imb_coin_magnet","imb_rob_insurance"]],
+          ["🎮 Solo wins",["win_hangman","win_snake_per_point","win_minesweeper_easy","win_minesweeper_medium","win_minesweeper_hard","win_numberguess","win_wordscramble"]],
+          ["🕹️ 2P wins",["win_ttt","win_c4","win_rps","win_mathrace","win_wordrace","win_trivia","win_scramblerace","win_countgame"]],
+          ["🏅 Events",["olympics_win_coins","invite_comp_1st","invite_comp_2nd","invite_comp_3rd","invite_comp_per_invite"]],
+        ];
+        const fields=groups.map(([g,keys])=>({
+          name:g,
+          value:keys.map(k=>`\`${k}\` → **${CONFIG[k]}**`).join("\n"),
+          inline:false,
+        }));
+        return safeReply(interaction,{embeds:[{
+          title:"⚙️ Global Config",
+          description:"Use `/adminconfig key:<name> value:<number>` to edit.\nAll 70 keys shown below.",
+          fields,
+          color:0x5865F2,
+        }],ephemeral:true});
+      }
+      if(!(key in CONFIG))return safeReply(interaction,{content:`❌ Unknown key \`${key}\`. Run \`/adminconfig\` with no arguments to see all valid keys.`,ephemeral:true});
+      if(value==null)return safeReply(interaction,{content:`⚙️ **${key}** = \`${CONFIG[key]}\``,ephemeral:true});
+      const old=CONFIG[key];CONFIG[key]=value;
+      saveData();
+      return safeReply(interaction,{content:`✅ **${key}**: \`${old}\` → \`${value}\``,ephemeral:true});
+    }
+
+    if(cmd==="rolespingfix"){
+      const isOwner=OWNER_IDS.includes(interaction.user.id);
+      if(!isOwner&&!interaction.member?.permissions.has("MANAGE_GUILD"))return safeReply(interaction,{content:"❌ You need the **Manage Server** permission to use this.",ephemeral:true});
+      if(!inGuild)return safeReply(interaction,{content:"Server only.",ephemeral:true});
+      await interaction.deferReply({ephemeral:true});
+      const guild=interaction.guild;
+      await guild.roles.fetch();
+      const dangerous=guild.roles.cache.filter(r=>{
+        if(r.managed||r.id===guild.id)return false;
+        return r.permissions.has("MENTION_EVERYONE");
+      });
+      if(!dangerous.size){
+        return safeReply(interaction,{embeds:[{
+          title:"✅ No dangerous roles found",
+          description:"No roles have the **Mention Everyone** permission.",
+          color:0x57F287,
+        }],ephemeral:true});
+      }
+      const lines=dangerous.map(r=>`<@&${r.id}>: \`${r.name}\` (ID: ${r.id})`).join("\n");
+      const fixBtn=new MessageActionRow().addComponents(
+        new MessageButton().setCustomId("rolespingfix_fix").setLabel(`Fix All (${dangerous.size} role${dangerous.size!==1?"s":""})`).setStyle("DANGER").setEmoji("🔧")
+      );
+      return safeReply(interaction,{embeds:[{
+        title:"⚠️ Roles with @everyone Permission",
+        description:`The following **${dangerous.size}** role(s) can ping @everyone:\n\n${lines}\n\nClick **Fix All** to remove the Mention Everyone permission from all of them.`,
+        color:0xFEE75C,
+        footer:{text:"This only removes the Mention Everyone permission: all other permissions stay intact."},
+      }],components:[fixBtn],ephemeral:true});
+    }
+    if(cmd==="setwelcomemsg"){const cfg=welcomeChannels.get(interaction.guildId);if(!cfg)return safeReply(interaction,{content:"No welcome channel set yet. Use /setwelcome first.",ephemeral:true});const message=interaction.options.getString("message")||null;cfg.message=message;const preview=(message||"Welcome to **{server}**, {user}! 🎉 You are member #{count}.").replace("{user}","@NewUser").replace("{server}",interaction.guild.name).replace("{count}","?");return safeReply(interaction,{content:`✅ Welcome message updated!\n**Preview:** ${preview}`,ephemeral:true});}
+    if(cmd==="setleavemsg"){const cfg=leaveChannels.get(interaction.guildId);if(!cfg)return safeReply(interaction,{content:"No leave channel set yet. Use /setleave first.",ephemeral:true});const message=interaction.options.getString("message")||null;cfg.message=message;const preview=(message||"**{user}** has left **{server}**. 👋").replace("{user}","Username").replace("{server}",interaction.guild.name);return safeReply(interaction,{content:`✅ Leave message updated!\n**Preview:** ${preview}`,ephemeral:true});}
+    if(cmd==="serverconfig"){
+      const wCfg=welcomeChannels.get(interaction.guildId),lCfg=leaveChannels.get(interaction.guildId),bCfg=boostChannels.get(interaction.guildId),botCh=guildChannels.get(interaction.guildId),arId=autoRoles.get(interaction.guildId),ownerMuted=disabledOwnerMsg.has(interaction.guildId),hasComp=inviteComps.has(interaction.guildId),lvlOff=disabledLevelUp.has(interaction.guildId);
+      const lines=[`⚙️ **Server Config: ${interaction.guild.name}**`,``,`📢 Bot channel: ${botCh?`<#${botCh}>`:"Not set"}`,`🏆 Level up notifications: ${lvlOff?"🔇 Disabled":"🔔 Enabled"}`,`👋 Welcome: ${wCfg?`<#${wCfg.channelId}>`:"Not set"}`,`🚪 Leave: ${lCfg?`<#${lCfg.channelId}>`:"Not set"}`,`🚀 Boost: ${bCfg?`<#${bCfg.channelId}>`:"Not set"}`,`🎭 Auto-role: ${arId?`<@&${arId}>`:"Not set"}`,`📣 Owner broadcasts: ${ownerMuted?"Disabled":"Enabled"}`,`📨 Invite comp: ${hasComp?"Running":"Not active"}`];
+      return safeReply(interaction,{content:lines.join("\n"),ephemeral:true});
+    }
+    if(cmd==="autorole"){
+      const role=interaction.options.getRole("role");
+      if(!role){autoRoles.delete(interaction.guildId);saveData();return safeReply(interaction,{content:"✅ Auto role disabled.",ephemeral:true});}
+      autoRoles.set(interaction.guildId,role.id);saveData();
+      return safeReply(interaction,{content:`✅ Members who join will automatically receive <@&${role.id}>.`,ephemeral:true});
+    }
+    if(cmd==="reactionrole"){
+      if(!inGuild)return safeReply(interaction,{content:"Server only.",ephemeral:true});
+      const action=interaction.options.getString("action");
+      if(action==="list"){
+        const prefix=`${interaction.guildId}:`;
+        const entries=[...reactionRoles.entries()].filter(([k])=>k.startsWith(prefix));
+        if(!entries.length)return safeReply(interaction,{content:"No reaction roles set up yet.",ephemeral:true});
+        const lines=entries.map(([key,roleId])=>{
+          const parts=key.split(":");
+          const msgId=parts[1];
+          const emojiPart=parts.slice(2).join(":");
+          const display=emojiPart.includes(":")?`<:${emojiPart}>`:emojiPart;
+          return`${display} → <@&${roleId}> (msg \`${msgId}\`)`;
+        });
+        return safeReply(interaction,{content:`🎭 **Reaction Roles: ${interaction.guild.name}**\n\n${lines.join("\n")}`,ephemeral:true});
+      }
+      if(action==="auto"){
+        const messageId=interaction.options.getString("messageid")?.trim();
+        if(!messageId)return safeReply(interaction,{content:"Provide messageid.",ephemeral:true});
+        await interaction.deferReply({ephemeral:true});
+        const targetMsg=await findMessageInGuild(interaction.guild, messageId);
+        if(!targetMsg)return safeReply(interaction,{content:"Message not found. Make sure the message ID is correct and the bot can see the channel.",ephemeral:true});
+        const parsed=parseReactionRoleLines(targetMsg.content, interaction.guild);
+        if(!parsed.length)return safeReply(interaction,{content:"No lines matched. Each line needs an emoji, then a role, either an actual role mention or just the role's name (caps and spaces don't matter).",ephemeral:true});
+        const results=[];
+        for(const {emojiRaw, roleId} of parsed){
+          const role=interaction.guild.roles.cache.get(roleId);
+          if(!role){ results.push(`❌ ${emojiRaw}: role not found`); continue; }
+          const norm=normalizeEmojiKey(emojiRaw);
+          const key=`${interaction.guildId}:${messageId}:${norm}`;
+          reactionRoles.set(key, roleId);
+          try{ await targetMsg.react(emojiRaw); results.push(`✅ ${emojiRaw} to ${role.name}`); }
+          catch(e){ results.push(`⚠️ ${emojiRaw} to ${role.name} (saved, but couldn't react: ${e.message})`); }
+        }
+        saveData();
+        return safeReply(interaction,{content:`🎭 **Auto detected reaction roles**\n📨 [Jump to message](${targetMsg.url})\n\n${results.join("\n")}`,ephemeral:true});
+      }
+      if(action==="manual"){
+        const messageId=interaction.options.getString("messageid")?.trim();
+        if(!messageId)return safeReply(interaction,{content:"Provide messageid.",ephemeral:true});
+        await interaction.deferReply({ephemeral:true});
+        const targetMsg=await findMessageInGuild(interaction.guild, messageId);
+        if(!targetMsg)return safeReply(interaction,{content:"Message not found. Make sure the message ID is correct and the bot can see the channel.",ephemeral:true});
+        const token=`${interaction.user.id.slice(-6)}${Date.now().toString(36)}`;
+        rrBuilders.set(token, { ownerId:interaction.user.id, guildId:interaction.guildId, channelId:targetMsg.channelId, messageId, pendingEmoji:null });
+        setTimeout(()=>rrBuilders.delete(token), 15*60*1000);
+        return safeReply(interaction, buildReactionRoleManualPanel(token));
+      }
+      if(action==="remove"){
+        const messageId=interaction.options.getString("messageid")?.trim();
+        const emojiRaw=interaction.options.getString("emoji")?.trim();
+        if(!messageId||!emojiRaw)return safeReply(interaction,{content:"❌ Provide `messageid` and `emoji`.",ephemeral:true});
+        const norm=normalizeEmojiKey(emojiRaw);
+        const key=`${interaction.guildId}:${messageId}:${norm}`;
+        if(!reactionRoles.has(key))return safeReply(interaction,{content:"❌ No reaction role found for that message + emoji.",ephemeral:true});
+        const roleId=reactionRoles.get(key);reactionRoles.delete(key);saveData();
+        return safeReply(interaction,{content:`✅ Removed: ${emojiRaw} → <@&${roleId}>`,ephemeral:true});
+      }
+      const messageId=interaction.options.getString("messageid")?.trim();
+      const emojiRaw=interaction.options.getString("emoji")?.trim();
+      const role=interaction.options.getRole("role");
+      if(!messageId||!emojiRaw||!role)return safeReply(interaction,{content:"❌ Provide `messageid`, `emoji`, and `role`.",ephemeral:true});
+      await interaction.deferReply({ephemeral:true});
+
+      const targetMsg=await findMessageInGuild(interaction.guild, messageId);
+      if(!targetMsg)return safeReply(interaction,{content:"❌ Message not found. Make sure the message ID is correct and the bot can see the channel.",ephemeral:true});
+
+      const norm=normalizeEmojiKey(emojiRaw);
+      const key=`${interaction.guildId}:${messageId}:${norm}`;
+      reactionRoles.set(key,role.id);
+      saveData();
+
+      try{ await targetMsg.react(emojiRaw); }catch(e){ console.warn("reactionrole react failed:",e.message); }
+
+      return safeReply(interaction,{content:`✅ **Reaction role added!**\n📨 [Jump to message](${targetMsg.url})\n${emojiRaw} → <@&${role.id}>\n\n> Tip: users must be able to see and react to that message. Bot needs \`Manage Roles\` and its role must be above <@&${role.id}> in the role list.`,ephemeral:true});
+    }
+    if(cmd==="dropdownroles"){
+      if(!inGuild)return safeReply(interaction,{content:"Server only.",ephemeral:true});
+      const action=interaction.options.getString("action");
+      if(action==="list"){
+        const prefix=`${interaction.guildId}:`;
+        const entries=[...dropdownRoleSets.entries()].filter(([k])=>k.startsWith(prefix));
+        if(!entries.length)return safeReply(interaction,{content:"No dropdown role sets posted yet.",ephemeral:true});
+        const lines=entries.map(([key,set])=>{
+          const setId=key.slice(prefix.length);
+          const ddLines=set.dropdowns.map(dd=>`  • ${dd.name} (${dd.options.length} option${dd.options.length!==1?"s":""})`).join("\n");
+          return `\`${setId}\`\n${ddLines}`;
+        });
+        return safeReply(interaction,{content:`🎛️ **Dropdown Role Sets: ${interaction.guild.name}**\n\n${lines.join("\n\n")}`,ephemeral:true});
+      }
+      if(action==="delete"){
+        const setId=interaction.options.getString("setid")?.trim();
+        if(!setId)return safeReply(interaction,{content:"❌ Provide `setid` (see /dropdownroles action:List).",ephemeral:true});
+        const key=`${interaction.guildId}:${setId}`;
+        if(!dropdownRoleSets.has(key))return safeReply(interaction,{content:"❌ No dropdown set found with that ID.",ephemeral:true});
+        dropdownRoleSets.delete(key);saveData();
+        return safeReply(interaction,{content:`✅ Deleted dropdown set \`${setId}\`. Any already-posted message will stop responding to selections.`,ephemeral:true});
+      }
+      const token=`${interaction.user.id.slice(-6)}${Date.now().toString(36)}`;
+      ddBuilders.set(token, { ownerId:interaction.user.id, guildId:interaction.guildId, setId:newDdSetId(), dropdowns:[], pendingEmoji:null, pendingIndex:null });
+      ddTouch(token);
+      return safeReply(interaction, {...buildDdMainPanel(token), ephemeral:true});
+    }
+    if(cmd==="setboostmsg"){
+      const ch=interaction.options.getChannel("channel");
+      if(ch.type!=="GUILD_TEXT")return safeReply(interaction,{content:"Select a text channel.",ephemeral:true});
+      const message=interaction.options.getString("message")||null;
+      boostChannels.set(interaction.guildId,{channelId:ch.id,message});saveData();
+      const preview=(message||"🚀 **{user}** just boosted **{server}**! Thank you! 💜").replace("{user}","@Booster").replace("{server}",interaction.guild.name);
+      return safeReply(interaction,{content:`✅ Boost messages → <#${ch.id}>\n**Preview:** ${preview}`,ephemeral:true});
+    }
+    if(cmd==="purge"){
+      if(!interaction.member.permissions.has("MANAGE_MESSAGES"))return safeReply(interaction,{content:"You need Manage Messages permission.",ephemeral:true});
+      const amount=interaction.options.getInteger("amount");
+      const filter=interaction.options.getString("filter")||null;
+      const contains=interaction.options.getString("contains")||null;
+      if(amount<1||amount>100)return safeReply(interaction,{content:"Amount must be 1–100.",ephemeral:true});
+      await interaction.deferReply({ephemeral:true});
+      try{
+        const messages=await interaction.channel.messages.fetch({limit:amount});
+        let toDelete=[...messages.values()];
+        if(filter==="humans") toDelete=toDelete.filter(m=>!m.author.bot);
+        if(filter==="bots")   toDelete=toDelete.filter(m=>m.author.bot);
+        if(contains)          toDelete=toDelete.filter(m=>m.content.toLowerCase().includes(contains.toLowerCase()));
+        if(!toDelete.length)return safeReply(interaction,{content:"❌ No messages matched your filters.",ephemeral:true});
+        const cutoff=Date.now()-(14*24*60*60*1000);
+        const fresh=toDelete.filter(m=>m.createdTimestamp>cutoff);
+        const old=toDelete.filter(m=>m.createdTimestamp<=cutoff);
+        let deletedCount=0;
+        if(fresh.length){
+          const bulk=await interaction.channel.bulkDelete(fresh,true);
+          deletedCount+=bulk.size;
+        }
+        if(old.length){
+          await safeReply(interaction,{content:`⏳ Deleting **${old.length}** old message(s) one by one, this may take a moment…`,ephemeral:true});
+          for(const m of old){
+            await m.delete().catch(()=>{});
+            deletedCount++;
+            await new Promise(res=>setTimeout(res,1000));
+          }
+        }
+        const filterDesc=filter?` (${filter} only)`:"";
+        const containsDesc=contains?` containing **"${contains}"**`:"";
+        return safeReply(interaction,{content:`🗑️ Deleted **${deletedCount}** message(s)${filterDesc}${containsDesc}.`,ephemeral:true});
+      }
+      catch(e){return safeReply(interaction,{content:`Failed: ${e.message}`,ephemeral:true});}
+    }
+
+    // ── YouTube commands ───────────────────────────────────────────────────────
+    if(cmd==="ytsetup"){
+      if(!inGuild)return safeReply(interaction,{content:"Server only.",ephemeral:true});
+      await interaction.deferReply({ephemeral:true});
+      const input     =interaction.options.getString("channel");
+      const discordCh =interaction.options.getChannel("discord_channel");
+      const newApiKey =interaction.options.getString("apikey")||null;
+      if(discordCh.type!=="GUILD_TEXT")return safeReply(interaction,{content:"❌ Please select a text channel.",ephemeral:true});
+      const existing=ytConfig.get(interaction.guildId)||{};
+      const apiKey=newApiKey||existing.apiKey||null;
+      if(!apiKey)return safeReply(interaction,{content:"❌ No API key found. Provide one with the `apikey:` option.\n\nGet a free key at https://console.cloud.google.com - enable the **YouTube Data API v3**, then create an API key credential.",ephemeral:true});
+      const ytChId=await resolveYouTubeChannelId(input,apiKey);
+      if(!ytChId)return safeReply(interaction,{content:`❌ Could not find a YouTube channel for \`${input}\`. Try the full URL or a channel ID starting with UC.`,ephemeral:true});
+      const stats=await getYouTubeStats(ytChId,apiKey);
+      if(!stats)return safeReply(interaction,{content:"❌ Could not fetch stats. Double check the API key and that YouTube Data API v3 is enabled.",ephemeral:true});
+      ytConfig.set(interaction.guildId,{
+        ...existing,apiKey,ytChannelId:ytChId,channelTitle:stats.title,
+        discordChannelId:discordCh.id,lastSubs:stats.subs,lastSubsTimestamp:Date.now(),
+        history:existing.history||[{ts:Date.now(),subs:stats.subs}],
+      });
+      saveData();
+      return safeReply(interaction,{content:`✅ Connected to **${stats.title}** (${fmtSubs(stats.subs)} subs)\nUpdates post to <#${discordCh.id}>.\n${newApiKey?"🔑 API key saved to botdata.\n":""}\nNow use \`/subgoal\`, \`/subcount\`, \`/milestones\`, and \`/growth\`.`,ephemeral:true});
+    }
+
+    if(cmd==="subgoal"){
+      if(!inGuild)return safeReply(interaction,{content:"Server only.",ephemeral:true});
+      const cfg=ytConfig.get(interaction.guildId);
+      if(!cfg?.ytChannelId)return safeReply(interaction,{content:"❌ No YouTube channel set up. Use `/ytsetup` first.",ephemeral:true});
+      const apiKey=cfg.apiKey;
+      if(!apiKey)return safeReply(interaction,{content:"❌ No API key stored. Re run `/ytsetup` and provide the `apikey:` option.",ephemeral:true});
+      const goal=interaction.options.getInteger("goal");
+      const goalMessage=interaction.options.getString("message")||null;
+      if(goal<1)return safeReply(interaction,{content:"❌ Goal must be at least 1.",ephemeral:true});
+      await interaction.deferReply();
+      const stats=await getYouTubeStats(cfg.ytChannelId,apiKey);
+      if(!stats)return safeReply(interaction,{content:"❌ Could not fetch current sub count."});
+      const pct=Math.min(100,Math.round(stats.subs/goal*100));
+      const ch=interaction.guild.channels.cache.get(cfg.discordChannelId);
+      if(!ch)return safeReply(interaction,{content:"❌ Configured Discord channel not found. Re run `/ytsetup`."});
+      const embedMsg=await ch.send({embeds:[{
+        title:`🎯 ${stats.title}: Sub Goal`,
+        description:`**${fmtSubs(stats.subs)}** / **${fmtSubs(goal)}**\n\`[${buildBar(stats.subs,goal)}]\` **${pct}%**`,
+        color:pct>=100?0x00FF00:0xFF0000,footer:{text:"Updates every 5 minutes"},timestamp:new Date().toISOString(),
+      }]});
+      cfg.goal=goal;cfg.goalMessage=goalMessage;cfg.goalReached=stats.subs>=goal;
+      cfg.goalDiscordId=cfg.discordChannelId;cfg.goalMessageId=embedMsg.id;
+      saveData();
+      const goalNote=goalMessage?`\nCustom goal message saved: _"${goalMessage}"_`:"";
+      return safeReply(interaction,{content:`✅ Sub goal set to **${fmtSubs(goal)}**! Progress bar posted in <#${cfg.discordChannelId}>.${goalNote}`});
+    }
+
+    if(cmd==="subcount"){
+      if(!inGuild)return safeReply(interaction,{content:"Server only.",ephemeral:true});
+      const cfg=ytConfig.get(interaction.guildId);
+      if(!cfg?.ytChannelId)return safeReply(interaction,{content:"❌ No YouTube channel set up. Use `/ytsetup` first.",ephemeral:true});
+      const apiKey=cfg.apiKey;
+      if(!apiKey)return safeReply(interaction,{content:"❌ No API key stored. Re run `/ytsetup` with `apikey:`.",ephemeral:true});
+      const threshold=parseInt(interaction.options.getString("threshold"));
+      await interaction.deferReply();
+      const stats=await getYouTubeStats(cfg.ytChannelId,apiKey);
+      if(!stats)return safeReply(interaction,{content:"❌ Could not fetch current sub count."});
+      const ch=interaction.guild.channels.cache.get(cfg.discordChannelId);
+      if(!ch)return safeReply(interaction,{content:"❌ Configured Discord channel not found. Re run `/ytsetup`."});
+      const rounded=Math.floor(stats.subs/threshold)*threshold;
+      const embedMsg=await ch.send({embeds:[{
+        title:`📊 ${stats.title}: Live Sub Count`,
+        description:`## ${fmtSubs(stats.subs)}\n*~${fmtSubs(rounded)} (rounded to nearest ${fmtSubs(threshold)})*`,
+        color:0xFF0000,footer:{text:"Updates every 5 minutes"},timestamp:new Date().toISOString(),
+      }]});
+      cfg.subcountDiscordId=cfg.discordChannelId;cfg.subcountMessageId=embedMsg.id;cfg.subcountThreshold=threshold;
+      saveData();
+      return safeReply(interaction,{content:`✅ Live sub count posted in <#${cfg.discordChannelId}>. Updates every 5 minutes, rounded to nearest **${fmtSubs(threshold)}**.`});
+    }
+
+    if(cmd==="milestones"){
+      if(!inGuild)return safeReply(interaction,{content:"Server only.",ephemeral:true});
+      const cfg=ytConfig.get(interaction.guildId);
+      if(!cfg?.ytChannelId)return safeReply(interaction,{content:"❌ No YouTube channel set up. Use `/ytsetup` first.",ephemeral:true});
+      const action=interaction.options.getString("action");
+      if(!cfg.milestones)cfg.milestones=[];
+      if(!cfg.milestoneDiscordId)cfg.milestoneDiscordId=cfg.discordChannelId;
+      if(action==="list"){
+        if(!cfg.milestones.length)return safeReply(interaction,{content:"No milestones set yet. Use `/milestones action:Add milestone subs:…`.",ephemeral:true});
+        const lines=cfg.milestones.map(m=>`${m.reached?"✅":"⏳"} **${fmtSubs(m.subs)} subs**${m.message?` - _${m.message}_`:""}`);
+        return safeReply(interaction,{content:`🏆 **Milestones for ${cfg.channelTitle||"your channel"}**\nAnnouncements → <#${cfg.milestoneDiscordId}>\n\n${lines.join("\n")}`,ephemeral:true});
+      }
+      const subs=interaction.options.getInteger("subs");
+      if(!subs)return safeReply(interaction,{content:"❌ Please provide a `subs` value.",ephemeral:true});
+      if(action==="add"){
+        if(cfg.milestones.find(m=>m.subs===subs))return safeReply(interaction,{content:`❌ A milestone at ${fmtSubs(subs)} already exists.`,ephemeral:true});
+        const message=interaction.options.getString("message")||null;
+        cfg.milestones.push({subs,message,reached:(cfg.lastSubs||0)>=subs});
+        cfg.milestones.sort((a,b)=>a.subs-b.subs);
+        saveData();
+        const addedNote=message?` - "${message}"`:"";
+        return safeReply(interaction,{content:`✅ Milestone added: **${fmtSubs(subs)} subs**${addedNote}`});
+      }
+      if(action==="remove"){
+        const before=cfg.milestones.length;
+        cfg.milestones=cfg.milestones.filter(m=>m.subs!==subs);
+        if(cfg.milestones.length===before)return safeReply(interaction,{content:`❌ No milestone found at ${fmtSubs(subs)}.`,ephemeral:true});
+        saveData();
+        return safeReply(interaction,{content:`✅ Milestone at **${fmtSubs(subs)}** removed.`});
+      }
+    }
+    if(cmd==="ticketsetup"){
+      try{
+        if(!inGuild)return safeReply(interaction,{content:"Server only.",ephemeral:true});
+        if(!isTicketAdmin(interaction))return safeReply(interaction,{content:"You need Manage Server permission to run this.",ephemeral:true});
+        return safeReply(interaction,buildTicketSetupStep(interaction.guild,interaction.guildId));
+      }catch(e){
+        console.error("[/ticketsetup]",e?.stack||e?.message);
+        return safeReply(interaction,{content:`❌ Ticket setup failed to start: \`${e?.message||e}\``,ephemeral:true});
+      }
+    }
+    if(cmd==="serverstats"){
+      if(!inGuild)return safeReply(interaction,{content:"Server only.",ephemeral:true});
+      return safeReply(interaction,{...ssBuildMainPanel(interaction.guild),ephemeral:true});
+    }
+    if(cmd==="closeticket"){
+      if(!inGuild)return safeReply(interaction,{content:"Server only.",ephemeral:true});
+      const ticket=openTickets.get(interaction.channelId);
+      if(!ticket)return safeReply(interaction,{content:"This is not a ticket channel.",ephemeral:true});
+      if(ticket.status==="closed")return safeReply(interaction,{content:"This ticket is already closed.",ephemeral:true});
+      const cfg=ticketConfigs.get(ticket.guildId);
+      const isStaff=isTicketStaff(cfg,interaction.member);
+      const canClose=ticket.userId===interaction.user.id||isStaff;
+      if(!canClose)return safeReply(interaction,{content:"You don't have permission to close this ticket.",ephemeral:true});
+      try{await interaction.channel.permissionOverwrites.edit(ticket.userId,{VIEW_CHANNEL:false,SEND_MESSAGES:false});}catch{}
+      ticket.status="closed";
+      ticket.closedBy=interaction.user.id;
+      ticket.closedAt=Date.now();
+      saveData();
+      const staffRow=buildTicketStaffRow();
+      return safeReply(interaction,{content:`🔒 **Ticket #${ticket.ticketId} closed** by <@${interaction.user.id}>.\n\n*<@${ticket.userId}> no longer has access.*\n**Staff:** Use the buttons below to reopen or permanently delete this ticket.`,components:[staffRow]});
+    }
+    if(cmd==="addtoticket"){
+      if(!inGuild)return safeReply(interaction,{content:"Server only.",ephemeral:true});
+      const ticket=openTickets.get(interaction.channelId);
+      if(!ticket)return safeReply(interaction,{content:"This is not a ticket channel.",ephemeral:true});
+      const cfg=ticketConfigs.get(ticket.guildId);
+      const canManage=isTicketStaff(cfg,interaction.member);
+      if(!canManage)return safeReply(interaction,{content:"Only support staff can add users to tickets.",ephemeral:true});
+      const target=interaction.options.getUser("user");
+      try{await interaction.channel.permissionOverwrites.edit(target.id,{VIEW_CHANNEL:true,SEND_MESSAGES:true,READ_MESSAGE_HISTORY:true});return safeReply(interaction,`✅ <@${target.id}> has been added to this ticket.`);}
+      catch(e){return safeReply(interaction,{content:`Failed to add user: ${e.message}`,ephemeral:true});}
+    }
+    if(cmd==="removefromticket"){
+      if(!inGuild)return safeReply(interaction,{content:"Server only.",ephemeral:true});
+      const ticket=openTickets.get(interaction.channelId);
+      if(!ticket)return safeReply(interaction,{content:"This is not a ticket channel.",ephemeral:true});
+      const cfg=ticketConfigs.get(ticket.guildId);
+      const canManage=isTicketStaff(cfg,interaction.member);
+      if(!canManage)return safeReply(interaction,{content:"Only support staff can remove users from tickets.",ephemeral:true});
+      const target=interaction.options.getUser("user");
+      if(target.id===ticket.userId)return safeReply(interaction,{content:"You can't remove the ticket owner.",ephemeral:true});
+      try{await interaction.channel.permissionOverwrites.edit(target.id,{VIEW_CHANNEL:false});return safeReply(interaction,`✅ <@${target.id}> has been removed from this ticket.`);}
+      catch(e){return safeReply(interaction,{content:`Failed to remove user: ${e.message}`,ephemeral:true});}
+    }
+    if(cmd==="invitecomp"){
+      if(inviteComps.has(interaction.guildId))return safeReply(interaction,{content:"⚠️ An invite competition is already running!",ephemeral:true});
+      const hours=interaction.options.getInteger("hours");
+      if(hours<1||hours>720)return safeReply(interaction,{content:"Hours must be 1–720.",ephemeral:true});
+      const baseline=await snapshotInvites(interaction.guild);
+      const endsAt=Date.now()+hours*3600000;
+      inviteComps.set(interaction.guildId,{endsAt,baseline:new Map(baseline),channelId:interaction.channelId});
+      const endTs=Math.floor(endsAt/1000);
+      await safeReply(interaction,`🏆 **Invite Competition Started!**\n⏳ Duration: **${hours} hour(s)**\n🔚 Ends: <t:${endTs}:R> (<t:${endTs}:f>)\n\nInvite people to win! Results posted here when it ends.`);
+      setTimeout(async()=>{
+        const comp=inviteComps.get(interaction.guildId);if(!comp)return;
+        inviteComps.delete(interaction.guildId);
+        const guild=client.guilds.cache.get(interaction.guildId);if(!guild)return;
+        const ch=guild.channels.cache.get(comp.channelId)||getGuildChannel(guild);if(!ch)return;
+        const allInvites=await guild.invites.fetch().catch(()=>null);
+        const gained=new Map();
+        if(allInvites){allInvites.forEach(inv=>{if(!inv.inviter)return;const base=comp.baseline.get(inv.code)||0;const diff=(inv.uses||0)-base;if(diff<=0)return;const id=inv.inviter.id;if(!gained.has(id))gained.set(id,{username:inv.inviter.username,count:0});gained.get(id).count+=diff;});}
+        const sorted=[...gained.entries()].sort((a,b)=>b[1].count-a[1].count);
+        if(!sorted.length){await safeSend(ch,"🏆 **Invite Competition Ended!**\n\nNo new tracked invites.");return;}
+        const medals=["🥇","🥈","🥉"],rewards=[CONFIG.invite_comp_1st,CONFIG.invite_comp_2nd,CONFIG.invite_comp_3rd];
+        const top=sorted.slice(0,3);
+        const lines=top.map(([id,d],i)=>`${medals[i]} <@${id}>: **${d.count}** invite${d.count!==1?"s":""} (+${rewards[i]} coins)`);
+        top.forEach(([id,d],i)=>{getScore(id,d.username).coins+=rewards[i];});
+        saveData();
+        await safeSend(ch,`🏆 **Invite Competition Ended!**\n\n${lines.join("\n")}`);
+      },hours*3600000);
+      return;
+    }
+    if(cmd==="library"){
+      if(!inGuild) return safeReply(interaction,{content:"Server only.",ephemeral:true});
+      const targetUser = interaction.options.getUser("user");
+      const targetScore = getScore(targetUser.id, targetUser.username);
+      const files = targetScore.uploadedImages || [];
+      if(!files.length)
+        return safeReply(interaction,{content:`📭 **${targetUser.username}** hasn't uploaded any images yet.`,ephemeral:true});
+      const pageArg = interaction.options.getInteger("page") ?? 1;
+      const idx = Math.max(0, Math.min(pageArg - 1, files.length - 1));
+      const fileName = files[idx];
+      const avatarUrl = targetUser.displayAvatarURL({ size:128, dynamic:true });
+      return safeReply(interaction,{
+        ...(await buildLibraryEmbed(targetUser.username, avatarUrl, fileName, idx, files.length)),
+        components: makeLibraryButtons(targetUser.id, idx, files.length, false),
+      });
+    }
+
+    if(cmd==="managememers"){
+      if(!OWNER_IDS.includes(interaction.user.id))
+        return safeReply(interaction,{content:"❌ Owner only.",ephemeral:true});
+      const action = interaction.options.getString("action");
+      const target = interaction.options.getUser("user")||null;
+
+      if(action==="list"){
+        const list = [...MEMERS].map(id=>`<@${id}>`).join("\n")||"*(none)*";
+        return safeReply(interaction,{content:`📋 **Upload allowlist (${MEMERS.size}):**\n${list}`,ephemeral:true});
+      }
+
+      if(!target)
+        return safeReply(interaction,{content:"❌ Provide a user for add/remove.",ephemeral:true});
+
+      if(action==="add"){
+        if(MEMERS.has(target.id))
+          return safeReply(interaction,{content:`ℹ️ <@${target.id}> is already in the allowlist.`,ephemeral:true});
+        MEMERS.add(target.id);
+        saveData();
+        return safeReply(interaction,{content:`✅ Added <@${target.id}> to the upload allowlist.`,ephemeral:true});
+      }
+
+      if(action==="remove"){
+        if(!MEMERS.has(target.id))
+          return safeReply(interaction,{content:`ℹ️ <@${target.id}> isn't in the allowlist.`,ephemeral:true});
+        MEMERS.delete(target.id);
+        saveData();
+        return safeReply(interaction,{content:`✅ Removed <@${target.id}> from the upload allowlist.`,ephemeral:true});
+      }
+
+      return safeReply(interaction,{content:"❌ Unknown action.",ephemeral:true});
+    }
+
+    // ── /dailyquote ────────────────────────────────────────────────────────────
+    if(cmd==="dailyquote"){
+      if(!inGuild) return safeReply(interaction,{content:"Server only.",ephemeral:true});
+      const action  = interaction.options.getString("action");
+      const channel = interaction.options.getChannel("channel")||null;
+      const hour    = interaction.options.getInteger("hour")??9;
+
+      if(action==="disable"){
+        dailyQuoteChannels.delete(interaction.guildId);
+        saveData();
+        return safeReply(interaction,{content:"🔇 Daily quote **disabled** for this server.",ephemeral:true});
+      }
+
+      if(action==="status"){
+        const cfg = dailyQuoteChannels.get(interaction.guildId);
+        if(!cfg) return safeReply(interaction,{content:"❌ No daily quote set up in this server. Use `/dailyquote action:Set channel` to enable it.",ephemeral:true});
+        return safeReply(interaction,{content:`📅 **Daily Quote Status**\n📢 Channel: <#${cfg.channelId}>\n🕐 Posts at: **${cfg.hour}:00 UTC** every day`,ephemeral:true});
+      }
+
+      if(!channel) return safeReply(interaction,{content:"❌ Please provide a `channel` when using Set channel.",ephemeral:true});
+      if(channel.type!=="GUILD_TEXT") return safeReply(interaction,{content:"❌ Please select a text channel.",ephemeral:true});
+      if(hour<0||hour>23) return safeReply(interaction,{content:"❌ Hour must be between 0 and 23 (UTC).",ephemeral:true});
+      const perms = channel.permissionsFor(interaction.guild.me);
+      if(!perms||!perms.has("SEND_MESSAGES")||!perms.has("ATTACH_FILES"))
+        return safeReply(interaction,{content:`❌ I don't have permission to send files in <#${channel.id}>.`,ephemeral:true});
+      dailyQuoteChannels.set(interaction.guildId,{channelId:channel.id, hour});
+      saveData();
+      return safeReply(interaction,{content:`✅ **Daily quote enabled!**\n📢 Channel: <#${channel.id}>\n🕐 Posts at: **${hour}:00 UTC** every day`,ephemeral:true});
+    }
+
+    // ── /quotemanage - owner only, subcommands: library | trash-threshold ──────
+    if(cmd==="quotemanage"){
+      if(!OWNER_IDS.includes(interaction.user.id))
+        return safeReply(interaction,{content:"❌ Owner only.",ephemeral:true});
+      const sub = interaction.options.getSubcommand();
+
+      // ── trash-threshold subcommand ─────────────────────────────────────────
+      if(sub==="trash-threshold"){
+        const amount = interaction.options.getInteger("amount");
+        if(amount<1||amount>25) return safeReply(interaction,{content:"❌ Amount must be between 1 and 25.",ephemeral:true});
+        trashcanThreshold = amount;
+        saveData();
+        return safeReply(interaction,{content:`✅ Trashcan reaction threshold set to **${amount}**. A quote needs **${amount}** 🗑️ reaction${amount!==1?"s":""} to be sent for review.`,ephemeral:true});
+      }
+
+      // ── set-review-channel subcommand ─────────────────────────────────────
+      if(sub==="set-review-channel"){
+        const ch = interaction.options.getChannel("channel");
+        if(ch.type!=="GUILD_TEXT") return safeReply(interaction,{content:"❌ Please select a text channel.",ephemeral:true});
+        reviewChannelId = ch.id;
+        saveData();
+        return safeReply(interaction,{content:`✅ Global quote review channel set to <#${ch.id}>. All \`/requestupload\` submissions will go there.`,ephemeral:true});
+      }
+
+      // ── set-delete-channel subcommand ─────────────────────────────────────
+      if(sub==="set-delete-channel"){
+        const ch = interaction.options.getChannel("channel");
+        if(ch.type!=="GUILD_TEXT") return safeReply(interaction,{content:"❌ Please select a text channel.",ephemeral:true});
+        deleterChannelId = ch.id;
+        saveData();
+        return safeReply(interaction,{content:`✅ Global quote deleter channel set to <#${ch.id}>. All 🗑️ flagged quotes will be sent there for owner review.`,ephemeral:true});
+      }
+
+      // ── library subcommand ────────────────────────────────────────────────
+      const action = interaction.options.getString("action");
+      if(action==="list"){ cmd="quotelist"; }
+      else if(action==="delete"){ cmd="quotedelete"; }
+      else {
+        await interaction.deferReply({ephemeral:true});
+        try {
+          const images = (await fetchAllQuoteFiles()).filter(f=>/\.(png|jpe?g|gif|webp)$/i.test(f.name));
+          if(!images.length) return safeReply(interaction,{content:"📭 No images in the quotes folders.",ephemeral:true});
+          const startIdx = Math.max(0, Math.min((interaction.options.getInteger("index")||1)-1, images.length-1));
+          const file = images[startIdx];
+          const imageUrl = quoteRawUrl(file.name, file.folder);
+          const navRow = new MessageActionRow().addComponents(
+            new MessageButton().setCustomId(`qm_prev_${startIdx}`).setLabel("◀ Prev").setStyle("SECONDARY").setDisabled(startIdx===0),
+            new MessageButton().setCustomId(`qm_next_${startIdx}_${images.length}`).setLabel("Next ▶").setStyle("SECONDARY").setDisabled(startIdx>=images.length-1),
+            new MessageButton().setCustomId(`qm_delete_${file.name}`).setLabel("🗑️ Delete This").setStyle("DANGER"),
+          );
+          return safeReply(interaction,{
+            content:`🖼️ **Quote Manager**: ${startIdx+1} of ${images.length}\n\`${file.name}\`\n${imageUrl}`,
+            components:[navRow],
+          });
+        } catch(e) {
+          console.error("quotemanage error:",e);
+          return safeReply(interaction,{content:"❌ Something went wrong.",ephemeral:true});
+        }
+      }
+    }
+
+    if(cmd==="quotelist"){
+      if(!OWNER_IDS.includes(interaction.user.id))
+        return safeReply(interaction,{content:"❌ Owner only.",ephemeral:true});
+      await interaction.deferReply({ephemeral:true});
+      try {
+        const images = (await fetchAllQuoteFiles()).filter(f => /\.(png|jpe?g|gif|webp)$/i.test(f.name));
+        if(!images.length) return safeReply(interaction,{content:"📭 No images in the quotes folders.",ephemeral:true});
+        const names = images.map((f,i) => `${i+1}. \`${f.name}\` _(${f.folder})_`);
+        const chunks = [];
+        let chunk = [];
+        for(const line of names){
+          if((chunk.join("\n").length + line.length + 1) > 1800){ chunks.push(chunk); chunk = []; }
+          chunk.push(line);
+        }
+        if(chunk.length) chunks.push(chunk);
+        await safeReply(interaction,{content:`🖼️ **Quotes: ${images.length} image${images.length!==1?"s":""} across quotes + quotes2:**\n${chunks[0].join("\n")}`,ephemeral:true});
+        for(let i=1;i<chunks.length;i++){
+          await interaction.followUp({content:chunks[i].join("\n"),ephemeral:true}).catch(()=>{});
+        }
+        return;
+      } catch(e) {
+        console.error("quotelist error:",e);
+        return safeReply(interaction,{content:"❌ Something went wrong fetching the quotes list.",ephemeral:true});
+      }
+    }
+
+    if(cmd==="quotedelete"){
+      if(!OWNER_IDS.includes(interaction.user.id))
+        return safeReply(interaction,{content:"❌ Owner only.",ephemeral:true});
+      const fileName = interaction.options.getString("filename").trim();
+      await interaction.deferReply({ephemeral:true});
+      try {
+        const ghPath = await resolveQuoteGhPath(fileName);
+        const checkRes = await fetch(`https://api.github.com/repos/${GH_REPO}/contents/${ghPath}`,{
+          headers:{"User-Agent":"RoyalBot","Authorization":`token ${GH_TOKEN}`,"Accept":"application/vnd.github+json"}
+        });
+        if(checkRes.status===404) return safeReply(interaction,{content:`❌ File \`${fileName}\` not found in either quotes folder.`,ephemeral:true});
+        if(!checkRes.ok) return safeReply(interaction,{content:`❌ GitHub API error (HTTP ${checkRes.status}).`,ephemeral:true});
+        const fileData = await checkRes.json();
+        const sha = fileData.sha;
+        if(!sha) return safeReply(interaction,{content:"❌ Couldn't retrieve file SHA for deletion.",ephemeral:true});
+        const delRes = await fetch(`https://api.github.com/repos/${GH_REPO}/contents/${ghPath}`,{
+          method:"DELETE",
+          headers:{"User-Agent":"RoyalBot","Authorization":`token ${GH_TOKEN}`,"Accept":"application/vnd.github+json","Content-Type":"application/json"},
+          body: JSON.stringify({ message:`chore: delete quote image ${fileName} via Discord`, sha })
+        });
+        if(!delRes.ok){
+          const err = await delRes.text();
+          console.error("quotedelete GitHub error:",err);
+          return safeReply(interaction,{content:`❌ GitHub delete failed (HTTP ${delRes.status}).`,ephemeral:true});
+        }
+        for(const [,s] of scores){
+          if(Array.isArray(s.uploadedImages) && s.uploadedImages.includes(fileName)){
+            s.uploadedImages = s.uploadedImages.filter(n=>n!==fileName);
+          }
+        }
+        saveData();
+        return safeReply(interaction,{content:`🗑️ \`${fileName}\` deleted (was in \`${ghPath.split("/")[0]}\`).`,ephemeral:true});
+      } catch(e) {
+        console.error("quotedelete error:",e);
+        return safeReply(interaction,{content:"❌ Something went wrong during deletion.",ephemeral:true});
+      }
+    }
+
+    // ── /jarvisdatabase: direct upload straight into the jarvis trigger folder ─
+    if(cmd==="jarvisdatabase"){
+      if(!MEMERS.has(interaction.user.id))
+        return safeReply(interaction,{content:"❌ You don't have permission to use /jarvisdatabase.",ephemeral:true});
+
+      const attachment = interaction.options.getAttachment("source");
+      const rawRename  = interaction.options.getString("name");
+
+      const mediaInfo = detectMediaKind(attachment.contentType, attachment.name);
+      if(!mediaInfo || mediaInfo.kind === "audio")
+        return safeReply(interaction,{content:"❌ Unsupported file type. Images, gifs, and videos only.",ephemeral:true});
+
+      const cleanName = rawRename.replace(/\.[a-zA-Z0-9]+$/,"").replace(/[^a-zA-Z0-9_-]/g,"_");
+      if(!cleanName)
+        return safeReply(interaction,{content:"❌ That name isn't valid: use letters, numbers, dashes, or underscores.",ephemeral:true});
+
+      await interaction.deferReply({ephemeral:true});
+
+      try {
+        const res = await fetch(attachment.url);
+        if(!res.ok) return safeReply(interaction,{content:"❌ Failed to download the attachment.",ephemeral:true});
+        const fileBuffer = Buffer.from(await res.arrayBuffer());
+
+        if(fileBuffer.length > 1000000)
+          return safeReply(interaction,{content:"❌ File is too large. GitHub's API only accepts files under 1 MB.",ephemeral:true});
+
+        const fileName = cleanName + "." + mediaInfo.ext;
+        const ghPath = JARVIS_FOLDER + "/" + fileName;
+        const encoded = fileBuffer.toString("base64");
+        const repo = GH_REPO;
+
+        const checkRes = await fetch("https://api.github.com/repos/" + repo + "/contents/" + ghPath, {
+          headers:{"User-Agent":"RoyalBot","Authorization":"token " + GH_TOKEN,"Accept":"application/vnd.github+json"}
+        });
+        let sha = null;
+        if(checkRes.ok){ const j=await checkRes.json(); sha=j.sha||null; }
+
+        const putRes = await fetch("https://api.github.com/repos/" + repo + "/contents/" + ghPath, {
+          method:"PUT",
+          headers:{
+            "User-Agent":"RoyalBot","Authorization":"token " + GH_TOKEN,
+            "Accept":"application/vnd.github+json","Content-Type":"application/json"
+          },
+          body: JSON.stringify({
+            message: "feat: add jarvis trigger " + fileName + " via Discord",
+            content: encoded,
+            sha: sha || undefined
+          })
+        });
+
+        if(!putRes.ok){
+          const err = await putRes.text();
+          console.error("Jarvis database upload failed:",err);
+          return safeReply(interaction,{content:"❌ GitHub upload failed (HTTP " + putRes.status + ").",ephemeral:true});
+        }
+
+        jarvisCacheFetchedAt = 0;
+        await getJarvisImages().catch(()=>{});
+
+        return safeReply(interaction,{content:"✅ `" + fileName + "` uploaded to `" + JARVIS_FOLDER + "`! Trigger word: `" + cleanName.toLowerCase() + "`",ephemeral:true});
+      } catch(e) {
+        console.error("jarvisdatabase error:",e);
+        return safeReply(interaction,{content:"❌ Something went wrong during upload.",ephemeral:true});
+      }
+    }
+
+    if(cmd==="upload"){
+      if(!MEMERS.has(interaction.user.id))
+        return safeReply(interaction,{content:"❌ You don't have permission to use /upload.",ephemeral:true});
+
+      const attachment = interaction.options.getAttachment("source")||null;
+      const link       = interaction.options.getString("link")||null;
+
+      if(!attachment && !link)
+        return safeReply(interaction,{content:"❌ Provide either a file (source) or a URL (link).",ephemeral:true});
+
+      await interaction.deferReply({ephemeral:true});
+
+      try {
+        let fileBuffer, mediaInfo, sourceUrl;
+
+        if(attachment){
+          mediaInfo = detectMediaKind(attachment.contentType, attachment.name);
+          if(!mediaInfo)
+            return safeReply(interaction,{content:"❌ Unsupported file type. Images, audio, and video files only.",ephemeral:true});
+          const res = await fetch(attachment.url);
+          if(!res.ok) return safeReply(interaction,{content:"❌ Failed to download the attachment.",ephemeral:true});
+          fileBuffer = Buffer.from(await res.arrayBuffer());
+          sourceUrl  = attachment.url;
+        } else {
+          let parsedUrl;
+          try { parsedUrl = new URL(link); } catch { return safeReply(interaction,{content:"❌ That doesn't look like a valid URL.",ephemeral:true}); }
+          if(!/^https?:/.test(parsedUrl.protocol)) return safeReply(interaction,{content:"❌ URL must be http or https.",ephemeral:true});
+          const res = await fetch(link);
+          if(!res.ok) return safeReply(interaction,{content:"❌ Couldn't fetch the file from that URL.",ephemeral:true});
+          const ct = res.headers.get("content-type")||"";
+          const pathParts = parsedUrl.pathname.split("/");
+          const linkName = pathParts[pathParts.length-1]||"";
+          mediaInfo = detectMediaKind(ct, linkName);
+          if(!mediaInfo)
+            return safeReply(interaction,{content:"❌ That URL doesn't point to a supported image, audio, or video file.",ephemeral:true});
+          fileBuffer = Buffer.from(await res.arrayBuffer());
+          sourceUrl  = link;
+        }
+
+        const overLimit = fileBuffer.length > 1_000_000;
+
+        if(mediaInfo.kind === "image" && overLimit){
+          return safeReply(interaction,{content:`❌ File is too large (${(fileBuffer.length/1024/1024).toFixed(1)} MB). GitHub's API only accepts images under 1 MB.`,ephemeral:true});
+        }
+
+        if(overLimit){
+          const num = nextUploadNumber(mediaInfo.prefix);
+          const fileName = `${mediaInfo.prefix}_${num}.${mediaInfo.ext}`;
+          return safeReply(interaction,{
+            content:`⚠️ \`${fileName}\` is ${(fileBuffer.length/1024/1024).toFixed(1)} MB: too large for \`quotes2\` (1 MB limit), so it wasn't saved there. Here it is instead:`,
+            files:[{attachment:fileBuffer, name:fileName}],
+            ephemeral:true
+          });
+        }
+
+        const num = nextUploadNumber(mediaInfo.prefix);
+        const fileName = `${mediaInfo.prefix}_${num}.${mediaInfo.ext}`;
+        const ghPath  = `quotes2/${fileName}`;
+        const encoded = fileBuffer.toString("base64");
+
+        const checkRes = await fetch(`https://api.github.com/repos/${GH_REPO}/contents/${ghPath}`,{
+          headers:{"User-Agent":"RoyalBot","Authorization":`token ${GH_TOKEN}`,"Accept":"application/vnd.github+json"}
+        });
+        let sha = null;
+        if(checkRes.ok){ const j=await checkRes.json(); sha=j.sha||null; }
+
+        const putRes = await fetch(`https://api.github.com/repos/${GH_REPO}/contents/${ghPath}`,{
+          method:"PUT",
+          headers:{
+            "User-Agent":"RoyalBot","Authorization":`token ${GH_TOKEN}`,
+            "Accept":"application/vnd.github+json","Content-Type":"application/json"
+          },
+          body: JSON.stringify({
+            message:`feat: upload ${mediaInfo.kind} ${fileName} via Discord`,
+            content: encoded,
+            ...(sha?{sha}:{})
+          })
+        });
+
+        if(!putRes.ok){
+          const err = await putRes.text();
+          console.error("GitHub upload failed:",err);
+          uploadCounters[mediaInfo.prefix] = Math.max(0,(uploadCounters[mediaInfo.prefix]||1)-1);
+          return safeReply(interaction,{content:`❌ GitHub upload failed (HTTP ${putRes.status}).`,ephemeral:true});
+        }
+        cacheQuoteFolder(fileName, "quotes2");
+
+        const s = getScore(interaction.user.id, interaction.user.username);
+        s.imagesUploaded = (s.imagesUploaded || 0) + 1;
+        if (!Array.isArray(s.uploadedImages)) s.uploadedImages = [];
+        if (!s.uploadedImages.includes(fileName)) s.uploadedImages.push(fileName);
+        saveData();
+        return safeReply(interaction,{content:`✅ \`${fileName}\` uploaded to \`quotes2\`!`,ephemeral:true});
+      } catch(e) {
+        console.error("upload error:",e);
+        return safeReply(interaction,{content:"❌ Something went wrong during upload.",ephemeral:true});
+      }
+    }
+
+    if(cmd==="activity-check"){
+      if(!inGuild) return safeReply(interaction,{content:"Server only.",ephemeral:true});
+      const hasPerms = OWNER_IDS.includes(interaction.user.id)||interaction.member.permissions.has("MANAGE_GUILD");
+      if(!hasPerms) return safeReply(interaction,{content:"❌ You need Manage Server permission.",ephemeral:true});
+
+      const channel    = interaction.options.getChannel("channel");
+      const deadlineHr = interaction.options.getInteger("deadline")??24;
+      const customMsg  = interaction.options.getString("message")||null;
+      const doPing     = interaction.options.getBoolean("ping")??true;
+      const scheduleStr= interaction.options.getString("schedule")||null;
+
+      const parsedSchedule = scheduleStr ? parseSchedule(scheduleStr) : null;
+      if (scheduleStr && !parsedSchedule) {
+        return safeReply(interaction,{content:"❌ Couldn't parse that schedule. Use a format like `Monday 09:00` or `Wed 14:30` (UTC).",ephemeral:true});
+      }
+
+      const cfg = raConfig.get(interaction.guildId)||{};
+      const excludedByDefault = new Set([cfg.raRoleId, cfg.loaRoleId].filter(Boolean));
+      const allRoles = [...interaction.guild.roles.cache.values()]
+        .filter(r => r.id !== interaction.guild.id && !r.managed)
+        .sort((a,b) => b.position - a.position)
+        .slice(0, 25);
+
+      if(!allRoles.length) return safeReply(interaction,{content:"❌ No assignable roles found in this server.",ephemeral:true});
+
+      const makeOptions = (selectedIds=[]) => allRoles.map(r => ({
+        label: r.name.slice(0,25),
+        value: r.id,
+        default: selectedIds.includes(r.id),
+      }));
+
+      const requiredMenu = new MessageActionRow().addComponents(
+        new MessageSelectMenu()
+          .setCustomId(`ac_required_${channel.id}_${deadlineHr}_${doPing}`)
+          .setPlaceholder("Select required roles (staff who must check in)")
+          .setMinValues(1).setMaxValues(Math.min(allRoles.length,25))
+          .addOptions(makeOptions())
+      );
+      const excludedMenu = new MessageActionRow().addComponents(
+        new MessageSelectMenu()
+          .setCustomId(`ac_excluded_${channel.id}_${deadlineHr}_${doPing}`)
+          .setPlaceholder("Select excluded roles (optional: RA/LOA autoexcluded)")
+          .setMinValues(0).setMaxValues(Math.min(allRoles.length,25))
+          .addOptions(makeOptions([...excludedByDefault]))
+      );
+      const msgLine = customMsg ? `\n📝 Message: *${customMsg}*` : "";
+      const schedLine = parsedSchedule ? `\n🕐 Schedule: **${scheduleStr}** (UTC, weekly)` : "";
+      await safeReply(interaction,{
+        content:`📋 **Activity Check Setup**\nChannel: ${channel}\nDeadline: **${deadlineHr}h**${msgLine}${schedLine}\n\nSelect the roles below, then click **Send Check** once both dropdowns are set.`,
+        components:[requiredMenu, excludedMenu],
+        ephemeral:true
+      });
+      if(!interaction.client._acPending) interaction.client._acPending = new Map();
+      interaction.client._acPending.set(interaction.user.id, { channel, deadlineHr, customMsg, doPing, requiredIds:[], excludedIds:[...excludedByDefault], parsedSchedule, scheduleStr });
+      return;
+    }
+
+    if(cmd==="raconfig"){
+      if(!inGuild) return safeReply(interaction,{content:"Server only.",ephemeral:true});
+      const hasPerms = OWNER_IDS.includes(interaction.user.id)||interaction.member.permissions.has("MANAGE_GUILD");
+      if(!hasPerms) return safeReply(interaction,{content:"❌ You need Manage Server permission.",ephemeral:true});
+      const action = interaction.options.getString("action");
+      const roleArg = interaction.options.getRole("role")||null;
+      const cfg = raConfig.get(interaction.guildId)||{};
+
+      if(action==="view"){
+        const raRole  = cfg.raRoleId  ? interaction.guild.roles.cache.get(cfg.raRoleId)  : null;
+        const loaRole = cfg.loaRoleId ? interaction.guild.roles.cache.get(cfg.loaRoleId) : null;
+        return safeReply(interaction,{content:[
+          `📋 **RA/LOA Config for ${interaction.guild.name}**`,
+          `🟡 Reduced Activity role: ${raRole?`<@&${raRole.id}> (${raRole.name})`:"Not set"}`,
+          `🔴 LOA role: ${loaRole?`<@&${loaRole.id}> (${loaRole.name})`:"Not set"}`,
+        ].join("\n"),ephemeral:true});
+      }
+
+      if(action==="create"){
+        await interaction.deferReply({ephemeral:true});
+        try {
+          const raRole  = await interaction.guild.roles.create({name:"Reduced Activity",color:"Yellow",reason:"RoyalBot RA/LOA setup"});
+          const loaRole = await interaction.guild.roles.create({name:"LOA",color:"Red",reason:"RoyalBot RA/LOA setup"});
+          raConfig.set(interaction.guildId,{raRoleId:raRole.id,loaRoleId:loaRole.id});
+          saveData();
+          return safeReply(interaction,{content:`✅ Created <@&${raRole.id}> and <@&${loaRole.id}>. All set!`,ephemeral:true});
+        } catch(e) {
+          return safeReply(interaction,{content:`❌ Failed to create roles: ${e.message}`,ephemeral:true});
+        }
+      }
+
+      if(action==="set_ra"){
+        if(!roleArg) return safeReply(interaction,{content:"❌ Provide a role.",ephemeral:true});
+        cfg.raRoleId = roleArg.id;
+        raConfig.set(interaction.guildId,cfg);
+        saveData();
+        return safeReply(interaction,{content:`✅ Reduced Activity role set to <@&${roleArg.id}>.`,ephemeral:true});
+      }
+
+      if(action==="set_loa"){
+        if(!roleArg) return safeReply(interaction,{content:"❌ Provide a role.",ephemeral:true});
+        cfg.loaRoleId = roleArg.id;
+        raConfig.set(interaction.guildId,cfg);
+        saveData();
+        return safeReply(interaction,{content:`✅ LOA role set to <@&${roleArg.id}>.`,ephemeral:true});
+      }
+
+      return safeReply(interaction,{content:"❌ Unknown action.",ephemeral:true});
+    }
+
+    if(cmd==="staffrole"){
+      const roleType = interaction.options.getString("type");
+      cmd = roleType === "ra" ? "reduced-activity" : "loa";
+    }
+    if(cmd==="reduced-activity"||cmd==="loa"){
+      if(!inGuild) return safeReply(interaction,{content:"Server only.",ephemeral:true});
+      const hasPerms = OWNER_IDS.includes(interaction.user.id)||interaction.member.permissions.has("MANAGE_ROLES");
+      if(!hasPerms) return safeReply(interaction,{content:"❌ You need Manage Roles permission.",ephemeral:true});
+
+      const cfg = raConfig.get(interaction.guildId)||{};
+      const isRA = cmd==="reduced-activity";
+      const roleId = isRA ? cfg.raRoleId : cfg.loaRoleId;
+      const roleLabel = isRA ? "Reduced Activity" : "LOA";
+      if(!roleId) return safeReply(interaction,{content:`❌ The ${roleLabel} role hasn't been set up. Run \`/raconfig\` first.`,ephemeral:true});
+
+      const role = interaction.guild.roles.cache.get(roleId);
+      if(!role) return safeReply(interaction,{content:`❌ The configured ${roleLabel} role no longer exists. Run \`/raconfig\` to set it again.`,ephemeral:true});
+
+      const target   = interaction.options.getUser("user");
+      const action   = interaction.options.getString("action");
+      const duration = interaction.options.getInteger("duration")||null;
+
+      const member = await interaction.guild.members.fetch(target.id).catch(()=>null);
+      if(!member) return safeReply(interaction,{content:"❌ Couldn't find that member.",ephemeral:true});
+
+      const timerKey = `${interaction.guildId}:${target.id}:${cmd}`;
+
+      if(action==="give"){
+        try { await member.roles.add(role); } catch(e) { return safeReply(interaction,{content:`❌ Failed to add role: ${e.message}`,ephemeral:true}); }
+        if(raTimers.has(timerKey)){ clearTimeout(raTimers.get(timerKey)); raTimers.delete(timerKey); }
+        let reply = `✅ Gave <@&${roleId}> to <@${target.id}>.`;
+        if(duration){
+          const ms = duration*3600000;
+          const t = setTimeout(async()=>{
+            raTimers.delete(timerKey);
+            const m = await interaction.guild.members.fetch(target.id).catch(()=>null);
+            if(m) await m.roles.remove(roleId).catch(()=>{});
+          }, ms);
+          raTimers.set(timerKey, t);
+          reply += ` Role will be removed automatically <t:${Math.floor((Date.now()+ms)/1000)}:R>.`;
+        }
+        return safeReply(interaction,{content:reply,ephemeral:true});
+      }
+
+      if(action==="remove"){
+        if(raTimers.has(timerKey)){ clearTimeout(raTimers.get(timerKey)); raTimers.delete(timerKey); }
+        try { await member.roles.remove(role); } catch(e) { return safeReply(interaction,{content:`❌ Failed to remove role: ${e.message}`,ephemeral:true}); }
+        return safeReply(interaction,{content:`✅ Removed <@&${roleId}> from <@${target.id}>.`,ephemeral:true});
+      }
+
+      return safeReply(interaction,{content:"❌ Unknown action.",ephemeral:true});
+    }
+
+    // ── /deleter: owner sets the flagged quote review channel ───────────────
+    if(cmd==="deleter"||((cmd==="quotemanage")&&interaction.options.getSubcommand(false)==="set-delete-channel")){
+      if(!OWNER_IDS.includes(interaction.user.id))
+        return safeReply(interaction,{content:"❌ Owner only.",ephemeral:true});
+      const ch = interaction.options.getChannel("channel");
+      if(ch.type!=="GUILD_TEXT") return safeReply(interaction,{content:"❌ Please select a text channel.",ephemeral:true});
+      deleterChannelId = ch.id;
+      saveData();
+      return safeReply(interaction,{content:`✅ Global quote deleter channel set to <#${ch.id}>. All 🗑️ flagged quotes will be sent there for owner review.`,ephemeral:true});
+    }
+
+    // ── Server specific quotes: /quotesetup and the server owner commands ────
+    if(cmd==="quotesetup"){
+      const qsGid = interaction.guildId;
+      const qsToken = `${qsGid.slice(0,4)}${Date.now().toString(36)}`;
+      const qsExisting = quoteGuildConfigs.get(qsGid);
+      const qsPrefill = qsExisting && qsExisting.mode==="server" ? qsExisting : null;
+      quoteSetupBuilders.set(qsToken, {
+        ownerId: interaction.user.id,
+        guildId: qsGid,
+        step: "request",
+        requestChannelId: qsPrefill ? qsPrefill.requestChannelId : null,
+        deleteChannelId: qsPrefill ? qsPrefill.deleteChannelId : null,
+        folder: qsPrefill ? qsPrefill.folder : null,
+        createdChannels: qsPrefill ? !!qsPrefill.createdChannels : false,
+      });
+      setTimeout(() => quoteSetupBuilders.delete(qsToken), 30 * 60 * 1000);
+      const qsScopeRow = new MessageActionRow().addComponents(
+        new MessageButton().setCustomId(`qs_global_${qsToken}`).setLabel(QS_TEXT.globalButton).setStyle("PRIMARY"),
+        new MessageButton().setCustomId(`qs_server_${qsToken}`).setLabel(QS_TEXT.serverButton).setStyle("SECONDARY"),
+      );
+      return safeReply(interaction,{content:QS_TEXT.askScope,components:[qsScopeRow],ephemeral:true});
+    }
+
+    if(cmd==="requestedquotes"||cmd==="deletedquotes"){
+      const qsCh = interaction.options.getChannel("channel");
+      if(!qsCh || qsCh.type!=="GUILD_TEXT") return safeReply(interaction,{content:QS_TEXT.textChannelOnly,ephemeral:true});
+      const qsCfg = quoteGuildConfigs.get(interaction.guildId);
+      if(!qsCfg || qsCfg.mode!=="server" || !qsCfg.folder) return safeReply(interaction,{content:QS_TEXT.needServerSetup,ephemeral:true});
+      if(cmd==="requestedquotes") qsCfg.requestChannelId = qsCh.id; else qsCfg.deleteChannelId = qsCh.id;
+      qsCfg.createdChannels = false;
+      saveData();
+      return safeReply(interaction,{content: cmd==="requestedquotes" ? QS_TEXT.requestSet(qsCh.id) : QS_TEXT.deleteSet(qsCh.id),ephemeral:true});
+    }
+
+    if(cmd==="globaltoggle"){
+      const qsCfg = quoteGuildConfigs.get(interaction.guildId);
+      if(!qsCfg || qsCfg.mode!=="server" || !qsCfg.folder) return safeReply(interaction,{content:QS_TEXT.needServerSetup,ephemeral:true});
+      qsCfg.globalToggled = !qsCfg.globalToggled;
+      saveData();
+      return safeReply(interaction,{content: qsCfg.globalToggled ? QS_TEXT.toggledGlobal : QS_TEXT.toggledServer,ephemeral:true});
+    }
+
+    if(cmd==="quotemoderator"){
+      const qsTarget = interaction.options.getUser("user");
+      if(!qsTarget) return safeReply(interaction,{content:QS_TEXT.textChannelOnly,ephemeral:true});
+      if(qsTarget.bot) return safeReply(interaction,{content:QS_TEXT.modBot,ephemeral:true});
+      const qsCfg = getOrCreateQuoteConfig(interaction.guildId);
+      const qsIdx = qsCfg.moderators.indexOf(qsTarget.id);
+      const qsGrant = qsIdx < 0;
+      if(qsGrant) qsCfg.moderators.push(qsTarget.id); else qsCfg.moderators.splice(qsIdx, 1);
+      saveData();
+      const qsSent = await safeReply(interaction,{content: qsGrant ? QS_TEXT.modAdded(qsTarget.id) : QS_TEXT.modRemoved(qsTarget.id),ephemeral:true});
+      await syncQuoteModeratorAccess(interaction.guild, qsCfg, qsTarget.id, qsGrant);
+      return qsSent;
+    }
+
+    if(cmd==="sotd"){
+      if(!inGuild) return safeReply(interaction,{content:"❌ Server only.",ephemeral:true});
+      if(!isGuildOwner(interaction.guildId, interaction.user.id)) return safeReply(interaction,{content:"❌ Server owner only.",ephemeral:true});
+      return safeReply(interaction, buildSotdSetupStep(interaction.guild, interaction.guildId));
+    }
+
+    if(cmd==="sotd-playlist"){
+      if(!inGuild) return safeReply(interaction,{content:"❌ Server only.",ephemeral:true});
+      if(!isGuildOwner(interaction.guildId, interaction.user.id)) return safeReply(interaction,{content:"❌ Server owner only.",ephemeral:true});
+      const cfg = sotdConfig.get(interaction.guildId);
+      const panel = buildSotdPlaylistPanel(interaction.guild, interaction.guildId);
+      if(cfg?.playlists?.length){
+        await interaction.deferReply({ephemeral:true});
+        const preview = await buildSotdPreviewEmbed(interaction.guild, cfg).catch(()=>null);
+        if(preview) panel.embeds.push(preview);
+      }
+      return safeReply(interaction, panel);
+    }
+
+    if(cmd==="gifquality"){
+      const lastUse = gifqCooldown.get(interaction.user.id) || 0;
+      if(Date.now() - lastUse < 10_000) return safeReply(interaction,{content:"⏳ Give it a few seconds between conversions.",ephemeral:true});
+      const file = interaction.options.getAttachment("file");
+      const isVideo = /\.(mp4|mov|webm|mkv)$/i.test(file.name||"") || (file.contentType||"").startsWith("video/");
+      const isGif = /\.gif$/i.test(file.name||"") || file.contentType === "image/gif";
+      if(!isVideo && !isGif) return safeReply(interaction,{content:"❌ That doesn't look like an mp4 or a gif.",ephemeral:true});
+      gifqCooldown.set(interaction.user.id, Date.now());
+      await interaction.deferReply({ephemeral:true});
+      let workDir;
+      try{
+        workDir = fs.mkdtempSync(path.join(os.tmpdir(), "gifq-"));
+        const srcPath = path.join(workDir, (file.name||"input").replace(/[^a-zA-Z0-9_.-]/g,"_"));
+        const dlRes = await fetch(file.url);
+        if(!dlRes.ok){ try{fs.rmSync(workDir,{recursive:true,force:true});}catch{} return safeReply(interaction,{content:"❌ Couldn't download that file.",ephemeral:true}); }
+        fs.writeFileSync(srcPath, Buffer.from(await dlRes.arrayBuffer()));
+        const info = await probeVideoInfo(srcPath);
+        if(!info){ try{fs.rmSync(workDir,{recursive:true,force:true});}catch{} return safeReply(interaction,{content:"❌ Couldn't read that file.",ephemeral:true}); }
+        const token = `${interaction.user.id.slice(-6)}${Date.now().toString(36)}`;
+        gifqJobs.set(token, { srcPath, workDir, name:file.name||"file", width:info.width, height:info.height, fps:info.fps, ownerId:interaction.user.id, scalePct:null, targetFps:null });
+        setTimeout(() => cleanupGifqJob(token), 15*60*1000);
+        return safeReply(interaction, buildGifQualityPanel(token));
+      }catch(e){
+        if(workDir) try{fs.rmSync(workDir,{recursive:true,force:true});}catch{}
+        return safeReply(interaction,{content:`❌ ${e.message}`,ephemeral:true});
+      }
+    }
+
+    if(cmd==="bansync"){
+      if(!inGuild) return safeReply(interaction,{content:"❌ Server only.",ephemeral:true});
+      if(!isGuildOwner(interaction.guildId, interaction.user.id)) return safeReply(interaction,{content:"❌ Server owner only.",ephemeral:true});
+      const myId = interaction.guildId;
+      const action = interaction.options.getString("action");
+      const otherId = (interaction.options.getString("server_id") || "").trim();
+      const mine = banSyncLinks.get(myId) || [];
+      const nameOf = id => client.guilds.cache.get(id)?.name || "unknown server";
+
+      if(action==="status"){
+        const lines = mine.map(id => `${isBanSyncActive(myId,id) ? "🟢 Syncing with" : "🟡 Waiting on"} **${nameOf(id)}** (\`${id}\`)`);
+        for(const [gid, list] of banSyncLinks){
+          if(gid !== myId && list.includes(myId) && !mine.includes(gid))
+            lines.push(`📨 **${nameOf(gid)}** (\`${gid}\`) wants to sync with you. Accept with \`/bansync action:Link server_id:${gid}\``);
+        }
+        return safeReply(interaction,{content: lines.length ? `🔗 **Ban sync**\n${lines.join("\n")}` : "No ban sync links yet. Start one with `/bansync action:Link server_id:<other server ID>`.", ephemeral:true});
+      }
+
+      if(!/^\d{15,22}$/.test(otherId)) return safeReply(interaction,{content:"❌ Give the other server's ID in `server_id`.",ephemeral:true});
+      if(otherId === myId) return safeReply(interaction,{content:"❌ A server can't sync with itself.",ephemeral:true});
+
+      if(action==="unlink"){
+        if(!mine.includes(otherId)) return safeReply(interaction,{content:"❌ You aren't linked to that server.",ephemeral:true});
+        banSyncLinks.set(myId, mine.filter(id => id !== otherId));
+        saveData();
+        return safeReply(interaction,{content:`🔓 Stopped syncing bans with **${nameOf(otherId)}**. Bans already carried over stay as they are.`,ephemeral:true});
+      }
+
+      const other = client.guilds.cache.get(otherId);
+      if(!other) return safeReply(interaction,{content:"❌ I'm not in that server, so I can't sync with it.",ephemeral:true});
+
+      if(action==="link"){
+        if(!mine.includes(otherId)){ mine.push(otherId); banSyncLinks.set(myId, mine); saveData(); }
+        if(!isBanSyncActive(myId, otherId))
+          return safeReply(interaction,{content:`🟡 Request saved. The owner of **${other.name}** needs to run \`/bansync action:Link server_id:${myId}\` there to switch it on.`,ephemeral:true});
+      } else if(!isBanSyncActive(myId, otherId)){
+        return safeReply(interaction,{content:"❌ That link isn't active yet. Both servers need to run Link first.",ephemeral:true});
+      }
+
+      const lacking = [interaction.guild, other].filter(g => !g.members.me?.permissions.has("BAN_MEMBERS")).map(g => g.name);
+      if(lacking.length) return safeReply(interaction,{content:`❌ I need the Ban Members permission in: ${lacking.join(", ")}`,ephemeral:true});
+      const pairKey = [myId, otherId].sort().join(":");
+      if(banSyncRunning.has(pairKey)) return safeReply(interaction,{content:"⏳ A sync between those two servers is already running.",ephemeral:true});
+
+      banSyncRunning.add(pairKey);
+      await interaction.deferReply({ephemeral:true});
+      try{
+        const r = await runBanSync(interaction.guild, other);
+        return safeReply(interaction,{content:`✅ ${action==="link" ? `Linked with **${other.name}**. ` : ""}Banned **${r.done}** of ${r.total} missing, **${r.failed}** failed.${action==="link" ? " New bans and unbans now carry over automatically." : ""}`,ephemeral:true});
+      }catch(e){
+        return safeReply(interaction,{content:`❌ Sync failed: ${e.message}`,ephemeral:true});
+      }finally{
+        banSyncRunning.delete(pairKey);
+      }
+    }
+
+    if(cmd==="extrachannels"){
+      if(!inGuild) return safeReply(interaction,{content:"❌ Server only.",ephemeral:true});
+      const memberRole = interaction.options.getRole("member_role");
+      const extraRole = interaction.options.getRole("extra_role");
+      const cfg = extraChannelsConfig.get(interaction.guildId) || { memberRoleId:null, extraRoleId:null };
+
+      if(memberRole || extraRole){
+        if(memberRole) cfg.memberRoleId = memberRole.id;
+        if(extraRole) cfg.extraRoleId = extraRole.id;
+        extraChannelsConfig.set(interaction.guildId, cfg);
+        saveData();
+        return safeReply(interaction,{content:`✅ Saved.\nMember role: ${cfg.memberRoleId ? `<@&${cfg.memberRoleId}>` : "not set"}\nExtra channels role: ${cfg.extraRoleId ? `<@&${cfg.extraRoleId}>` : "not set"}`,ephemeral:true,allowedMentions:{parse:[]}});
+      }
+
+      if(!cfg.memberRoleId || !cfg.extraRoleId) return safeReply(interaction,{content:"❌ Set both roles first with `/extrachannels member_role:… extra_role:…`.",ephemeral:true});
+      if(cfg.memberRoleId === cfg.extraRoleId) return safeReply(interaction,{content:"❌ The member role and the Extra channels role have to be different roles.",ephemeral:true});
+      const memberR = interaction.guild.roles.cache.get(cfg.memberRoleId);
+      const extraR = interaction.guild.roles.cache.get(cfg.extraRoleId);
+      if(!memberR || !extraR) return safeReply(interaction,{content:"❌ One of the saved roles no longer exists. Set them again.",ephemeral:true});
+      const ch = interaction.channel;
+      if(!ch?.permissionOverwrites) return safeReply(interaction,{content:"❌ Run this in a regular server channel, not a thread.",ephemeral:true});
+      if(!ch.permissionsFor(interaction.guild.members.me)?.has("MANAGE_ROLES")) return safeReply(interaction,{content:"❌ I need the Manage Permissions permission in this channel.",ephemeral:true});
+
+      try{
+        const reason = `/extrachannels by ${interaction.user.tag}`;
+        await Promise.all([
+          ch.permissionOverwrites.edit(extraR, { VIEW_CHANNEL:true }, { reason }),
+          ch.permissionOverwrites.edit(memberR, { VIEW_CHANNEL:false }, { reason }),
+        ]);
+      }catch(e){
+        return safeReply(interaction,{content:`❌ Couldn't change the permissions: ${e.message}`,ephemeral:true});
+      }
+      return safeReply(interaction,{content:`✅ <#${ch.id}> is now an extra channel. <@&${extraR.id}> can see it and <@&${memberR.id}> can't.`,ephemeral:true,allowedMentions:{parse:[]}});
+    }
+
+    if(cmd==="announcementsync"){
+      if(!OWNER_IDS.includes(interaction.user.id)) return safeReply(interaction,{content:"❌ Owner only.",ephemeral:true});
+      const sub = interaction.options.getSubcommand();
+      const SYNCABLE = ["GUILD_TEXT","GUILD_NEWS"];
+      const chName = id => { const c = client.channels.cache.get(id); return c?.guild ? `**${c.guild.name}** #${c.name}` : `unknown channel (\`${id}\`)`; };
+      const roleName = id => { const g = client.guilds.cache.find(x => x.roles.cache.has(id)); return g ? `**${g.name}** @${g.roles.cache.get(id).name}` : `unknown role (\`${id}\`)`; };
+
+      if(sub==="status"){
+        const lines = [];
+        for(const [a, b] of announcementSyncChannels) if(a < b) lines.push(`📢 ${chName(a)} ↔ ${chName(b)}`);
+        for(const [a, b] of announcementSyncRoles) if(a < b) lines.push(`🏷️ ${roleName(a)} ↔ ${roleName(b)}`);
+        return safeReply(interaction,{content: lines.length ? `🔗 **Announcement sync**\n${lines.join("\n")}` : "Nothing is synced yet.", ephemeral:true});
+      }
+      if(!inGuild) return safeReply(interaction,{content:"❌ Run this inside a server.",ephemeral:true});
+
+      if(sub==="channels"){
+        const hereOpt = interaction.options.getChannel("channel");
+        const here = interaction.guild.channels.cache.get(hereOpt.id);
+        const other = client.channels.cache.get(interaction.options.getString("other_channel_id").trim());
+        if(!here || !SYNCABLE.includes(here.type)) return safeReply(interaction,{content:"❌ Pick a text or announcement channel.",ephemeral:true});
+        if(!other?.guild || !SYNCABLE.includes(other.type)) return safeReply(interaction,{content:"❌ I can't see a text channel with that ID. I need to be in that server.",ephemeral:true});
+        if(other.id === here.id) return safeReply(interaction,{content:"❌ That's the same channel.",ephemeral:true});
+        if(announcementSyncChannels.has(here.id) || announcementSyncChannels.has(other.id)) return safeReply(interaction,{content:"❌ One of those channels is already synced. Remove it first.",ephemeral:true});
+        const lacking = [here, other].filter(c => !c.permissionsFor(c.guild.members.me)?.has(["VIEW_CHANNEL","SEND_MESSAGES","MANAGE_WEBHOOKS"])).map(c => `#${c.name} (${c.guild.name})`);
+        if(lacking.length) return safeReply(interaction,{content:`❌ I need View Channel, Send Messages and Manage Webhooks in: ${lacking.join(", ")}`,ephemeral:true});
+        announcementSyncChannels.set(here.id, other.id);
+        announcementSyncChannels.set(other.id, here.id);
+        saveData();
+        return safeReply(interaction,{content:`✅ Synced ${chName(here.id)} ↔ ${chName(other.id)}. Messages now carry over both ways.`,ephemeral:true});
+      }
+
+      if(sub==="roles"){
+        const hereRole = interaction.options.getRole("role");
+        const otherId = interaction.options.getString("other_role_id").trim();
+        const otherGuild = client.guilds.cache.find(g => g.roles.cache.has(otherId));
+        const otherRole = otherGuild?.roles.cache.get(otherId);
+        if(!otherRole) return safeReply(interaction,{content:"❌ I can't find a role with that ID in any server I'm in.",ephemeral:true});
+        if(otherRole.id === hereRole.id) return safeReply(interaction,{content:"❌ That's the same role.",ephemeral:true});
+        if(announcementSyncRoles.has(hereRole.id) || announcementSyncRoles.has(otherRole.id)) return safeReply(interaction,{content:"❌ One of those roles is already synced. Remove it first.",ephemeral:true});
+        announcementSyncRoles.set(hereRole.id, otherRole.id);
+        announcementSyncRoles.set(otherRole.id, hereRole.id);
+        saveData();
+        return safeReply(interaction,{content:`✅ Synced ${roleName(hereRole.id)} ↔ ${roleName(otherRole.id)}. Pinging one in a synced channel pings the other.`,ephemeral:true});
+      }
+
+      if(sub==="remove"){
+        const ch = interaction.options.getChannel("channel");
+        const role = interaction.options.getRole("role");
+        if(!ch && !role) return safeReply(interaction,{content:"❌ Pick a channel or a role to remove.",ephemeral:true});
+        const removed = [];
+        if(ch){
+          const partner = announcementSyncChannels.get(ch.id);
+          if(partner){ announcementSyncChannels.delete(ch.id); announcementSyncChannels.delete(partner); removed.push("the channel sync"); }
+        }
+        if(role){
+          const partner = announcementSyncRoles.get(role.id);
+          if(partner){ announcementSyncRoles.delete(role.id); announcementSyncRoles.delete(partner); removed.push("the role sync"); }
+        }
+        if(!removed.length) return safeReply(interaction,{content:"❌ Nothing synced there.",ephemeral:true});
+        saveData();
+        return safeReply(interaction,{content:`🔓 Removed ${removed.join(" and ")}.`,ephemeral:true});
+      }
+    }
+
+    if(cmd==="limitedrole"){
+      if(!inGuild) return safeReply(interaction,{content:"❌ Server only.",ephemeral:true});
+      const roleOpt = interaction.options.getRole("role");
+      const amount = interaction.options.getInteger("amount");
+      const role = interaction.guild.roles.cache.get(roleOpt.id);
+      if(!role || role.id === interaction.guildId || role.managed) return safeReply(interaction,{content:"❌ That role can't be limited.",ephemeral:true});
+      if(!role.editable) return safeReply(interaction,{content:"❌ I can't manage that role. Give me Manage Roles and move my role above it.",ephemeral:true});
+      await interaction.deferReply({ephemeral:true});
+      const members = await interaction.guild.members.fetch().catch(() => null);
+      const holders = members ? members.filter(m => m.roles.cache.has(role.id)).size : null;
+      const limits = limitedRoles.get(interaction.guildId) || {};
+      limits[role.id] = amount;
+      limitedRoles.set(interaction.guildId, limits);
+      saveData();
+      const note = holders === null ? "" : ` ${holders} ${holders === 1 ? "person has" : "people have"} it right now.${holders > amount ? " That's over the limit, so nobody new can get it until it drops." : ""}`;
+      return safeReply(interaction,{content:`✅ <@&${role.id}> is now limited to ${amount} at once.${note}`,ephemeral:true,allowedMentions:{parse:[]}});
+    }
+
+    if(cmd==="pass"){
+      if(!inGuild) return safeReply(interaction,{content:"❌ Server only.",ephemeral:true});
+      const limits = limitedRoles.get(interaction.guildId) || {};
+      const invoker = await interaction.guild.members.fetch(interaction.user.id).catch(() => null);
+      const held = invoker ? Object.keys(limits).filter(id => invoker.roles.cache.has(id)) : [];
+      if(!held.length) return safeReply(interaction,{content:"❌ You don't hold a limited role.",ephemeral:true});
+      const picked = interaction.options.getRole("role");
+      let roleId;
+      if(picked){
+        if(!held.includes(picked.id)) return safeReply(interaction,{content:"❌ You don't hold that limited role.",ephemeral:true});
+        roleId = picked.id;
+      } else if(held.length === 1){
+        roleId = held[0];
+      } else {
+        return safeReply(interaction,{content:`❌ You hold more than one limited role, pick one with the role option: ${held.map(id => interaction.guild.roles.cache.get(id)?.name || id).join(", ")}`,ephemeral:true});
+      }
+      const userOpt = interaction.options.getUser("user");
+      const target = await interaction.guild.members.fetch(userOpt.id).catch(() => null);
+      if(!target) return safeReply(interaction,{content:"❌ That person isn't in this server.",ephemeral:true});
+      if(target.user.bot) return safeReply(interaction,{content:"❌ You can't pass it to a bot.",ephemeral:true});
+      if(target.id === invoker.id) return safeReply(interaction,{content:"❌ You can't pass it to yourself.",ephemeral:true});
+      if(target.roles.cache.has(roleId)) return safeReply(interaction,{content:"❌ They already have it.",ephemeral:true});
+      const role = interaction.guild.roles.cache.get(roleId);
+      if(!role?.editable) return safeReply(interaction,{content:"❌ I can't manage that role right now.",ephemeral:true});
+
+      await interaction.deferReply();
+      const key = `${interaction.guildId}:${target.id}:${roleId}`;
+      limitedRoleSuppress.add(key);
+      setTimeout(() => limitedRoleSuppress.delete(key), 15_000);
+      try{
+        await target.roles.add(roleId, `Passed by ${interaction.user.tag}`);
+      }catch(e){
+        limitedRoleSuppress.delete(key);
+        return safeReply(interaction,{content:`❌ Couldn't give it to them: ${e.message}`});
+      }
+      try{
+        await invoker.roles.remove(roleId, `Passed to ${target.user.tag}`);
+      }catch(e){
+        await target.roles.remove(roleId, "Pass rolled back").catch(() => {});
+        return safeReply(interaction,{content:`❌ Couldn't take it from you, so nothing changed: ${e.message}`});
+      }
+      return safeReply(interaction,{content:`🎁 <@${invoker.id}> passed <@&${roleId}> to <@${target.id}>.`,allowedMentions:{users:[target.id]}});
+    }
+
+    if(cmd==="deactivatetoggle"){
+      if(!inGuild) return safeReply(interaction,{content:"❌ Server only.",ephemeral:true});
+      if(!isGuildOwner(interaction.guildId, interaction.user.id)) return safeReply(interaction,{content:"❌ Server owner only.",ephemeral:true});
+      const me = interaction.guild.members.me;
+      if(!me?.permissions.has("MANAGE_GUILD")) return safeReply(interaction,{content:"❌ I need the Manage Server permission for this.",ephemeral:true});
+
+      const existing = deactivateToggleConfig.get(interaction.guildId);
+      if(existing?.active){
+        deactivateToggleConfig.delete(interaction.guildId);
+        saveData();
+        await interaction.deferReply({ephemeral:true});
+        try{ await setGuildIncidentActions(interaction.guildId, { dmsUntil:null, invitesUntil:null }); }
+        catch(e){ return safeReply(interaction,{content:`⚠️ Stopped the repeating lockdown, but clearing the current one failed: ${e.message}`,ephemeral:true}); }
+        return safeReply(interaction,{content:"🟢 Lockdown stopped. DMs and invites are back to normal, and it won't reactivate.",ephemeral:true});
+      }
+
+      await interaction.deferReply({ephemeral:true});
+      const until = Date.now() + DEACTIVATE_DURATION_MS;
+      try{ await setGuildIncidentActions(interaction.guildId, { dmsUntil:new Date(until).toISOString(), invitesUntil:new Date(until).toISOString() }); }
+      catch(e){ return safeReply(interaction,{content:`❌ Couldn't activate: ${e.message}`,ephemeral:true}); }
+      deactivateToggleConfig.set(interaction.guildId, { active:true, nextFireAt: until });
+      saveData();
+      return safeReply(interaction,{content:`🔴 Lockdown activated for 24 hours (DMs from this server blocked, invites paused). It renews automatically every 24 hours, run \`/deactivatetoggle\` again any time to stop it for good.`,ephemeral:true});
+    }
+
+    // ── /selfclank: selfclankerify yourself (0 to cancel, 1–5 min, max 2 per server) ────
+    if(cmd==="selfclank"){
+      if(!inGuild) return safeReply(interaction,{content:"❌ Server only.",ephemeral:true});
+      const duration = interaction.options.getInteger("duration");
+      const myKey = scopedKey(interaction.guildId, interaction.user.id);
+
+      if(duration === 0){
+        if(!clankerify.has(myKey)){
+          return safeReply(interaction,{content:"❌ You're not currently selfclanked.",ephemeral:true});
+        }
+        const existingEntry = clankerify.get(myKey);
+        if(existingEntry?.ownerClanked){
+          return safeReply(interaction,{content:"❌ Your clank was applied by an owner: you can't remove it yourself. Wait for it to expire.",ephemeral:true});
+        }
+        clankerify.delete(myKey);
+        if(interaction.guildId){
+          const gs = selfClankUsers.get(interaction.guildId);
+          if(gs) gs.delete(interaction.user.id);
+        }
+        const cooldownExpiry = Date.now() + 10 * 60_000;
+        selfClankCooldown.set(interaction.user.id, cooldownExpiry);
+        saveData();
+        return safeReply(interaction,{content:`✅ Self clank cancelled. You'll be on cooldown for **10 minutes** before you can use it again (<t:${Math.floor(cooldownExpiry/1000)}:R>).`,ephemeral:true});
+      }
+
+      if(duration<1||duration>5) return safeReply(interaction,{content:"❌ Duration must be **1–5** minutes, or **0** to cancel.",ephemeral:true});
+
+      const cooldownExpiry = selfClankCooldown.get(interaction.user.id) || 0;
+      if(Date.now() < cooldownExpiry){
+        return safeReply(interaction,{content:`⏳ You're on cooldown! You can selfclank again <t:${Math.floor(cooldownExpiry/1000)}:R>.`,ephemeral:true});
+      }
+
+      if(clankerify.has(myKey)){
+        const entry = clankerify.get(myKey);
+        if(entry?.ownerClanked){
+          return safeReply(interaction,{content:"❌ You've been clankerified by an owner. You can't selfclank until that expires.",ephemeral:true});
+        }
+        const remainMs = entry.expiresAt ? entry.expiresAt - Date.now() : 0;
+        const remainMin = Math.ceil(remainMs/60000);
+        return safeReply(interaction,{content:`❌ You're already clankerified! It expires in **${remainMin}** minute(s). Use \`/selfclank duration:0\` to cancel early.`,ephemeral:true});
+      }
+
+      if(!selfClankUsers.has(interaction.guildId)) selfClankUsers.set(interaction.guildId, new Set());
+      const guildSelfClanks = selfClankUsers.get(interaction.guildId);
+      for(const uid2 of [...guildSelfClanks]){
+        const entry = clankerify.get(scopedKey(interaction.guildId, uid2));
+        if(!entry || (entry.expiresAt && entry.expiresAt <= Date.now())) guildSelfClanks.delete(uid2);
+      }
+      if(guildSelfClanks.size >= 2){
+        return safeReply(interaction,{content:`❌ There are already **2** selfclanked users in this server (the maximum). Wait for one to expire.`,ephemeral:true});
+      }
+      const selfclankBuiltIn = [
+        {label:"No mode (plain)",           value:"none",             emoji:"🤖"},
+        {label:"Evil",                      value:"evil",             emoji:"😈"},
+        {label:"Freaky",                    value:"freaky",           emoji:"😏"},
+        {label:"American",                  value:"american",         emoji:"🦅"},
+        {label:"British",                   value:"british",          emoji:"🫖"},
+        {label:"Stupid",                    value:"stupid",           emoji:"🪖"},
+        {label:"Boomer",                    value:"boomer",           emoji:"📰"},
+        {label:"Conspiracy",                value:"conspiracy",       emoji:"🔺"},
+        {label:"NPC",                       value:"npc",              emoji:"🗺️"},
+        {label:"Sigma",                     value:"sigma",            emoji:"😤"},
+        {label:"Medieval",                  value:"medieval",         emoji:"⚔️"},
+        {label:"Ghost",                     value:"ghost",            emoji:"👻"},
+        {label:"Pirate",                    value:"pirate",           emoji:"🏴‍☠️"},
+        {label:"RespawnRaccoon Propaganda", value:"rr_propaganda",    emoji:"🦝"},
+        {label:"French",                    value:"french",           emoji:"🇫🇷"},
+        {label:"UWU / LOLCAT",              value:"uwu",              emoji:"🐱"},
+        {label:"Random (picks a random mode each message)", value:"random",   emoji:"🎲"},
+      ];
+      const selfclankComponents = [new MessageActionRow().addComponents(
+        new MessageSelectMenu()
+          .setCustomId(`selfclank_mode_${interaction.user.id}_${duration}`)
+          .setPlaceholder("Pick a built in personality mode…")
+          .addOptions(selfclankBuiltIn)
+      )];
+      const selfclankCommunity = [...customClankerModes.entries()].map(([id, m]) => ({
+        label: `${m.emoji||"⭐"} ${id}`, value: id, description: `by ${m.creatorName||"?"}`,
+      }));
+      if(selfclankCommunity.length){
+        selfclankComponents.push(new MessageActionRow().addComponents(
+          new MessageSelectMenu()
+            .setCustomId(`selfclank_community_${interaction.user.id}_${duration}`)
+            .setPlaceholder("🤖 Community modes…")
+            .addOptions(selfclankCommunity.slice(0,25))
+        ));
+      }
+      const modeMenu = selfclankComponents[0];
+      return safeReply(interaction,{
+        content:`🤖 Self clankerifying yourself for **${duration} minute(s)**. Pick a mode:`,
+        components: selfclankComponents,
+        ephemeral:true
+      });
+    }
+
+    // ── /requester: owner sets the review channel ────────────────────────────
+    if(cmd==="requester"||((cmd==="quotemanage")&&interaction.options.getSubcommand(false)==="set-review-channel")){
+      if(!OWNER_IDS.includes(interaction.user.id))
+        return safeReply(interaction,{content:"❌ Owner only.",ephemeral:true});
+      const ch = interaction.options.getChannel("channel");
+      if(ch.type!=="GUILD_TEXT") return safeReply(interaction,{content:"❌ Please select a text channel.",ephemeral:true});
+      reviewChannelId = ch.id;
+      saveData();
+      return safeReply(interaction,{content:`✅ Global quote review channel set to <#${ch.id}>. All \`/requestupload\` submissions will go there.`,ephemeral:true});
+    }
+
+    if(cmd==="emojisteal"){
+      if(!OWNER_IDS.includes(interaction.user.id))
+        return safeReply(interaction,{content:"❌ Owner only.",ephemeral:true});
+      const serverIdInput = interaction.options.getString("server");
+      const emojisInput   = interaction.options.getString("emojis");
+      if(!serverIdInput && !emojisInput)
+        return safeReply(interaction,{content:"❌ Give a server ID to set the destination, or paste emojis to copy.",ephemeral:true});
+
+      if(serverIdInput){
+        const g = client.guilds.cache.get(serverIdInput.trim());
+        if(!g) return safeReply(interaction,{content:"❌ I\'m not in a server with that ID.",ephemeral:true});
+        emojiStealDestGuildId = g.id;
+        saveData();
+        if(!emojisInput) return safeReply(interaction,{content:`✅ Destination server set to **${g.name}** (\`${g.id}\`).`,ephemeral:true});
+      }
+
+      const destG = emojiStealDestGuildId ? client.guilds.cache.get(emojiStealDestGuildId) : null;
+      if(!destG) return safeReply(interaction,{content:"❌ No destination server set (or I\'m no longer in it). Run `/emojisteal server:` first.",ephemeral:true});
+      await interaction.deferReply({ephemeral:true});
+      const result = await stealEmojisToGuild(destG, emojisInput);
+      return safeReply(interaction,{content: result, ephemeral:true});
+    }
+
+    // ── /pixeltxt: structure an image into PIXELTXT text, or destructure it back ─
+    if(cmd==="pixeltxt"){
+      const action = interaction.options.getString("action");
+      const file = interaction.options.getAttachment("file");
+      const PIXELTXT_PROMO = "Try the website version of this command at https://royal-v-rr.github.io/pixeltxt/";
+      const promoContent = () => Math.random() < 0.05 ? PIXELTXT_PROMO : undefined;
+
+      if(action === "structure"){
+        const info = detectMediaKind(file.contentType, file.name);
+        if(!info || info.kind !== "image")
+          return safeReply(interaction,{content:"❌ For structuring, attach an image file.",ephemeral:true});
+
+        const MAX_SIZE = 10_000_000;
+        if(file.size > MAX_SIZE)
+          return safeReply(interaction,{content:"❌ Image must be under 10 MB.",ephemeral:true});
+
+        await interaction.deferReply();
+        try{
+          const res = await fetch(file.url);
+          if(!res.ok) throw new Error(`Could not fetch image (HTTP ${res.status})`);
+          const buf = Buffer.from(await res.arrayBuffer());
+          const { data, info: meta } = await sharp(buf).ensureAlpha().raw().toBuffer({resolveWithObject:true});
+          const W = meta.width, H = meta.height;
+          if(W*H > PIXELTXT_MAX_PIXELS)
+            return safeReply(interaction,{content:`❌ That image is ${W}×${H} (${(W*H).toLocaleString()} px): too large to structure. Max is ${PIXELTXT_MAX_PIXELS.toLocaleString()} px, try resizing it down first.`});
+
+          const { text } = pixeltxtEncode(data, W, H);
+
+          return safeReply(interaction,{
+            content: promoContent(),
+            files:[{attachment: Buffer.from(text,"utf8"), name:"pixels.txt"}],
+          });
+        }catch(e){
+          console.error("pixeltxt structure error:", e.message);
+          return safeReply(interaction,{content:`❌ Failed to structure: ${e.message}`,ephemeral:true});
+        }
+      }
+
+      const MAX_TXT_SIZE = 8_000_000;
+      if(file.size > MAX_TXT_SIZE)
+        return safeReply(interaction,{content:"❌ Text file must be under 8 MB.",ephemeral:true});
+
+      await interaction.deferReply();
+      try{
+        const res = await fetch(file.url);
+        if(!res.ok) throw new Error(`Could not fetch file (HTTP ${res.status})`);
+        const text = await res.text();
+
+        const { W, H, pixels } = pixeltxtDecode(text);
+        const png = await sharp(pixels, { raw:{ width:W, height:H, channels:4 } }).png().toBuffer();
+
+        return safeReply(interaction,{
+          content: promoContent(),
+          files:[{attachment: png, name:"restructured.png"}],
+        });
+      }catch(e){
+        console.error("pixeltxt destructure error:", e.message);
+        return safeReply(interaction,{content:`❌ Failed to destructure: ${e.message}`,ephemeral:true});
+      }
+    }
+
+    // ── /requestupload: anyone submits an image for review ────────────────────
+    if(cmd==="requestupload"){
+      if(!inGuild) return safeReply(interaction,{content:"❌ Server only.",ephemeral:true});
+      const attachment = interaction.options.getAttachment("source");
+      await interaction.deferReply({ephemeral:true});
+      const result = await submitMediaForReview({
+        submitterUser: interaction.user,
+        attachmentUrl: attachment.url,
+        attachmentName: attachment.name,
+        attachmentContentType: attachment.contentType,
+        attachmentSize: attachment.size,
+        guildName: interaction.guild.name,
+        guildId: interaction.guildId,
+        channelId: interaction.channelId,
+      });
+      if(!result.ok) return safeReply(interaction,{content:`❌ ${result.reason}`,ephemeral:true});
+      return safeReply(interaction,{content:"✅ Your file has been submitted for review! You'll get a DM once it's been approved or rejected.",ephemeral:true});
+    }
+
+    // ── /download: fetch a YouTube video as MP4/MP3, splitting into parts if too big ─
+    if(cmd==="download"){
+      const url        = interaction.options.getString("url");
+      const format      = interaction.options.getString("format") || "mp4";
+      const resolution   = interaction.options.getString("resolution") || "1080p";
+
+      if(!/^https?:\/\/(www\.|m\.|music\.)?(youtube\.com|youtu\.be)\//i.test(url))
+        return safeReply(interaction,{content:"❌ That doesn't look like a YouTube URL.",ephemeral:true});
+
+      await interaction.deferReply({ephemeral:true});
+
+      const jobId   = crypto.randomUUID().slice(0,8);
+      const workDir = path.join(os.tmpdir(), `dl_${jobId}`);
+      fs.mkdirSync(workDir,{recursive:true});
+      const cleanup = () => { try{ fs.rmSync(workDir,{recursive:true,force:true}); }catch{} };
+
+      try {
+        await safeReply(interaction,{content:"⏳ Fetching video info…",ephemeral:true});
+
+        let info, workingClient;
+        try {
+          ({ info, client: workingClient } = await ytFetchInfoWithFallback(url));
+        } catch(e) {
+          throw new Error(`Couldn't read that video: ${ytErrorMessage(e)}`);
+        }
+
+        const title = (info.title || "video").replace(/[\\/:*?"<>|]/g,"").trim().slice(0,60) || "video";
+        const outTemplate = path.join(workDir, `${jobId}.%(ext)s`);
+        const clientArgs = ytExtractorArgs(workingClient);
+
+        await safeReply(interaction,{content:`⏳ Downloading **${title}**…`,ephemeral:true});
+
+        try {
+          if(format === "mp3"){
+            await youtubedl(url, {
+              output: outTemplate,
+              noPlaylist: true,
+              extractAudio: true,
+              audioFormat: "mp3",
+              audioQuality: 0,
+              ffmpegLocation: ffmpegPath,
+              ...clientArgs,
+            });
+          } else {
+            const heightMap = {"1080p":1080,"720p":720,"480p":480,"360p":360,"240p":240,"144p":144};
+            const maxHeight = heightMap[resolution] || 1080;
+            await youtubedl(url, {
+              output: outTemplate,
+              noPlaylist: true,
+              format: `bestvideo[height<=${maxHeight}]+bestaudio/best[height<=${maxHeight}]`,
+              mergeOutputFormat: "mp4",
+              ffmpegLocation: ffmpegPath,
+              ...clientArgs,
+            });
+          }
+        } catch(e) {
+          throw new Error(`Download failed: ${ytErrorMessage(e)}`);
+        }
+
+        const produced = fs.readdirSync(workDir).find(f => f.startsWith(`${jobId}.`));
+        if(!produced) throw new Error("Download finished but no output file was found.");
+        const filePath  = path.join(workDir, produced);
+        const ext       = format === "mp3" ? "mp3" : "mp4";
+        const finalName = `${title}.${ext}`;
+
+        const limitBytes = getUploadLimitBytes(interaction.guild);
+        const fileSize    = fs.statSync(filePath).size;
+
+        if(fileSize <= limitBytes){
+          await safeReply(interaction,{ content:`✅ **${title}**`, files:[{attachment:filePath, name:finalName}], ephemeral:true });
+          cleanup();
+          return;
+        }
+
+        await safeReply(interaction,{content:`⏳ **${title}** is ${(fileSize/1024/1024).toFixed(1)} MB: splitting it to fit Discord's ${(limitBytes/1024/1024).toFixed(0)} MB limit…`,ephemeral:true});
+
+        const parts = await splitToFit(filePath, workDir, jobId, ext, limitBytes, info.duration || null);
+        if(!parts.length) throw new Error("Couldn't split the file into small enough parts: it may have very sparse keyframes.");
+
+        await safeReply(interaction,{content:`✅ **${title}**: split into **${parts.length}** part${parts.length!==1?"s":""}:`,ephemeral:true});
+        for(let i=0;i<parts.length;i++){
+          await interaction.followUp({
+            content:`Part ${i+1}/${parts.length}`,
+            files:[{attachment:parts[i], name:`${title}_part${i+1}.${ext}`}],
+            ephemeral:true,
+          }).catch(e=>console.error("download part send error:",e.message));
+        }
+        cleanup();
+        return;
+      } catch(e) {
+        cleanup();
+        console.error("download error:", e.message);
+        return safeReply(interaction,{content:`❌ ${e.message}`,ephemeral:true});
+      }
+    }
+
+  }catch(err){
+    _clearAutoDefer();
+    console.error(`[command error] /${cmd}:`, err);
+    safeReply(interaction, {content:"❌ An error occurred processing that command.", ephemeral:true});
+  } finally {
+    maybeSendPromo(interaction);
+  }
+});
+
+client.login(TOKEN);
