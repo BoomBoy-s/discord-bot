@@ -102,7 +102,7 @@
         "dailyStreak": 0,
         "bestStreak": 0,
         "lastDailyDate": "",
-        "xp": 31,
+        "xp": 43,
         "level": 1,
         "lastWorkTime": 0,
         "lastBegTime": 0,
@@ -425,7 +425,19 @@
   ],
   "selfClankUsers": [],
   "selfClankCooldown": [],
-  "pendingReviews": [],
+  "pendingReviews": [
+    [
+      "678288mwtzh44m",
+      {
+        "submitterId": "1529301472309678288",
+        "fileName": "1529301472309678288__image__70e3c3c9_c7cd_4bc8_b1c6_42549d1bead4.png",
+        "rawName": "70e3c3c9_c7cd_4bc8_b1c6_42549d1bead4.png",
+        "mediaKind": "image",
+        "guildId": "1048053656035020911",
+        "destFolder": null
+      }
+    ]
+  ],
   "quoteGuildConfigs": [],
   "uploadCounters": {
     "quote": 3,
