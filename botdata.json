@@ -150,7 +150,7 @@
         "dailyStreak": 0,
         "bestStreak": 0,
         "lastDailyDate": "",
-        "xp": 86,
+        "xp": 99,
         "level": 2,
         "lastWorkTime": 0,
         "lastBegTime": 0,
@@ -540,7 +540,7 @@
         "dailyStreak": 0,
         "bestStreak": 0,
         "lastDailyDate": "",
-        "xp": 32,
+        "xp": 39,
         "level": 1,
         "lastWorkTime": 0,
         "lastBegTime": 0,
@@ -1249,6 +1249,72 @@
         "submitterId": "1254388539890860083",
         "fileName": "1254388539890860083__image__IMG_0693.png",
         "rawName": "IMG_0693.png",
+        "mediaKind": "image",
+        "guildId": "1048053656035020911",
+        "destFolder": null
+      }
+    ],
+    [
+      "860083mwuv4li9",
+      {
+        "submitterId": "1254388539890860083",
+        "fileName": "1254388539890860083__image__IMG_0672.png",
+        "rawName": "IMG_0672.png",
+        "mediaKind": "image",
+        "guildId": "1048053656035020911",
+        "destFolder": null
+      }
+    ],
+    [
+      "860083mwuv4z4k",
+      {
+        "submitterId": "1254388539890860083",
+        "fileName": "1254388539890860083__image__IMG_0671.png",
+        "rawName": "IMG_0671.png",
+        "mediaKind": "image",
+        "guildId": "1048053656035020911",
+        "destFolder": null
+      }
+    ],
+    [
+      "860083mwuv5gbr",
+      {
+        "submitterId": "1254388539890860083",
+        "fileName": "1254388539890860083__image__IMG_0667.png",
+        "rawName": "IMG_0667.png",
+        "mediaKind": "image",
+        "guildId": "1048053656035020911",
+        "destFolder": null
+      }
+    ],
+    [
+      "860083mwuv5ugt",
+      {
+        "submitterId": "1254388539890860083",
+        "fileName": "1254388539890860083__image__IMG_0665.png",
+        "rawName": "IMG_0665.png",
+        "mediaKind": "image",
+        "guildId": "1048053656035020911",
+        "destFolder": null
+      }
+    ],
+    [
+      "860083mwuv67ym",
+      {
+        "submitterId": "1254388539890860083",
+        "fileName": "1254388539890860083__image__quote_1568290670857162823.png",
+        "rawName": "quote_1568290670857162823.png",
+        "mediaKind": "image",
+        "guildId": "1048053656035020911",
+        "destFolder": null
+      }
+    ],
+    [
+      "860083mwuv6rf5",
+      {
+        "submitterId": "1254388539890860083",
+        "fileName": "1254388539890860083__image__IMG_0654.png",
+        "rawName": "IMG_0654.png",
         "mediaKind": "image",
         "guildId": "1048053656035020911",
         "destFolder": null
