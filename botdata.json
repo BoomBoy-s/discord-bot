@@ -147,7 +147,25 @@
   ],
   "userInstalls": [],
   "featureBlacklist": [],
-  "tempOwnerGrants": [],
+  "tempOwnerGrants": [
+    [
+      "1391972162285604966",
+      {
+        "commands": [
+          "restart",
+          "refreshcmds",
+          "botstats"
+        ],
+        "features": [
+          "quote_review",
+          "quote_manager"
+        ],
+        "expiresAt": null,
+        "grantedBy": "969280648667889764",
+        "grantedAt": 1795546822733
+      }
+    ]
+  ],
   "scores": [
     [
       "969280648667889764",
@@ -159,7 +177,7 @@
         "dailyStreak": 0,
         "bestStreak": 0,
         "lastDailyDate": "",
-        "xp": 51,
+        "xp": 65,
         "level": 3,
         "lastWorkTime": 0,
         "lastBegTime": 0,
