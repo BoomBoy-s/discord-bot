@@ -87,7 +87,8 @@
   "disabledLevelUp": [
     "1048053656035020911",
     "1440773513060290763",
-    "867435618748989481"
+    "867435618748989481",
+    "1472162315414536332"
   ],
   "levelUpConfig": [
     [
@@ -113,6 +114,14 @@
         "ping": true,
         "channelId": null
       }
+    ],
+    [
+      "1472162315414536332",
+      {
+        "enabled": false,
+        "ping": true,
+        "channelId": null
+      }
     ]
   ],
   "ytConfig": [],
@@ -131,7 +140,7 @@
         "dailyStreak": 0,
         "bestStreak": 0,
         "lastDailyDate": "",
-        "xp": 6,
+        "xp": 14,
         "level": 2,
         "lastWorkTime": 0,
         "lastBegTime": 0,
@@ -336,7 +345,16 @@
   "deactivateToggleConfig": [],
   "banSyncLinks": [],
   "extraChannelsConfig": [],
-  "announcementSyncChannels": [],
+  "announcementSyncChannels": [
+    [
+      "1517219624616202330",
+      "1572291695570190398"
+    ],
+    [
+      "1572291695570190398",
+      "1517219624616202330"
+    ]
+  ],
   "announcementSyncRoles": [],
   "limitedRoles": [],
   "memers": [
