@@ -1,1 +1,297 @@
-{}
+{
+  "config": {
+    "xp_per_msg_min": 5,
+    "xp_per_msg_max": 15,
+    "xp_cooldown_ms": 60000,
+    "work_cooldown_ms": 3600000,
+    "beg_cooldown_ms": 300000,
+    "crime_cooldown_ms": 7200000,
+    "rob_cooldown_ms": 3600000,
+    "daily_base_coins": 100,
+    "daily_streak_bonus": 10,
+    "daily_wrong_penalty": 5,
+    "starting_coins": 100,
+    "beg_success_chance": 60,
+    "crime_success_chance": 57,
+    "rob_steal_pct_min": 10,
+    "rob_steal_pct_max": 30,
+    "rob_fine_pct_min": 5,
+    "rob_fine_pct_max": 15,
+    "rob_success_chance": 45,
+    "slots_min_bet": 1,
+    "coinbet_win_chance": 50,
+    "slots_jackpot_mult": 1000,
+    "slots_bigwin_mult": 500,
+    "slots_triple_mult": 300,
+    "slots_pair_mult": 150,
+    "blackjack_natural_mult": 150,
+    "lucky_charm_bonus": 10,
+    "xp_boost_mult": 200,
+    "coin_magnet_mult": 300,
+    "mystery_box_coin_chance": 50,
+    "mb_coins_small": 10,
+    "mb_coins_large": 15,
+    "mb_lucky_charm": 15,
+    "mb_xp_boost": 15,
+    "mb_shield": 15,
+    "mb_coin_magnet": 15,
+    "mb_rob_insurance": 15,
+    "imb_coins_tiny": 30,
+    "imb_coins_small": 20,
+    "imb_lucky_charm": 12,
+    "imb_xp_boost": 8,
+    "imb_shield": 12,
+    "imb_coin_magnet": 8,
+    "imb_rob_insurance": 10,
+    "shop_lucky_charm_price": 200,
+    "shop_xp_boost_price": 300,
+    "shop_shield_price": 150,
+    "shop_coin_magnet_price": 350,
+    "shop_mystery_box_price": 100,
+    "shop_item_mystery_box_price": 40,
+    "shop_rob_insurance_price": 250,
+    "win_hangman": 40,
+    "win_snake_per_point": 5,
+    "win_minesweeper_easy": 30,
+    "win_minesweeper_medium": 60,
+    "win_minesweeper_hard": 100,
+    "win_numberguess": 30,
+    "win_wordscramble": 25,
+    "win_ttt": 50,
+    "win_c4": 50,
+    "win_rps": 40,
+    "win_mathrace": 40,
+    "win_wordrace": 40,
+    "win_trivia": 60,
+    "win_scramblerace": 80,
+    "win_countgame": 200,
+    "olympics_win_coins": 75,
+    "invite_comp_1st": 500,
+    "invite_comp_2nd": 250,
+    "invite_comp_3rd": 100,
+    "invite_comp_per_invite": 10
+  },
+  "ticketConfigs": [],
+  "openTickets": [],
+  "guildChannels": [],
+  "welcomeChannels": [],
+  "leaveChannels": [],
+  "boostChannels": [],
+  "autoRoles": [],
+  "shadowDelete": [],
+  "clankerify": [],
+  "theCountChannels": [],
+  "reactionRoles": [],
+  "dropdownRoleSets": [],
+  "disabledOwnerMsg": [],
+  "disabledLevelUp": [],
+  "levelUpConfig": [],
+  "ytConfig": [],
+  "countingChannels": [],
+  "userInstalls": [],
+  "featureBlacklist": [],
+  "tempOwnerGrants": [],
+  "scores": [
+    [
+      "969280648667889764",
+      {
+        "username": "royalvmusic",
+        "wins": 0,
+        "gamesPlayed": 0,
+        "coins": 0,
+        "dailyStreak": 0,
+        "bestStreak": 0,
+        "lastDailyDate": "",
+        "xp": 25,
+        "level": 1,
+        "lastWorkTime": 0,
+        "lastBegTime": 0,
+        "lastCrimeTime": 0,
+        "lastRobTime": 0,
+        "inventory": [],
+        "marriedTo": null,
+        "pendingProposal": null,
+        "imagesUploaded": 1,
+        "forceMarried": false,
+        "uploadedImages": [
+          "quote_1.png"
+        ]
+      }
+    ]
+  ],
+  "activeEffects": [],
+  "reminders": [],
+  "scheduledMessages": [],
+  "inviteComps": [],
+  "premieres": [],
+  "raConfig": [],
+  "activityChecks": [],
+  "scheduledChecks": [],
+  "dailyQuoteChannels": [],
+  "sotdConfig": [],
+  "sotdMetaCache": [],
+  "sotdVotes": [],
+  "countingBlocks": [],
+  "deactivateToggleConfig": [],
+  "banSyncLinks": [],
+  "extraChannelsConfig": [],
+  "announcementSyncChannels": [],
+  "announcementSyncRoles": [],
+  "limitedRoles": [],
+  "memers": [
+    "1419803002771865722",
+    "1259223683826712729",
+    "1254388539890860083",
+    "1082452773787942922",
+    "1193150033864949811",
+    "1413943805203189800",
+    "969280648667889764",
+    "690219723472109616"
+  ],
+  "quoteVotes": [],
+  "quoteVoteMessages": [],
+  "favoritedQuotes": [],
+  "userVoteStats": [],
+  "userFlagStats": [],
+  "pendingFlagDeleters": [],
+  "reviewChannelId": "1503045026866004071",
+  "deleterChannelId": "1550846932057071656",
+  "emojiStealDestGuildId": null,
+  "trashcanThreshold": 3,
+  "trashcanVotes": [],
+  "selfClankUsers": [],
+  "selfClankCooldown": [],
+  "pendingReviews": [],
+  "quoteGuildConfigs": [],
+  "uploadCounters": {
+    "quote": 1,
+    "eardestroyer": 0,
+    "eyebleacher": 0
+  },
+  "botStatus": null,
+  "dmRelayGuildId": null,
+  "dmRelayChannels": [],
+  "paranoiaWatchers": [],
+  "customClankerModes": [],
+  "jarvisEnhanceProfiles": [
+    [
+      "clankerfy",
+      {
+        "triggers": [
+          "clankerfy",
+          "clankerify",
+          "clank"
+        ],
+        "actions": [
+          {
+            "type": "clankerify",
+            "params": {
+              "mode": "random",
+              "duration": "10"
+            }
+          }
+        ],
+        "ownerLocked": true,
+        "creatorId": "system",
+        "creatorName": "RoyalBot",
+        "createdAt": 1795480491730
+      }
+    ],
+    [
+      "hitaclip",
+      {
+        "triggers": [
+          "quote"
+        ],
+        "actions": [
+          {
+            "type": "random_quote",
+            "params": {}
+          }
+        ],
+        "ownerLocked": false,
+        "creatorId": "system",
+        "creatorName": "RoyalBot",
+        "createdAt": 1795480491730
+      }
+    ],
+    [
+      "clipquote",
+      {
+        "triggers": [
+          "clip"
+        ],
+        "actions": [
+          {
+            "type": "make_it_a_quote",
+            "params": {}
+          }
+        ],
+        "ownerLocked": false,
+        "creatorId": "system",
+        "creatorName": "RoyalBot",
+        "createdAt": 1795480491730
+      }
+    ],
+    [
+      "databaseupload",
+      {
+        "triggers": [
+          "database",
+          "upload"
+        ],
+        "actions": [
+          {
+            "type": "request_upload",
+            "params": {}
+          }
+        ],
+        "ownerLocked": false,
+        "creatorId": "system",
+        "creatorName": "RoyalBot",
+        "createdAt": 1795480491730
+      }
+    ],
+    [
+      "clipship",
+      {
+        "triggers": [
+          "clip",
+          "ship"
+        ],
+        "matchAll": true,
+        "actions": [
+          {
+            "type": "make_quote_and_submit",
+            "params": {}
+          }
+        ],
+        "ownerLocked": false,
+        "creatorId": "system",
+        "creatorName": "RoyalBot",
+        "createdAt": 1795480491730
+      }
+    ],
+    [
+      "elementary",
+      {
+        "triggers": [
+          "elementary"
+        ],
+        "actions": [
+          {
+            "type": "block_counting",
+            "params": {}
+          }
+        ],
+        "ownerLocked": false,
+        "creatorId": "system",
+        "creatorName": "RoyalBot",
+        "createdAt": 1795480491730
+      }
+    ]
+  ],
+  "serverStatsConfig": [],
+  "boostHistory": [],
+  "quoteUserVotes": []
+}
