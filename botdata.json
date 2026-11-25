@@ -177,7 +177,7 @@
         "dailyStreak": 0,
         "bestStreak": 0,
         "lastDailyDate": "",
-        "xp": 186,
+        "xp": 208,
         "level": 3,
         "lastWorkTime": 0,
         "lastBegTime": 0,
@@ -227,7 +227,7 @@
         "dailyStreak": 0,
         "bestStreak": 0,
         "lastDailyDate": "",
-        "xp": 72,
+        "xp": 77,
         "level": 3,
         "lastWorkTime": 0,
         "lastBegTime": 0,
@@ -236,10 +236,11 @@
         "inventory": [],
         "marriedTo": null,
         "pendingProposal": null,
-        "imagesUploaded": 1,
+        "imagesUploaded": 2,
         "forceMarried": false,
         "uploadedImages": [
-          "quote_2.png"
+          "quote_2.png",
+          "quote_4.png"
         ]
       }
     ],
@@ -471,7 +472,7 @@
         "dailyStreak": 0,
         "bestStreak": 0,
         "lastDailyDate": "",
-        "xp": 94,
+        "xp": 104,
         "level": 2,
         "lastWorkTime": 0,
         "lastBegTime": 0,
@@ -792,9 +793,11 @@
         "inventory": [],
         "marriedTo": null,
         "pendingProposal": null,
-        "imagesUploaded": 0,
+        "imagesUploaded": 1,
         "forceMarried": false,
-        "uploadedImages": []
+        "uploadedImages": [
+          "quote_6.jpg"
+        ]
       }
     ],
     [
@@ -2219,44 +2222,11 @@
         "guildId": "1048053656035020911",
         "destFolder": null
       }
-    ],
-    [
-      "860083mwuv9wee",
-      {
-        "submitterId": "1254388539890860083",
-        "fileName": "1254388539890860083__image__IMG_0548.png",
-        "rawName": "IMG_0548.png",
-        "mediaKind": "image",
-        "guildId": "1048053656035020911",
-        "destFolder": null
-      }
-    ],
-    [
-      "860083mwuvm6s0",
-      {
-        "submitterId": "1254388539890860083",
-        "fileName": "1254388539890860083__image__IMG_2184.jpg",
-        "rawName": "IMG_2184.jpg",
-        "mediaKind": "image",
-        "guildId": "1048053656035020911",
-        "destFolder": null
-      }
-    ],
-    [
-      "678288mwwbsiis",
-      {
-        "submitterId": "1529301472309678288",
-        "fileName": "1529301472309678288__image__d3f39a7b_1d48_46ff_aec3_1c0c2b8d1ec9.png",
-        "rawName": "d3f39a7b_1d48_46ff_aec3_1c0c2b8d1ec9.png",
-        "mediaKind": "image",
-        "guildId": "1048053656035020911",
-        "destFolder": null
-      }
     ]
   ],
   "quoteGuildConfigs": [],
   "uploadCounters": {
-    "quote": 3,
+    "quote": 5,
     "eardestroyer": 0,
     "eyebleacher": 0
   },
