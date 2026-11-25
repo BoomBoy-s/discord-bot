@@ -197,7 +197,7 @@
         "dailyStreak": 0,
         "bestStreak": 0,
         "lastDailyDate": "",
-        "xp": 100,
+        "xp": 111,
         "level": 4,
         "lastWorkTime": 0,
         "lastBegTime": 0,
@@ -2611,7 +2611,7 @@
     "eyebleacher": 0
   },
   "botStatus": null,
-  "dmRelayGuildId": null,
+  "dmRelayGuildId": "1521099828078182460",
   "dmRelayChannels": [],
   "paranoiaWatchers": [],
   "customClankerModes": [],
