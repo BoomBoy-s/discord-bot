@@ -223,7 +223,7 @@
         "dailyStreak": 0,
         "bestStreak": 0,
         "lastDailyDate": "",
-        "xp": 24,
+        "xp": 36,
         "level": 1,
         "lastWorkTime": 0,
         "lastBegTime": 0,
@@ -3520,6 +3520,10 @@
     [
       "969280648667889764",
       "1575540665369100460"
+    ],
+    [
+      "1529301472309678288",
+      "1575639188735271014"
     ]
   ],
   "paranoiaWatchers": [],
