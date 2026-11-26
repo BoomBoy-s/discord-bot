@@ -139,9 +139,9 @@
       "1515972755424673902",
       {
         "guildId": "1048053656035020911",
-        "count": 18,
-        "lastUserId": "1528529543923499039",
-        "highScore": 18
+        "count": 19,
+        "lastUserId": "1391972162285604966",
+        "highScore": 19
       }
     ]
   ],
@@ -396,8 +396,8 @@
         "dailyStreak": 0,
         "bestStreak": 0,
         "lastDailyDate": "",
-        "xp": 127,
-        "level": 2,
+        "xp": 0,
+        "level": 3,
         "lastWorkTime": 0,
         "lastBegTime": 0,
         "lastCrimeTime": 0,
