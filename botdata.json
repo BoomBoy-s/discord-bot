@@ -597,9 +597,11 @@
         "inventory": [],
         "marriedTo": null,
         "pendingProposal": null,
-        "imagesUploaded": 0,
+        "imagesUploaded": 1,
         "forceMarried": false,
-        "uploadedImages": []
+        "uploadedImages": [
+          "quote_6.png"
+        ]
       }
     ],
     [
@@ -3038,7 +3040,7 @@
     ]
   ],
   "uploadCounters": {
-    "quote": 5,
+    "quote": 6,
     "eardestroyer": 0,
     "eyebleacher": 0
   },
