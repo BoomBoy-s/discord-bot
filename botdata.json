@@ -825,7 +825,7 @@
         "dailyStreak": 0,
         "bestStreak": 0,
         "lastDailyDate": "",
-        "xp": 214,
+        "xp": 221,
         "level": 5,
         "lastWorkTime": 0,
         "lastBegTime": 0,
@@ -995,7 +995,7 @@
         "dailyStreak": 0,
         "bestStreak": 0,
         "lastDailyDate": "",
-        "xp": 202,
+        "xp": 215,
         "level": 3,
         "lastWorkTime": 0,
         "lastBegTime": 0,
@@ -4010,6 +4010,28 @@
         "submitterId": "1254388539890860083",
         "fileName": "1254388539890860083__image__quote_1575208059238744176.png",
         "rawName": "quote_1575208059238744176.png",
+        "mediaKind": "image",
+        "guildId": "1048053656035020911",
+        "destFolder": null
+      }
+    ],
+    [
+      "860083mwz4wpqs",
+      {
+        "submitterId": "1254388539890860083",
+        "fileName": "1254388539890860083__image__quote_1575831644752052386.png",
+        "rawName": "quote_1575831644752052386.png",
+        "mediaKind": "image",
+        "guildId": "1048053656035020911",
+        "destFolder": null
+      }
+    ],
+    [
+      "604194mwz4xixl",
+      {
+        "submitterId": "1213866609362604194",
+        "fileName": "1213866609362604194__image__quote_597.png",
+        "rawName": "quote_597.png",
         "mediaKind": "image",
         "guildId": "1048053656035020911",
         "destFolder": null
