@@ -215,7 +215,7 @@
         "dailyStreak": 0,
         "bestStreak": 0,
         "lastDailyDate": "",
-        "xp": 550,
+        "xp": 557,
         "level": 5,
         "lastWorkTime": 0,
         "lastBegTime": 0,
@@ -340,7 +340,7 @@
         "dailyStreak": 0,
         "bestStreak": 0,
         "lastDailyDate": "",
-        "xp": 200,
+        "xp": 206,
         "level": 3,
         "lastWorkTime": 0,
         "lastBegTime": 0,
@@ -3914,6 +3914,30 @@
         "forceMarried": false,
         "uploadedImages": []
       }
+    ],
+    [
+      "1446118991729922148",
+      {
+        "username": "7hg6",
+        "wins": 0,
+        "gamesPlayed": 0,
+        "coins": 0,
+        "dailyStreak": 0,
+        "bestStreak": 0,
+        "lastDailyDate": "",
+        "xp": 5,
+        "level": 1,
+        "lastWorkTime": 0,
+        "lastBegTime": 0,
+        "lastCrimeTime": 0,
+        "lastRobTime": 0,
+        "inventory": [],
+        "marriedTo": null,
+        "pendingProposal": null,
+        "imagesUploaded": 0,
+        "forceMarried": false,
+        "uploadedImages": []
+      }
     ]
   ],
   "activeEffects": [],
@@ -4748,7 +4772,37 @@
       }
     ]
   ],
-  "serverStatsConfig": [],
+  "serverStatsConfig": [
+    [
+      "1440773513060290763",
+      {
+        "categoryId": "1575983967339815134",
+        "channels": [
+          {
+            "id": "1575983969021992990",
+            "type": "all",
+            "label": "All Members",
+            "emoji": ""
+          },
+          {
+            "id": "1575983970196259079",
+            "type": "humans",
+            "label": "Members",
+            "emoji": ""
+          },
+          {
+            "id": "1575983970976534709",
+            "type": "bots",
+            "label": "Bots",
+            "emoji": ""
+          }
+        ],
+        "intervalMinutes": 15,
+        "locked": true,
+        "lastUpdate": 1795814259233
+      }
+    ]
+  ],
   "boostHistory": [],
   "quoteUserVotes": [
     [
