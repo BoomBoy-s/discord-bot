@@ -3938,6 +3938,30 @@
         "forceMarried": false,
         "uploadedImages": []
       }
+    ],
+    [
+      "490909242107232296",
+      {
+        "username": "wonwest",
+        "wins": 0,
+        "gamesPlayed": 0,
+        "coins": 0,
+        "dailyStreak": 0,
+        "bestStreak": 0,
+        "lastDailyDate": "",
+        "xp": 15,
+        "level": 1,
+        "lastWorkTime": 0,
+        "lastBegTime": 0,
+        "lastCrimeTime": 0,
+        "lastRobTime": 0,
+        "inventory": [],
+        "marriedTo": null,
+        "pendingProposal": null,
+        "imagesUploaded": 0,
+        "forceMarried": false,
+        "uploadedImages": []
+      }
     ]
   ],
   "activeEffects": [],
@@ -4795,11 +4819,30 @@
             "type": "bots",
             "label": "Bots",
             "emoji": ""
+          },
+          {
+            "id": "1575984600025538740",
+            "type": "roles",
+            "label": "Roles",
+            "emoji": ""
+          },
+          {
+            "id": "1575984601095082104",
+            "type": "channels",
+            "label": "Total Channels",
+            "emoji": ""
+          },
+          {
+            "id": "1575984651384783110",
+            "type": "role",
+            "roleId": "1570852077209657364",
+            "label": "Staff",
+            "emoji": "💼"
           }
         ],
         "intervalMinutes": 60,
         "locked": true,
-        "lastUpdate": 1795814288542
+        "lastUpdate": 1795814490946
       }
     ]
   ],
