@@ -340,7 +340,7 @@
         "dailyStreak": 0,
         "bestStreak": 0,
         "lastDailyDate": "",
-        "xp": 206,
+        "xp": 218,
         "level": 3,
         "lastWorkTime": 0,
         "lastBegTime": 0,
@@ -4838,6 +4838,18 @@
             "roleId": "1570852077209657364",
             "label": "Staff",
             "emoji": "💼"
+          },
+          {
+            "id": "1575985447912349857",
+            "type": "roles",
+            "label": "Roles",
+            "emoji": ""
+          },
+          {
+            "id": "1575985449124630638",
+            "type": "channels",
+            "label": "Total Channels",
+            "emoji": ""
           }
         ],
         "intervalMinutes": 60,
