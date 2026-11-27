@@ -3376,7 +3376,22 @@
     "969280648667889764",
     "690219723472109616"
   ],
-  "quoteVotes": [],
+  "quoteVotes": [
+    [
+      "quote_6.jpg",
+      {
+        "up": 1,
+        "down": 0
+      }
+    ],
+    [
+      "quote_2.png",
+      {
+        "up": 1,
+        "down": 0
+      }
+    ]
+  ],
   "quoteVoteMessages": [
     [
       "1574586137987784816",
@@ -3405,10 +3420,54 @@
     [
       "1574719723550277704",
       "quote_1.png"
+    ],
+    [
+      "1575833112561066044",
+      "quote_1.png"
+    ],
+    [
+      "1575833136883966073",
+      "quote_6.jpg"
+    ],
+    [
+      "1575833168924250172",
+      "quote_4.png"
+    ],
+    [
+      "1575833192538177589",
+      "quote_2.png"
+    ],
+    [
+      "1575833224251310141",
+      "quote_7.png"
+    ],
+    [
+      "1575833256375623712",
+      "quote_8.png"
+    ],
+    [
+      "1575833298318397612",
+      "quote_3.jpg"
+    ],
+    [
+      "1575833314818789518",
+      "quote_4.png"
+    ],
+    [
+      "1575833329083875400",
+      "quote_8.png"
     ]
   ],
   "favoritedQuotes": [],
-  "userVoteStats": [],
+  "userVoteStats": [
+    [
+      "1213866609362604194",
+      {
+        "up": 2,
+        "down": 0
+      }
+    ]
+  ],
   "userFlagStats": [],
   "pendingFlagDeleters": [],
   "reviewChannelId": "1503045026866004071",
@@ -3489,6 +3548,105 @@
         "voters": [],
         "guildId": "1510645922604781821",
         "channelId": "1510645923498295347",
+        "sentToDeleter": false,
+        "type": "quote"
+      }
+    ],
+    [
+      "1575833112561066044",
+      {
+        "filename": "quote_1.png",
+        "voters": [],
+        "guildId": "1048053656035020911",
+        "channelId": "1477294439180537980",
+        "sentToDeleter": false,
+        "type": "quote"
+      }
+    ],
+    [
+      "1575833136883966073",
+      {
+        "filename": "quote_6.jpg",
+        "voters": [],
+        "guildId": "1048053656035020911",
+        "channelId": "1477294439180537980",
+        "sentToDeleter": false,
+        "type": "quote"
+      }
+    ],
+    [
+      "1575833168924250172",
+      {
+        "filename": "quote_4.png",
+        "voters": [],
+        "guildId": "1048053656035020911",
+        "channelId": "1477294439180537980",
+        "sentToDeleter": false,
+        "type": "quote"
+      }
+    ],
+    [
+      "1575833192538177589",
+      {
+        "filename": "quote_2.png",
+        "voters": [],
+        "guildId": "1048053656035020911",
+        "channelId": "1477294439180537980",
+        "sentToDeleter": false,
+        "type": "quote"
+      }
+    ],
+    [
+      "1575833224251310141",
+      {
+        "filename": "quote_7.png",
+        "voters": [],
+        "guildId": "1048053656035020911",
+        "channelId": "1477294439180537980",
+        "sentToDeleter": false,
+        "type": "quote"
+      }
+    ],
+    [
+      "1575833256375623712",
+      {
+        "filename": "quote_8.png",
+        "voters": [],
+        "guildId": "1048053656035020911",
+        "channelId": "1477294439180537980",
+        "sentToDeleter": false,
+        "type": "quote"
+      }
+    ],
+    [
+      "1575833298318397612",
+      {
+        "filename": "quote_3.jpg",
+        "voters": [],
+        "guildId": "1048053656035020911",
+        "channelId": "1477294439180537980",
+        "sentToDeleter": false,
+        "type": "quote"
+      }
+    ],
+    [
+      "1575833314818789518",
+      {
+        "filename": "quote_4.png",
+        "voters": [],
+        "guildId": "1048053656035020911",
+        "channelId": "1477294439180537980",
+        "sentToDeleter": false,
+        "type": "quote"
+      }
+    ],
+    [
+      "1575833329083875400",
+      {
+        "filename": "quote_8.png",
+        "voters": [],
+        "guildId": "1048053656035020911",
+        "channelId": "1477294439180537980",
         "sentToDeleter": false,
         "type": "quote"
       }
@@ -3882,5 +4040,24 @@
   ],
   "serverStatsConfig": [],
   "boostHistory": [],
-  "quoteUserVotes": []
+  "quoteUserVotes": [
+    [
+      "quote_6.jpg",
+      [
+        [
+          "1213866609362604194",
+          "up"
+        ]
+      ]
+    ],
+    [
+      "quote_2.png",
+      [
+        [
+          "1213866609362604194",
+          "up"
+        ]
+      ]
+    ]
+  ]
 }
