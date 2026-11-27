@@ -396,7 +396,7 @@
         "dailyStreak": 0,
         "bestStreak": 0,
         "lastDailyDate": "",
-        "xp": 18,
+        "xp": 30,
         "level": 3,
         "lastWorkTime": 0,
         "lastBegTime": 0,
@@ -405,9 +405,11 @@
         "inventory": [],
         "marriedTo": null,
         "pendingProposal": null,
-        "imagesUploaded": 0,
+        "imagesUploaded": 1,
         "forceMarried": false,
-        "uploadedImages": []
+        "uploadedImages": [
+          "quote_8.png"
+        ]
       }
     ],
     [
@@ -3565,17 +3567,6 @@
         "guildId": "1048053656035020911",
         "destFolder": null
       }
-    ],
-    [
-      "604966mwy9q7zy",
-      {
-        "submitterId": "1391972162285604966",
-        "fileName": "1391972162285604966__image__IMG_2689.png",
-        "rawName": "IMG_2689.png",
-        "mediaKind": "image",
-        "guildId": "1048053656035020911",
-        "destFolder": null
-      }
     ]
   ],
   "quoteGuildConfigs": [
@@ -3593,7 +3584,7 @@
     ]
   ],
   "uploadCounters": {
-    "quote": 7,
+    "quote": 8,
     "eardestroyer": 0,
     "eyebleacher": 0
   },
