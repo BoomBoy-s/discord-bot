@@ -161,7 +161,9 @@
       }
     ]
   ],
-  "userInstalls": [],
+  "userInstalls": [
+    "1391972162285604966"
+  ],
   "featureBlacklist": [],
   "tempOwnerGrants": [
     [
@@ -729,7 +731,7 @@
         "dailyStreak": 0,
         "bestStreak": 0,
         "lastDailyDate": "",
-        "xp": 21,
+        "xp": 27,
         "level": 1,
         "lastWorkTime": 0,
         "lastBegTime": 0,
