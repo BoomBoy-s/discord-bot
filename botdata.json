@@ -995,7 +995,7 @@
         "dailyStreak": 0,
         "bestStreak": 0,
         "lastDailyDate": "",
-        "xp": 215,
+        "xp": 224,
         "level": 3,
         "lastWorkTime": 0,
         "lastBegTime": 0,
@@ -4065,6 +4065,28 @@
         "submitterId": "1213866609362604194",
         "fileName": "1213866609362604194__image__Screenshot_20260430_001845.png",
         "rawName": "Screenshot_20260430_001845.png",
+        "mediaKind": "image",
+        "guildId": "1048053656035020911",
+        "destFolder": null
+      }
+    ],
+    [
+      "604194mwz54g8v",
+      {
+        "submitterId": "1213866609362604194",
+        "fileName": "1213866609362604194__image__quote_1473156002659434497.png",
+        "rawName": "quote_1473156002659434497.png",
+        "mediaKind": "image",
+        "guildId": "1048053656035020911",
+        "destFolder": null
+      }
+    ],
+    [
+      "604194mwz54phu",
+      {
+        "submitterId": "1213866609362604194",
+        "fileName": "1213866609362604194__image__9bb5469d_1380_4a16_9b86_5b4e08c69198.png",
+        "rawName": "9bb5469d_1380_4a16_9b86_5b4e08c69198.png",
         "mediaKind": "image",
         "guildId": "1048053656035020911",
         "destFolder": null
