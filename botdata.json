@@ -414,7 +414,7 @@
         "dailyStreak": 0,
         "bestStreak": 0,
         "lastDailyDate": "",
-        "xp": 50,
+        "xp": 59,
         "level": 4,
         "lastWorkTime": 0,
         "lastBegTime": 0,
@@ -423,11 +423,12 @@
         "inventory": [],
         "marriedTo": null,
         "pendingProposal": null,
-        "imagesUploaded": 2,
+        "imagesUploaded": 3,
         "forceMarried": false,
         "uploadedImages": [
           "quote_8.png",
-          "quote_9.png"
+          "quote_9.png",
+          "quote_41.png"
         ]
       }
     ],
@@ -4788,7 +4789,7 @@
     ]
   ],
   "uploadCounters": {
-    "quote": 40,
+    "quote": 41,
     "eardestroyer": 0,
     "eyebleacher": 0
   },
