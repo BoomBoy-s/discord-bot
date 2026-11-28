@@ -215,7 +215,7 @@
         "dailyStreak": 0,
         "bestStreak": 0,
         "lastDailyDate": "",
-        "xp": 153,
+        "xp": 162,
         "level": 6,
         "lastWorkTime": 0,
         "lastBegTime": 0,
@@ -4648,6 +4648,35 @@
         "intervalMinutes": 60,
         "locked": true,
         "lastUpdate": 1795825503474
+      }
+    ],
+    [
+      "1048053656035020911",
+      {
+        "categoryId": "1576032294068682865",
+        "channels": [
+          {
+            "id": "1576032295788220517",
+            "type": "all",
+            "label": "All Members",
+            "emoji": ""
+          },
+          {
+            "id": "1576032296652382298",
+            "type": "humans",
+            "label": "Members",
+            "emoji": ""
+          },
+          {
+            "id": "1576032297885634701",
+            "type": "bots",
+            "label": "Bots",
+            "emoji": ""
+          }
+        ],
+        "intervalMinutes": 15,
+        "locked": true,
+        "lastUpdate": 1795825781186
       }
     ]
   ],
