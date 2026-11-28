@@ -265,7 +265,7 @@
         "dailyStreak": 0,
         "bestStreak": 0,
         "lastDailyDate": "",
-        "xp": 547,
+        "xp": 555,
         "level": 6,
         "lastWorkTime": 0,
         "lastBegTime": 0,
@@ -1018,7 +1018,7 @@
         "dailyStreak": 0,
         "bestStreak": 0,
         "lastDailyDate": "",
-        "xp": 33,
+        "xp": 46,
         "level": 4,
         "lastWorkTime": 0,
         "lastBegTime": 0,
@@ -4772,7 +4772,7 @@
         ],
         "intervalMinutes": 15,
         "locked": true,
-        "lastUpdate": 1795836028647
+        "lastUpdate": 1795836928648
       }
     ]
   ],
