@@ -215,7 +215,7 @@
         "dailyStreak": 0,
         "bestStreak": 0,
         "lastDailyDate": "",
-        "xp": 252,
+        "xp": 265,
         "level": 6,
         "lastWorkTime": 0,
         "lastBegTime": 0,
@@ -265,7 +265,7 @@
         "dailyStreak": 0,
         "bestStreak": 0,
         "lastDailyDate": "",
-        "xp": 473,
+        "xp": 479,
         "level": 6,
         "lastWorkTime": 0,
         "lastBegTime": 0,
@@ -1629,7 +1629,7 @@
         "dailyStreak": 0,
         "bestStreak": 0,
         "lastDailyDate": "",
-        "xp": 71,
+        "xp": 88,
         "level": 2,
         "lastWorkTime": 0,
         "lastBegTime": 0,
@@ -2109,7 +2109,7 @@
         "dailyStreak": 0,
         "bestStreak": 0,
         "lastDailyDate": "",
-        "xp": 37,
+        "xp": 43,
         "level": 2,
         "lastWorkTime": 0,
         "lastBegTime": 0,
@@ -4676,7 +4676,7 @@
         ],
         "intervalMinutes": 15,
         "locked": true,
-        "lastUpdate": 1795829703522
+        "lastUpdate": 1795830628526
       }
     ]
   ],
