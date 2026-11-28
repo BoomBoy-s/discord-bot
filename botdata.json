@@ -4332,6 +4332,18 @@
     [
       "1575833329083875400",
       "quote_8.png"
+    ],
+    [
+      "1576091972572029090",
+      "quote_29.png"
+    ],
+    [
+      "1576092102066970637",
+      "quote_11.png"
+    ],
+    [
+      "1576092134732333157",
+      "quote_17.png"
     ]
   ],
   "favoritedQuotes": [],
@@ -4523,6 +4535,39 @@
         "voters": [],
         "guildId": "1048053656035020911",
         "channelId": "1477294439180537980",
+        "sentToDeleter": false,
+        "type": "quote"
+      }
+    ],
+    [
+      "1576091972572029090",
+      {
+        "filename": "quote_29.png",
+        "voters": [],
+        "guildId": "1440773513060290763",
+        "channelId": "1440780168191807599",
+        "sentToDeleter": false,
+        "type": "quote"
+      }
+    ],
+    [
+      "1576092102066970637",
+      {
+        "filename": "quote_11.png",
+        "voters": [],
+        "guildId": "1440773513060290763",
+        "channelId": "1440780168191807599",
+        "sentToDeleter": false,
+        "type": "quote"
+      }
+    ],
+    [
+      "1576092134732333157",
+      {
+        "filename": "quote_17.png",
+        "voters": [],
+        "guildId": "1440773513060290763",
+        "channelId": "1440780168191807599",
         "sentToDeleter": false,
         "type": "quote"
       }
@@ -4767,7 +4812,7 @@
         ],
         "intervalMinutes": 60,
         "locked": true,
-        "lastUpdate": 1795836328647
+        "lastUpdate": 1795839928672
       }
     ],
     [
