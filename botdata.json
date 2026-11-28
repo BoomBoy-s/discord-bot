@@ -4344,6 +4344,46 @@
     [
       "1576092134732333157",
       "quote_17.png"
+    ],
+    [
+      "1576092162179731607",
+      "quote_7.png"
+    ],
+    [
+      "1576092193095942254",
+      "quote_3.jpg"
+    ],
+    [
+      "1576092215875473570",
+      "quote_14.png"
+    ],
+    [
+      "1576092239837401209",
+      "quote_38.png"
+    ],
+    [
+      "1576092255142285333",
+      "quote_34.png"
+    ],
+    [
+      "1576092272771076176",
+      "quote_2.png"
+    ],
+    [
+      "1576092288738660482",
+      "quote_4.png"
+    ],
+    [
+      "1576092305956274236",
+      "quote_20.png"
+    ],
+    [
+      "1576092331042541648",
+      "quote_36.png"
+    ],
+    [
+      "1576092348285325324",
+      "quote_27.png"
     ]
   ],
   "favoritedQuotes": [],
@@ -4565,6 +4605,116 @@
       "1576092134732333157",
       {
         "filename": "quote_17.png",
+        "voters": [],
+        "guildId": "1440773513060290763",
+        "channelId": "1440780168191807599",
+        "sentToDeleter": false,
+        "type": "quote"
+      }
+    ],
+    [
+      "1576092162179731607",
+      {
+        "filename": "quote_7.png",
+        "voters": [],
+        "guildId": "1440773513060290763",
+        "channelId": "1440780168191807599",
+        "sentToDeleter": false,
+        "type": "quote"
+      }
+    ],
+    [
+      "1576092193095942254",
+      {
+        "filename": "quote_3.jpg",
+        "voters": [],
+        "guildId": "1440773513060290763",
+        "channelId": "1440780168191807599",
+        "sentToDeleter": false,
+        "type": "quote"
+      }
+    ],
+    [
+      "1576092215875473570",
+      {
+        "filename": "quote_14.png",
+        "voters": [],
+        "guildId": "1440773513060290763",
+        "channelId": "1440780168191807599",
+        "sentToDeleter": false,
+        "type": "quote"
+      }
+    ],
+    [
+      "1576092239837401209",
+      {
+        "filename": "quote_38.png",
+        "voters": [],
+        "guildId": "1440773513060290763",
+        "channelId": "1440780168191807599",
+        "sentToDeleter": false,
+        "type": "quote"
+      }
+    ],
+    [
+      "1576092255142285333",
+      {
+        "filename": "quote_34.png",
+        "voters": [],
+        "guildId": "1440773513060290763",
+        "channelId": "1440780168191807599",
+        "sentToDeleter": false,
+        "type": "quote"
+      }
+    ],
+    [
+      "1576092272771076176",
+      {
+        "filename": "quote_2.png",
+        "voters": [],
+        "guildId": "1440773513060290763",
+        "channelId": "1440780168191807599",
+        "sentToDeleter": false,
+        "type": "quote"
+      }
+    ],
+    [
+      "1576092288738660482",
+      {
+        "filename": "quote_4.png",
+        "voters": [],
+        "guildId": "1440773513060290763",
+        "channelId": "1440780168191807599",
+        "sentToDeleter": false,
+        "type": "quote"
+      }
+    ],
+    [
+      "1576092305956274236",
+      {
+        "filename": "quote_20.png",
+        "voters": [],
+        "guildId": "1440773513060290763",
+        "channelId": "1440780168191807599",
+        "sentToDeleter": false,
+        "type": "quote"
+      }
+    ],
+    [
+      "1576092331042541648",
+      {
+        "filename": "quote_36.png",
+        "voters": [],
+        "guildId": "1440773513060290763",
+        "channelId": "1440780168191807599",
+        "sentToDeleter": false,
+        "type": "quote"
+      }
+    ],
+    [
+      "1576092348285325324",
+      {
+        "filename": "quote_27.png",
         "voters": [],
         "guildId": "1440773513060290763",
         "channelId": "1440780168191807599",
